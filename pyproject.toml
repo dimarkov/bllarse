@@ -1,0 +1,18 @@
+[project]
+name = "bllarse"
+version = "0.1.0"
+description = "Learning Bayesian last layers on top of deep neural networks with sparse priors and Bayesian model reduction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.5.0",
+    "equimo>=0.3.3",
+    "augmax>=0.3.4",
+    "tqdm>=4.67.1",
+    "pillow>=11.1.0",
+    "ipykernel>=6.29.5",
+    "jax[cuda]>=0.5.3",
+]
+
+[tool.uv.sources]
+bmr4pml = { git = "https://github.com/dimarkov/bmr4pml.git", rev = "main" }
