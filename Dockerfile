@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.1-devel-ubuntu20.04
+FROM nvidia/cuda:12.5.0-devel-ubuntu20.04
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
