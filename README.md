@@ -7,11 +7,15 @@ Use the included `start_docker.sh` script to start a container with GPU access a
 
 ```bash
 ./start_docker.sh                # Start an interactive shell
-./start_docker.sh python         # Run Python in the container
-./start_docker.sh bash           # Explicitly run bash
 ```
 
 This asssumes you've already built the image:
 ```
 docker build -t bllarse-dev .
 ``` 
+
+Once inside an interactive shell on the container, you can create a virtual environment with `uv`, ensure required dependencies are installed using `uv sync` and then run code from within the virtual environment using
+
+```bash
+source .venv/bin/activate
+```
