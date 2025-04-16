@@ -5,7 +5,7 @@ description = "Learning Bayesian last layers on top of deep neural networks with
 readme = "README.md"
 authors = [
     { name = "Dimitrije Markovic", email = "5038100+dimarkov@users.noreply.github.com" },
-    { name = "Conor Heins", email = "" }
+    { name = "Conor Heins", email = "conor.heins@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
