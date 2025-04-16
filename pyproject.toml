@@ -1,0 +1,28 @@
+[project]
+name = "bllarse"
+version = "0.1.0"
+description = "Learning Bayesian last layers on top of deep neural networks with sparse priors and Bayesian model reduction"
+readme = "README.md"
+authors = [
+    { name = "Dimitrije Markovic", email = "5038100+dimarkov@users.noreply.github.com" },
+    { name = "Conor Heins", email = "" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3.5.0",
+    "equimo>=0.3.3",
+    "augmax>=0.3.4",
+    "tqdm>=4.67.1",
+    "pillow>=11.1.0",
+    "ipykernel>=6.29.5",
+    "jax[cuda]>=0.5.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]
