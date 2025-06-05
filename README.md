@@ -9,7 +9,7 @@ Use the included `start_docker.sh` script to start a container with GPU access a
 ./start_docker.sh                # Start an interactive shell
 ```
 
-This asssumes you've already built the image:
+This assumes you've already built the image:
 ```
 docker build -t bllarse-dev .
 ``` 
