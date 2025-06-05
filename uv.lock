@@ -727,7 +727,7 @@ wheels = [
 [[package]]
 name = "mlpox"
 version = "0.1.0"
-source = { git = "https://github.com/dimarkov/mlpox.git?rev=main#cc9d51d67f11c4e82462c58340eab5cb8ce871fa" }
+source = { git = "https://github.com/dimarkov/mlpox.git?rev=main#930af45ec8b79ddc6087998016cd98c3b62060d8" }
 dependencies = [
     { name = "einops" },
     { name = "equinox" },
