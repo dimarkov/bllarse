@@ -1,6 +1,6 @@
 #!/bin/bash
 
-docker run -it --rm --gpus all \
+docker run --rm --gpus="device=$SLURM_JOB_GPUS"\
   -e HOME=$HOME \
   -v $HOME:$HOME \
   -v $(pwd):$(pwd) \
