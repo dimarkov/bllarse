@@ -1,21 +1,72 @@
 # bllarse
+
 Fitting Bayesian last layers or Bayesian "heads" with sparse priors to embeddings of deep neural networks, and pruning their parameters with Bayesian model reduction.
 
-## 🚀 Running the Docker container
+## 🚀 Building the Docker image
 
-Use the included `start_docker.sh` script to start a container with GPU access and your current working directory mounted:
+> **Note:** Build the image on a GPU-equipped node so that CUDA drivers are available.
 
 ```bash
-./start_docker.sh                # Start an interactive shell
-```
-
-This assumes you've already built the image:
-```
+# From the project root:
 docker build -t bllarse-dev .
-``` 
+```
 
-Once inside an interactive shell on the container, you can create a virtual environment with `uv`, ensure required dependencies are installed using `uv sync` and then run code from within the virtual environment using
+## 💻 Interactive container usage
+
+Use the interactive startup script to enter a shell (or run a one-off command) inside the container, with your home directory and project workspace mounted:
 
 ```bash
-source .venv/bin/activate
+# Drop into an interactive bash shell:
+scripts/start_docker_interactive.sh
+
+# And then run a specific command, e.g. finetuning script:
+>>> source .venv/bin/activate # assumes you've already created a venv and synced dependencies
+>>> python scripts/last_layer_finetuning.py
 ```
+
+Once inside the container:
+
+```bash
+# (Re)create and synchronize your virtual environment:
+uv venv
+uv sync
+
+# Activate it:
+source .venv/bin/activate
+
+# Run any Python code, e.g.:
+python scripts/last_layer_finetuning.py
+```
+
+## 📋 SLURM cluster usage
+
+We provide an sbatch wrapper for non-interactive, GPU-accelerated jobs.
+
+1. **Submit a SLURM job** from the login node of your computing cluster:
+
+   ```bash
+   sbatch scripts/run_slurm_finetuning_test.sh
+   ```
+
+2. **How it works**:
+
+   * `scripts/run_slurm_finetuning_test.sh` requests a GPU node and then invokes:
+
+     ```bash
+     scripts/start_docker_sbatch.sh scripts/run_finetuning.sh
+     ```
+   * `scripts/start_docker_sbatch.sh` launches the Docker container (with `--gpus`), mounts your home and working directory, and executes the provided script inside.
+
+3. **`scripts/run_finetuning.sh`** (inside the container):
+
+   ```bash
+   #!/usr/bin/env bash
+   set -e
+
+   # Activate the virtual environment
+   source .venv/bin/activate
+
+   # Run the finetuning
+   python scripts/last_layer_finetuning.py
+   ```
+
