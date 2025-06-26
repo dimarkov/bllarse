@@ -16,7 +16,10 @@ dependencies = [
     "pillow>=11.1.0",
     "ipykernel>=6.29.5",
     "jax[cuda]>=0.5.3",
+    "optax>=0.2.4",
+    "tfp-nightly[jax]",
     "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
+    "blrax @ git+https://github.com/dimarkov/blrax.git@main"
 ]
 
 [build-system]
