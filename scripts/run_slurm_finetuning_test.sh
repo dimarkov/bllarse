@@ -5,4 +5,4 @@
 #SBATCH --mem=40GB                   # memory limit
 #SBATCH --time=01:00:00              # HH:MM:SS – wall-clock time limit
 
-./start_docker_sbatch.sh ./run_finetuning.sh
+scripts/start_docker_sbatch.sh scripts/run_finetuning.sh
