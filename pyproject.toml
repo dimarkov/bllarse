@@ -31,5 +31,6 @@ allow-direct-references = true
 
 [dependency-groups]
 dev = [
+    "matplotlib>=3.10.3",
     "pytest>=8.3.5",
 ]
