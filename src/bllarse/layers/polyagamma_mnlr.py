@@ -142,20 +142,14 @@ class MultinomialLogistic_Polyagamma(eqx.Module):
 
         # x.shape = (sample_shape, batch_shape, d)
         # L.shape = (batch_shape, C, d, d)
-        # we need both to be broadcastable to (sample_shape, batch_shape, C, d, d)
 
-        C = L.shape[-self.stick_breaking_dim]
-        d = x.shape[-1]
-
-        x_transposed = jnp.moveaxis(x, -1, 0) # (d, ...)
-        rhs   = jnp.broadcast_to(x_transposed, (C,) + x_transposed.shape)  # (C, d, ...)
-        # if rhs has shape (C, d, N, M, ...) then we need to reshape it to (C, d, N*M*...)
-        rhs = jnp.reshape(rhs, (C, d, -1))
+        x_reshaped = jnp.moveaxis(jnp.expand_dims(x, -self.stick_breaking_dim+1), 0, -1)                    # (*batch_shape, 1, d, N)
+        rhs   = jnp.broadcast_to(x_reshaped, L.shape[:-1] + (x_reshaped.shape[-1],))  # (*batch_shape, C, d, N) 
         y     = jax.lax.linalg.triangular_solve(
-                                     L, rhs, left_side=True, lower=True)             # (C, d, N*M*...)
-        quad  = jnp.moveaxis((y ** 2).sum(1), 0, -1)                                 # (C, d, N*M*...) --> (C, N*M*...) --> (N*M*..., C)
-        outer = (x[...,None] * mu.mT).sum(-2) ** 2                                   # (N, M, ..., C)
-        return quad.reshape(x.shape[:-1] + (C,)) + outer                             # (N, M, ..., C)
+                                     L, rhs, left_side=True, lower=True)             # (*batch_shape, C, d, N)
+        quad  = jnp.moveaxis((y ** 2).sum(-2), -1, 0)                                # (N, *batch_shape, C)
+        outer = (x[...,None] * mu.mT).sum(-2) ** 2                                   # (N, *batch_shape, C)
+        return quad + outer                                                          # (N, *batch_shape,C)
 
 
 
