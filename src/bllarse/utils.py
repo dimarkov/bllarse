@@ -8,6 +8,8 @@ import optax
 from blrax.states import ScaleByIvonState
 from blrax.utils import noisy_value_and_grad, get_scale, sample_posterior
 
+import jax.scipy.linalg as linalg
+from jax.lax.linalg import triangular_solve
 import augmax
 from math import prod
 
@@ -32,6 +34,18 @@ STD_DICT = {
     "cifar100": jnp.asarray([0.24703233, 0.24348505, 0.26158768]),
     "stl10": jnp.asarray([0.2471, 0.2435, 0.2616]),
 }
+
+def stable_inverse(arr_to_invert):
+    """ Assumes `arr_to_invert` is a batch of matrices of shape (..., dim, dim)"""
+    dim = arr_to_invert.shape[-1]
+    L_chol = linalg.cho_factor(arr_to_invert, lower=True)
+    return linalg.cho_solve(L_chol, jnp.broadcast_to(jnp.eye(dim), arr_to_invert.shape, dtype=arr_to_invert.dtype))
+
+def solve_precision(L, b):
+    """Solve (LLᵀ)x = b for x given lower-triangular L (Cholesky of Λ)."""
+    y = triangular_solve(L, b, left_side=True, lower=True)
+    x = triangular_solve(L, y, left_side=True, lower=True, transpose_a=True)
+    return x
 
 def get_number_of_parameters(model):
     params, _ = eqx.partition(model, eqx.is_array)
