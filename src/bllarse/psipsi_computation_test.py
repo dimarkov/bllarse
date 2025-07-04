@@ -77,7 +77,7 @@ def psipsi_dense_diag(Sigma, mu, x):
 # φφ – Cholesky shortcut (no Σ at all, O(d²))
 # ----------------------------
 @jit
-def psipsi_chol(L, mu, x):
+def psipsi_chol_left_batching(L, mu, x):
     """
     Same φφ but using only the Cholesky of Λ.
     Returns (N, C).
@@ -89,6 +89,27 @@ def psipsi_chol(L, mu, x):
     quad  = (y ** 2).sum(-1)                                # (N, C)
     outer = (x @ mu.T) ** 2                                   # (N, C)
     return quad + outer
+
+@jit
+def psipsi_chol_right_batching(L, mu, x):
+    """
+    Same φφ but using only the Cholesky of Λ.
+    Returns (N, C).
+    """
+
+    # x.shape = (..., d)
+    # write a permutation command that puts the last dimension (d) of x to the front and the rest to the back
+    # x.shape = (..., d)  # where ... is any number of dimensions --> (d,  ...)
+    x_transposed = jnp.moveaxis(x, -1, 0)                     # (d, ...)
+    rhs   = jnp.broadcast_to(x_transposed, (L.shape[-3],) + x_transposed.shape)  # (C, d, ...)
+    y     = jax.lax.linalg.triangular_solve(
+              L, rhs, left_side=True, lower=True)             # (C, d, ...)
+    quad  = jnp.moveaxis((y ** 2).sum(1), 0, -1)                                 # (..., C)
+    # x.shape = (..., d)
+    # mu.shape = (...., C, d)
+    # mu.T.shape = (...., d, C)
+    outer = (x[...,None] * mu.mT).sum(-2) ** 2  
+    return quad + outer                                       # (..., C)
 
 # ----------------------------
 # timing helper
@@ -107,20 +128,27 @@ def timeit(fn, *args, runs=30):
 # ----------------------------
 t_dense = timeit(psipsi_dense, Sigma, mu, x, runs=runs)
 t_dense_diag = timeit(psipsi_dense_diag, Sigma, mu, x, runs=runs)
-t_chol  = timeit(psipsi_chol,       L,     mu, x, runs=runs)
+t_chol_left  = timeit(psipsi_chol_left_batching,       L,     mu, x, runs=runs)
+t_chol_right  = timeit(psipsi_chol_right_batching,       L,     mu, x, runs=runs)
 
 psi_dense = psipsi_dense(Sigma, mu, x)
 psi_dense_diag = psipsi_dense_diag(Sigma, mu, x)
-psi_chol  = psipsi_chol(L, mu, x)
+psi_chol_left   = psipsi_chol_left_batching(L, mu, x)
+psi_chol_right  = psipsi_chol_right_batching(L, mu, x)
 
-err_psi_dense_psi_chol = jnp.max(jnp.abs(psi_dense - psi_chol)).item()
+err_psi_dense_psi_chol = jnp.max(jnp.abs(psi_dense - psi_chol_left)).item()
 err_psi_dense_psi_diag = jnp.max(jnp.abs(psi_dense - psi_dense_diag)).item()
-err_psi_diag_psi_chol = jnp.max(jnp.abs(psi_dense_diag - psi_chol)).item()
+err_psi_diag_psi_chol = jnp.max(jnp.abs(psi_dense_diag - psi_chol_left)).item()
+err_psi_chol_left_right = jnp.max(jnp.abs(psi_chol_left - psi_chol_right)).item()
+
 
 print(f"[dense]   mean {t_dense.mean()*1e3:.2f} ms   IQR [{np.percentile(t_dense,25)*1e3:.2f}, "
       f"{np.percentile(t_dense,75)*1e3:.2f}] ms")
-print(f"[chol ]   mean {t_chol.mean()*1e3:.2f} ms   IQR [{np.percentile(t_chol,25)*1e3:.2f}, "
-      f"{np.percentile(t_chol,75)*1e3:.2f}] ms")
+print(f"[chol left]   mean {t_chol_left.mean()*1e3:.2f} ms   IQR [{np.percentile(t_chol_left,25)*1e3:.2f}, "
+      f"{np.percentile(t_chol_left,75)*1e3:.2f}] ms")
+print(f"[chol right]   mean {t_chol_right.mean()*1e3:.2f} ms   IQR [{np.percentile(t_chol_right,25)*1e3:.2f}, "
+      f"{np.percentile(t_chol_right,75)*1e3:.2f}] ms")
 print(f"max |φφ_dense − φφ_chol| = {err_psi_dense_psi_chol:.3e}")
 print(f"max |φφ_dense − φφ_dense_diag| = {err_psi_dense_psi_diag:.3e}")
 print(f"max |φφ_dense_diag − φφ_chol| = {err_psi_diag_psi_chol:.3e}")
+print(f"max |φφ_chol_left − φφ_chol_right| = {err_psi_chol_left_right:.3e}")
