@@ -144,13 +144,18 @@ class MultinomialLogistic_Polyagamma(eqx.Module):
         # L.shape = (batch_shape, C, d, d)
         # we need both to be broadcastable to (sample_shape, batch_shape, C, d, d)
 
-        shape_to_use = jnp.broadcast_shapes(jnp.expand_dims(x[...,None], -self.stick_breaking_dim).shape, L.shape)
-        rhs = jnp.broadcast_to(jnp.expand_dims(x, -self.stick_breaking_dim+1), shape_to_use[:-1])  # (N, ..., C, d) NOTE: we offset the event_dim by 1 since the x is not vector-formatted (i.e. it doesn't have a (1,) at the end)
+        C = L.shape[-self.stick_breaking_dim]
+        d = x.shape[-1]
+
+        x_transposed = jnp.moveaxis(x, -1, 0) # (d, ...)
+        rhs   = jnp.broadcast_to(x_transposed, (C,) + x_transposed.shape)  # (C, d, ...)
+        # if rhs has shape (C, d, N, M, ...) then we need to reshape it to (C, d, N*M*...)
+        rhs = jnp.reshape(rhs, (C, d, -1))
         y     = jax.lax.linalg.triangular_solve(
-                jnp.broadcast_to(L, shape_to_use), rhs, left_side=True, lower=True)             # (N, ..., C, d)
-        quad  = (y ** 2).sum(-1)                                 # (N, ..., C)
-        outer = (x @ mu.T) ** 2                                   # (N, ..., C)
-        return quad + outer
+                                     L, rhs, left_side=True, lower=True)             # (C, d, N*M*...)
+        quad  = jnp.moveaxis((y ** 2).sum(1), 0, -1)                                 # (C, d, N*M*...) --> (C, N*M*...) --> (N*M*..., C)
+        outer = (x[...,None] * mu.mT).sum(-2) ** 2                                   # (N, M, ..., C)
+        return quad.reshape(x.shape[:-1] + (C,)) + outer                             # (N, M, ..., C)
 
 
 
