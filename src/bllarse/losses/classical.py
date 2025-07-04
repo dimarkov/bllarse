@@ -12,7 +12,7 @@ class MSE(eqx.Module):
 
     def __call__(self, params: eqx.Module, static:eqx.Module, x: Array, y: Array, *, key: Optional[PRNGKey] = None, with_logits: bool = False):
         model = eqx.combine(params, static)
-        pred = vmap(partial(mode, key=key))
+        pred = vmap(partial(model, key=key))
         _y = nn.one_hot(y, self.num_classes)
         if with_logits:
             return l2_loss(pred, y).mean(), pred
