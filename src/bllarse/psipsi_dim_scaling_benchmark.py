@@ -77,7 +77,7 @@ def psipsi_dense_diag(Sigma, mu, x):
 # φφ – Cholesky shortcut (no Σ at all, O(d²))
 # ----------------------------
 @jit
-def psipsi_chol(L, mu, x):
+def psipsi_chol_left_batching(L, mu, x):
     """
     Same φφ but using only the Cholesky of Λ.
     Returns (N, C).
@@ -87,8 +87,23 @@ def psipsi_chol(L, mu, x):
     y     = jax.lax.linalg.triangular_solve(
               jnp.broadcast_to(L, shape_to_use), rhs, left_side=True, lower=True)             # (N, ..., C, d)
     quad  = (y ** 2).sum(-1)                                # (N, C)
-    outer = (x @ mu.T) ** 2                                   # (N, C)
+    outer = (x[...,None] * mu.mT).sum(-2) ** 2              # (N, C)
     return quad + outer
+
+
+@jit
+def psipsi_chol_right_batching(L, mu, x):
+    """
+    Same φφ but using only the Cholesky of Λ.
+    Returns (N, C).
+    """
+    x_transposed = jnp.moveaxis(x, -1, 0)                     # (d, ...)
+    rhs   = jnp.broadcast_to(x_transposed, (L.shape[-3],) + x_transposed.shape)  # (C, d, ...)
+    y     = jax.lax.linalg.triangular_solve(
+              L, rhs, left_side=True, lower=True)             # (C, d, ...)
+    quad  = jnp.moveaxis((y ** 2).sum(1), 0, -1)              # (..., C)
+    outer = (x[...,None] * mu.mT).sum(-2) ** 2  
+    return quad + outer         
 
 # ---------- timing helper ---------------------------------------------------
 def walltime(fn, *args, repeat=30):
@@ -111,11 +126,13 @@ for d in DIMS:
 
     t_dense      = walltime(psipsi_dense,      Σ, μ, x, repeat=RUNS_PER_DIM)
     t_dense_diag = walltime(psipsi_dense_diag, Σ, μ, x, repeat=RUNS_PER_DIM)
-    t_chol       = walltime(psipsi_chol,       L, μ, x, repeat=RUNS_PER_DIM)
+    t_chol_left       = walltime(psipsi_chol_left_batching,       L, μ, x, repeat=RUNS_PER_DIM)
+    t_chol_right  = walltime(psipsi_chol_right_batching,       L, μ, x, repeat=RUNS_PER_DIM)  
 
     φ_dense      = psipsi_dense(Σ, μ, x)
     φ_dense_diag = psipsi_dense_diag(Σ, μ, x)
-    φ_chol       = psipsi_chol(L, μ, x)
+    φ_chol_left       = psipsi_chol_left_batching(L, μ, x)
+    φ_chol_right  = psipsi_chol_right_batching(L, μ, x)
 
     def err_stats(ref, other):
         diff = np.abs(np.asarray(ref - other)).ravel()
@@ -126,9 +143,11 @@ for d in DIMS:
     results[d] = {
         "dense":      Timing(t_dense.mean()*1e3,      np.percentile(t_dense,      [25, 75])*1e3),
         "dense_diag": Timing(t_dense_diag.mean()*1e3, np.percentile(t_dense_diag, [25, 75])*1e3),
-        "chol":       Timing(t_chol.mean()*1e3,       np.percentile(t_chol,       [25, 75])*1e3),
-        "err_chol":   err_stats(φ_dense, φ_chol),
+        "chol_left":       Timing(t_chol_left.mean()*1e3,       np.percentile(t_chol_left,       [25, 75])*1e3),
+        "chol_right": Timing(t_chol_right.mean()*1e3, np.percentile(t_chol_right, [25, 75])*1e3),
+        "err_dense_to_chol":   err_stats(φ_dense, φ_chol_left),
         "err_diag":   err_stats(φ_dense, φ_dense_diag),
+        "err_chol_left_to_right": err_stats(φ_chol_left, φ_chol_right),
     }
 
 # ---------- plotting --------------------------------------------------------
@@ -138,7 +157,8 @@ def plot_runtimes():
     plt.figure()
     for tag, label, color in [("dense", "dense xxᵀ", "C0"),
                               ("dense_diag", "dense diag", "C1"),
-                              ("chol", "Cholesky", "C2")]:
+                              ("chol_left", "Cholesky (left)", "C2"),
+                              ("chol_right", "Cholesky (right)", "C3")]:
         means = [results[d][tag].mean for d in dims]
         iqrs  = np.array([results[d][tag].iqr for d in dims])
         plt.plot(dims, means, marker="o", label=label, color=color)
@@ -153,8 +173,9 @@ def plot_runtimes():
 
 def plot_errors():
     plt.figure()
-    for tag, label, color in [("err_chol",  "|dense − chol|",  "C2"),
-                              ("err_diag",  "|dense − diag|", "C1")]:
+    for tag, label, color in [("err_dense_to_chol",  "|dense − chol|",  "C2"),
+                              ("err_diag",  "|dense − diag|", "C1"),
+                              ("err_chol_left_to_right", "|chol left − chol right|", "C3")]:
         means = [results[d][tag].mean for d in dims]
         iqrs  = np.array([results[d][tag].iqr for d in dims])
         maxs  = [results[d][tag].max  for d in dims]
