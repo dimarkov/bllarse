@@ -67,16 +67,18 @@ def augmentdata(img, key=None, **kwargs):
 
 def evaluate_model(data_augmentation, loss_fn, nnet, images, labels):
     aug_images = data_augmentation(images, key=None)
-    nll, logits = loss_fn(nnet, aug_images, labels, with_logits=True)
+    if hasattr(loss_fn, 'mu'): # Bayesian case
+        loss, logits, _ = loss_fn(nnet, aug_images, labels, with_logits=True)
+    else: # Classical case
+        loss, logits = loss_fn(nnet, aug_images, labels, with_logits=True)
     
     predictions = jnp.argmax(logits, axis=-1)
     acc = jnp.mean(predictions == labels)
     ece = compute_ece(20, logits=logits, labels_true=labels, labels_predicted=predictions)
-    return acc, nll, ece
+    return acc, loss, ece
 
 def run_training(
     key,
-    last_layer,
     pretrained_nnet,
     loss_fn,
     optim,
@@ -106,21 +108,32 @@ def run_training(
     """
     
     
-    params, static = eqx.partition(last_layer, eqx.is_array)  # split model into params and static fields
+    if hasattr(loss_fn, 'mu'): # Bayesian case
+        params, static = eqx.partition(loss_fn, eqx.is_array)
+    else: # Classical case
+        params, static = eqx.partition(loss_fn, eqx.is_array)
+
     opt_state = optim.init(params) if opt_state is None else opt_state  # initialize optimizer state
 
     def local_loss(params, x, y, *args, **kwargs):
-        ll = eqx.combine(params, static)
-        return loss_fn(partial(ll, pretrained_nnet), x, y)
+        loss_module = eqx.combine(params, static)
+        model = pretrained_nnet
+        if hasattr(loss_module, 'mu'): # Bayesian case
+            loss, _, new_loss_module = loss_module(model, x, y, *args, **kwargs)
+            return loss, new_loss_module
+        else: # Classical case
+            return loss_module(model, x, y, *args, **kwargs)
 
     
     # Training step function
     @eqx.filter_jit
     def train_step(loss_fn, params, opt_state, x, y, key):
         keys = jr.split(key, mc_samples)
-        loss_value, grads = noisy_value_and_grad(loss_fn, opt_state[0], params, x, y, key=keys)
+        (loss_value, new_loss_module), grads = noisy_value_and_grad(loss_fn, opt_state[0], params, x, y, key=keys)
         updates, opt_state = optim.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
+        if hasattr(new_loss_module, 'mu'):
+            params, _ = eqx.partition(new_loss_module, eqx.is_array)
         return params, opt_state, loss_value
     
     # Evaluation function
@@ -168,9 +181,9 @@ def run_training(
         
         # Calculate metrics
         key, _key = jr.split(key)
-        nnet = partial(eqx.combine(params, static), pretrained_nnet)
+        loss_module = eqx.combine(params, static)
         acc, nll, ece = evaluate(
-            nnet,
+            pretrained_nnet,
             test_ds['image'],
             test_ds['label'],
         )
@@ -192,5 +205,5 @@ def run_training(
         init_carry,
         (keys, jnp.arange(num_epochs))
     )
-    trained_model = eqx.combine(params, static)
-    return trained_model, final_opt_state, metrics
+    trained_loss_module = eqx.combine(params, static)
+    return trained_loss_module, final_opt_state, metrics

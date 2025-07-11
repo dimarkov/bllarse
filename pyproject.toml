@@ -7,7 +7,7 @@ authors = [
     { name = "Dimitrije Markovic", email = "5038100+dimarkov@users.noreply.github.com" },
     { name = "Conor Heins", email = "conor.heins@gmail.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "datasets>=3.5.0",
     "equimo>=0.3.3",
@@ -15,7 +15,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "pillow>=11.1.0",
     "ipykernel>=6.29.5",
-    "jax[cuda]>=0.5.3",
+    "jax[cuda]>=0.6.2",
     "optax>=0.2.4",
     "tfp-nightly[jax]",
     "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
