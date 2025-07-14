@@ -142,3 +142,95 @@ class BayesianMultinomialProbit(eqx.Module):
             return loss, logits, new_self
         else:
             return loss, new_self
+
+class MultinomialPolyaGamma(eqx.Module):
+    num_classes: int
+    input_dim: int
+    use_bias: bool
+    loss_type: int
+    mu: Array
+    Sigma: Array
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes:int,
+        *,
+        key: PRNGKey,
+        use_bias: bool = False,
+        loss_type: int = 0
+    ):
+
+        self.num_classes = num_classes
+        self.input_dim = input_dim
+        self.use_bias = use_bias
+        self.loss_type = loss_type
+
+        d = input_dim + int(use_bias)
+        k = num_classes - 1
+        self.mu = jr.normal((d, k)) * 1e-3
+        self.Sigma = jnp.eye(d)[None].repeat(k, axis=0)
+
+    def reset(self, key: PRNGKey) -> "MultinomialPolyaGamma":
+        d = self.input_dim + int(self.use_bias)
+        k = self.num_classes - 1
+        mu = jr.normal((d, k)) * 1e-3
+        Sigma = jnp.eye(d)[None].repeat(k, axis=0)
+
+        return eqx.tree_at(lambda x: (x.mu, x.Sigma), self, (mu, Sigma))
+
+    def get_b_kappa(self, y_one_hot: Array):
+        delta_ky = y_one_hot[..., :-1]
+        b = 1 - jnp.pad(y_one_hot, [(0, 0), (1, 0)])[..., :-2].cumsum(-1)
+        kappa = delta_ky - b / 2
+
+        return b, kappa
+
+    def __call__(self, features: Array, y: Array, *, with_logits: bool = False):
+        
+        x = jnp.pad(features, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
+        M_x = x[..., None, :] * x[..., None]
+
+        y_onehots = nn.one_hot(y, self.num_classes)
+        b, kappa = self.get_b_kappa(y_onehots)
+        lam = jnp.sum(lax.stop_gradient(x)[..., None] * kappa[..., None, :], axis=0)
+
+        def step_fn(carry, _):
+
+            mu, Sigma, M_x = carry
+
+            M_beta = Sigma + mu @ mu.mT
+            psi = jnp.sqrt(jnp.sum(M_beta * jnp.expand_dims(M_x, -3), axis=(-1, -2)))
+
+            rho = b * jnp.tanh(psi / 2) / (psi + 1e-8) / 2
+            F = jnp.sum(rho[:, None, None] * M_x, axis=0) / 2
+            tmp = jnp.eye(x.shape[-1]) + self.Sigma @ F 
+            Sigma_new = lu_solve(lu_factor(tmp), self.Sigma)
+            mu_new = Sigma_new @ lam
+
+            return (mu_new, Sigma_new, M_x), None
+
+        init = (self.mu, self.Sigma, lax.stop_gradient(M_x))
+        (params, covariance, _), _ = lax.scan(step_fn, init, jnp.arange(self.num_iters))
+
+        # compute loss as  E_{q(\beta)q(\omega)}[\ln q(\omega) - \log p(y, \omega|\beta, x)]
+        weights = params[:-1] if self.use_bias else params
+        bias = params[-1] if self.use_bias else 0.0
+
+        logits = features @ weights + bias
+        
+        if self.loss_type == 0:
+            logits = jnp.pad(logits, [(0, 0), (0, 1)]) - jnp.sum(b * nn.softplus(logits), -1)
+            loss = - (y_onehots * logits).sum(-1)
+
+        elif self.loss_type == 1:
+            M_beta = covariance + params @ params.mT
+            psi = jnp.sqrt(
+                jnp.sum(M_beta * jnp.expand_dims(M_x, -3), axis=(-1, -2))
+            )
+            logits = jnp.pad(logits, [(0, 0), (0, 1)]) \
+                + jnp.sum(b * ((psi - logits) / 2  - nn.softplus(psi)) )
+            # loss = jnp.sum(logits * kappa + b * (psi / 2 - nn.softplus(psi) ), -1)
+            loss = - (y_onehots * logits).sum(-1)
+
+        return loss, logits if with_logits else loss
