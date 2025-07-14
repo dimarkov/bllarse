@@ -110,7 +110,7 @@ class IBProbit(eqx.Module):
             loss_cbm = optax.safe_softmax_cross_entropy(jnp.nan_to_num(logits), y_one_hot)
             loss_cbc = optax.safe_softmax_cross_entropy(logits2, y_one_hot)
 
-            loss = 0.5 * (loss_cbm + nn.softplus(loss_cbc - loss_cbm))
+            loss = loss_cbm - nn.softplus(loss_cbm - loss_cbc) + jnp.log(2)
 
         if with_logits:
             return loss, logits
