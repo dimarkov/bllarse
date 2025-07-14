@@ -173,7 +173,7 @@ class MultinomialPolyaGamma(eqx.Module):
             psi = jnp.sqrt(jnp.sum(E_betabetaT * xxT, axis=(-1, -2)))
 
             rho = 0.5 * b * jnp.tanh(psi / 2) / (psi + 1e-8)
-            F = jnp.sum(rho[..., None, None] * xxT, axis=0) / 2
+            F = jnp.sum(rho[..., None, None] * xxT, axis=0)
             tmp = jnp.eye(x.shape[-1]) + self.Sigma @ F 
             Sigma_new = lu_solve(lu_factor(tmp), self.Sigma)
             mu_new = (Sigma_new @ lam).squeeze(-1)
@@ -195,6 +195,7 @@ class MultinomialPolyaGamma(eqx.Module):
         if loss_type == 0:
             logits = jnp.pad(logits, [(0, 0), (0, 1)]) - nn.softplus(logits) @ b_ky
             loss = - jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
+            return (loss, logits) if with_logits else loss
 
         elif loss_type == 1:
             params = self.mu.mT
@@ -204,8 +205,12 @@ class MultinomialPolyaGamma(eqx.Module):
             psi = jnp.sqrt(
                 jnp.sum(E_betabetaT * xxT, axis=(-1, -2))
             )
-            logits = jnp.pad(logits, [(0, 0), (0, 1)]) + ((psi - logits) / 2  - nn.softplus(psi)) @ b_ky
-            # loss =  - jnp.sum(logits * kappa + b * (psi / 2 - nn.softplus(psi) ), -1)
-            loss = - jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
 
-        return (loss, logits) if with_logits else loss
+            if with_logits:
+                logits = jnp.pad(logits, [(0, 0), (0, 1)]) + ((psi - logits) / 2  - nn.softplus(psi)) @ b_ky
+                loss = - jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
+                return loss, logits
+            else:
+                b, kappa = self.get_b_kappa(y)
+                loss = - jnp.sum(logits * kappa + b * (psi / 2 - nn.softplus(psi) ), -1)
+                return loss
