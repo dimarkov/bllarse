@@ -68,7 +68,7 @@ class IBProbit(eqx.Module):
             eta = self.eta + fts.T @ E_q_z
             return eta, None
 
-        eta_new, _ = lax.scan(step_fn, self.eta, jnp.arange(num_iters - 1))
+        eta_new, _ = lax.scan(step_fn, self.eta, jnp.arange(num_iters))
 
         return eqx.tree_at(lambda x: (x.eta, x.Sigma), self, (eta_new, Sigma_new))
     
@@ -150,9 +150,9 @@ class MultinomialPolyaGamma(eqx.Module):
         return 1 - jnp.pad(jnp.eye(nc)[..., :-2], [(0, 0), (1, 0)]).cumsum(-1)
 
     def get_b_kappa(self, y: Array):
-        delta_ky = nn.one_hot(y, self.mu.shape[-1])
-        b = self.__get_b_ky()[y]
-        kappa = delta_ky - b / 2
+        y_onehot = nn.one_hot(y, self.mu.shape[-1] + 1)
+        b = y_onehot @ self.__get_b_ky()
+        kappa = y_onehot[..., :-1] - b / 2
 
         return b, kappa
 
@@ -185,7 +185,6 @@ class MultinomialPolyaGamma(eqx.Module):
 
         return eqx.tree_at(lambda x: (x.mu, x.Sigma), self, (mu_trans.mT, Sigma))
 
-
     def __call__(self, features: Array, y: Array, *, with_logits: bool = False, loss_type: int = 0):
 
         x = jnp.pad(features, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
@@ -194,7 +193,7 @@ class MultinomialPolyaGamma(eqx.Module):
         
         if loss_type == 0:
             logits = jnp.pad(logits, [(0, 0), (0, 1)]) - nn.softplus(logits) @ b_ky
-            loss = - jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
+            loss = - jnp.sum(logits * nn.one_hot(y, self.mu.shape[-1] + 1), -1)
             return (loss, logits) if with_logits else loss
 
         elif loss_type == 1:
@@ -208,7 +207,7 @@ class MultinomialPolyaGamma(eqx.Module):
 
             if with_logits:
                 logits = jnp.pad(logits, [(0, 0), (0, 1)]) + ((psi - logits) / 2  - nn.softplus(psi)) @ b_ky
-                loss = - jnp.take_along_axis(logits, y[..., None], axis=-1).squeeze(-1)
+                loss = - jnp.sum(logits * nn.one_hot(y, self.mu.shape[-1] + 1), -1)
                 return loss, logits
             else:
                 b, kappa = self.get_b_kappa(y)
