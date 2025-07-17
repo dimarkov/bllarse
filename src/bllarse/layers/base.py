@@ -1,5 +1,5 @@
 import equinox as eqx
-
+from jax import random as jr 
 from typing import Optional
 from jaxtyping import Array, PRNGKeyArray as PRNGKey
 

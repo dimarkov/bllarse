@@ -20,7 +20,7 @@ from jax import random as jr, nn, vmap, config
 from blrax.optim import ivon
 from mlpox.load_models import load_model
 
-from bllarse.losses import MSE, CrossEntropy
+from bllarse.losses import MSE, CrossEntropy, BayesianMultinomialProbit
 from bllarse.layers import LastLayer
 from bllarse.utils import run_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, MEAN_DICT, STD_DICT
 
@@ -85,10 +85,16 @@ def main(args, m_config, o_config):
         loss_fn = MSE(m_config['num_classes'])
     if args.loss_function == 'CrossEntropy':
         loss_fn = CrossEntropy(args.label_smooth, m_config['num_classes'])
+    if args.loss_function == 'BayesianMultinomialProbit':
+        key, _key = jr.split(key)
+        loss_fn = BayesianMultinomialProbit(_key, m_config['embed_dim'], m_config['num_classes'])
 
     # get pretrained network test stats
-    nnet = partial(last_layer, pretrained_nnet)
-    acc, nll, ece = evaluate_model(augdata, loss_fn, nnet, test_ds['image'], test_ds['label'])
+    if hasattr(loss_fn, 'mu'):
+        acc, nll, ece = evaluate_model(augdata, loss_fn, pretrained_nnet, test_ds['image'], test_ds['label'])
+    else:
+        nnet = partial(last_layer, pretrained_nnet)
+        acc, nll, ece = evaluate_model(augdata, loss_fn, nnet, test_ds['image'], test_ds['label'])
     print(f'pre-trained test acc={acc:.3f}, ece={ece:.3f}, nll={nll:.3f}')
 
     # set optimizer
@@ -113,14 +119,13 @@ def main(args, m_config, o_config):
 
     # run training
     opt_state = None
-    trained_ll = last_layer
+    trained_loss_fn = loss_fn
     for i in range(num_epochs // save_every):
         key, _key = jr.split(key)
-        trained_ll, opt_state, metrics = run_training(
+        trained_loss_fn, opt_state, metrics = run_training(
             _key,
-            trained_ll,
             pretrained_nnet,
-            loss_fn,
+            trained_loss_fn,
             optim,
             augdata,
             train_ds, 
@@ -132,7 +137,7 @@ def main(args, m_config, o_config):
         )
 
         #TODO: save model checkpoint, opt_state, and test metrics
-        to_save = {"nnet": last_layer, "opt_state": opt_state, "metrics": metrics}
+        to_save = {"loss_fn": trained_loss_fn, "opt_state": opt_state, "metrics": metrics}
         vals = jtu.tree_map(lambda x: x[-1], metrics)
         print(i, [(name, f'{vals[name].item():.3f}') for name in vals])
 
@@ -140,7 +145,7 @@ def main(args, m_config, o_config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="deep MLP training")
     parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion'], default='ivon', type=str)
-    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy'], default='CrossEntropy', type=str)
+    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'BayesianMultinomialProbit'], default='CrossEntropy', type=str)
     parser.add_argument('--num-blocks', choices=[6, 12], default=6, type=int, help='Allowed number of blocks/layers')
     parser.add_argument('--embed-dim', choices=[512, 1024], default=512, type=int, help='Allowed embedding dimensions')
     parser.add_argument("--device", nargs='?', default='gpu', type=str)
