@@ -20,8 +20,8 @@ class IBProbit(eqx.Module):
     """
     eta: Array  # natural parameter Sigma_inv @ mu
     Sigma: Array
-    use_bias: bool
-    cdf: Callable
+    use_bias: bool = eqx.static_field()
+    cdf: Callable = eqx.static_field()  # cumulative distribution function, default is approx_cdf
 
     def __init__(
         self,
