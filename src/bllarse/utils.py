@@ -266,11 +266,6 @@ def run_bayesian_training(
         True,            # turn off dropout / BN statistics
     )
 
-    @eqx.filter_jit
-    def extract_features(x):
-        # vmap to keep things simple (batch, …) → (batch, embed_dim)
-        return vmap(headless_nnet)(x)
-
     # ----------------------------------------------------------------
     # 2)  Helper: evaluate on (full) test set
     # ----------------------------------------------------------------
