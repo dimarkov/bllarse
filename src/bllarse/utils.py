@@ -293,7 +293,7 @@ def run_bayesian_training(
     # 4)  One training epoch (scan over mini-batches)
     # ----------------------------------------------------------------
     def epoch_body(carry, epoch_key):
-        current_loss_fn = carry
+        current_model = carry
         ds_size         = train_ds["label"].shape[0]
         img_shape       = train_ds["image"].shape[1:]
         n_batches       = ds_size // batch_size
@@ -320,20 +320,25 @@ def run_bayesian_training(
             imgs, labs, k = scans
             return batch_update(loss_fn_b, imgs, labs, k)
 
-        current_loss_fn, batch_losses = lax.scan(
-            batch_body, current_loss_fn, (img_batches, label_batches, batch_keys)
+        updated_model, batch_losses = lax.scan(
+            batch_body, current_model, (img_batches, label_batches, batch_keys)
         )
 
         # validation metrics (after epoch)
-        nll, acc, ece, _ = evaluate(current_loss_fn)
-
-        metrics = dict(
-            loss=batch_losses.mean(),
-            nll=nll,
-            acc=acc,
-            ece=ece,
+        acc, nll, ece = evaluate(
+            updated_model,
+            test_ds['image'],
+            test_ds['label'],
         )
-        return current_loss_fn, metrics
+
+        metrics = {
+            'loss': batch_losses.mean(),
+            'acc': acc,
+            'ece': ece,
+            'nll': nll,
+        }
+
+        return updated_model, metrics
 
     # ----------------------------------------------------------------
     # 5)  Main training loop (scan over epochs)
@@ -341,8 +346,4 @@ def run_bayesian_training(
     epoch_keys = jr.split(key, num_epochs)
     trained_loss_fn, metrics_seq = lax.scan(epoch_body, bayesian_model, epoch_keys)
 
-    # `lax.scan` stacks dict‐values; convert to {k:jnp.ndarray}
-    stacked_metrics = {
-        k: jnp.stack([m[k] for m in metrics_seq]) for k in metrics_seq[0]
-    }
-    return trained_loss_fn, stacked_metrics
+    return trained_loss_fn, metrics_seq
