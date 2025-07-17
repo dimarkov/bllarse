@@ -81,15 +81,29 @@ def augmentdata(img, key=None, **kwargs):
 
 def evaluate_model(data_augmentation, loss_fn, nnet, images, labels):
     aug_images = data_augmentation(images, key=None)
-    if hasattr(loss_fn, 'mu'): # Bayesian case
-        loss, logits, _ = loss_fn(nnet, aug_images, labels, with_logits=True)
-    else: # Classical case
-        loss, logits = loss_fn(nnet, aug_images, labels, with_logits=True)
-    
+    loss, logits = loss_fn(nnet, aug_images, labels, with_logits=True)
     predictions = jnp.argmax(logits, axis=-1)
     acc = jnp.mean(predictions == labels)
     ece = compute_ece(20, logits=logits, labels_true=labels, labels_predicted=predictions)
     return acc, loss, ece
+
+def evaluate_bayesian_model(data_augmentation, loss_fn, pretrained_nnet, images, labels):
+    """
+    Bayesian version of `evaluate_model`. 
+    #TODO: Re-write `evaluate_model` and `evaluate_bayesian_model()` into a single function
+    with branching on `if any(hasattr(loss_fn, attr) for attr in ["eta", "mu"])`:
+    """
+    aug_images = data_augmentation(images, key=None)
+    feats    = extract_features(pretrained_nnet, aug_images)
+    loss, logits = loss_fn(feats, labels, with_logits=True)
+    predictions = jnp.argmax(logits, axis=-1)
+    acc = jnp.mean(predictions == labels)
+    ece = compute_ece(20, logits=logits, labels_true=labels, labels_predicted=predictions)
+    return acc, loss.mean(), ece
+
+def extract_features(nnet, x):
+    # vmap to keep things simple (batch, …) → (batch, embed_dim)
+    return vmap(nnet)(x)
 
 def run_training(
     key,
