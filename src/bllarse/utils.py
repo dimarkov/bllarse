@@ -269,20 +269,12 @@ def run_bayesian_training(
     # ----------------------------------------------------------------
     # 2)  Helper: evaluate on (full) test set
     # ----------------------------------------------------------------
+    # Evaluation function
     @eqx.filter_jit
-    def evaluate(current_loss_fn):
-        aug_test = data_augmentation(test_ds["image"], key=None)
-        feats    = extract_features(aug_test)
-        # we only need logits for metrics – loss is NLL
-        loss, logits = current_loss_fn(feats, test_ds["label"], with_logits=True)
-
-        preds = jnp.argmax(logits, axis=-1)
-        acc   = (preds == test_ds["label"]).mean()
-        ece   = compute_ece(
-            20, logits=logits, labels_true=test_ds["label"], labels_predicted=preds
+    def evaluate(model, images, labels):
+        return evaluate_bayesian_model(
+            data_augmentation, model, headless_nnet, images, labels
         )
-        return loss.mean(), acc, ece, logits
-
     # ----------------------------------------------------------------
     # 3)  One mini-batch update (CAVI / PG)
     # ----------------------------------------------------------------
