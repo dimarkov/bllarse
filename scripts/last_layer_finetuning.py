@@ -22,7 +22,7 @@ from mlpox.load_models import load_model
 
 from bllarse.losses import MSE, CrossEntropy, BayesianMultinomialProbit
 from bllarse.layers import LastLayer
-from bllarse.utils import run_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, MEAN_DICT, STD_DICT
+from bllarse.utils import run_training, run_bayesian_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, MEAN_DICT, STD_DICT
 
 def main(args, m_config, o_config):
     dataset = args.dataset
@@ -122,19 +122,33 @@ def main(args, m_config, o_config):
     trained_loss_fn = loss_fn
     for i in range(num_epochs // save_every):
         key, _key = jr.split(key)
-        trained_loss_fn, opt_state, metrics = run_training(
-            _key,
-            pretrained_nnet,
-            trained_loss_fn,
-            optim,
-            augdata,
-            train_ds, 
-            test_ds,
-            opt_state=opt_state,
-            mc_samples=mc_samples,
-            num_epochs=save_every,
-            batch_size=batch_size
-        )
+        if hasattr(trained_loss_fn, "update"):     # ==> Bayesian last layer
+            trained_loss_fn, metrics = run_bayesian_training(
+                _key,
+                pretrained_nnet,
+                trained_loss_fn,
+                augdata,
+                train_ds,
+                test_ds,
+                num_epochs=save_every,
+                batch_size=batch_size,
+            )
+            opt_state = None                       # keep interface untouched
+        else:                                      # ==> classical optimiser-based
+            trained_loss_fn, opt_state, metrics = run_training(
+                _key,
+                pretrained_nnet,
+                trained_loss_fn,
+                optim,
+                augdata,
+                train_ds,
+                test_ds,
+                opt_state=opt_state,
+                mc_samples=mc_samples,
+                num_epochs=save_every,
+                batch_size=batch_size,
+            )
+
 
         #TODO: save model checkpoint, opt_state, and test metrics
         to_save = {"loss_fn": trained_loss_fn, "opt_state": opt_state, "metrics": metrics}
