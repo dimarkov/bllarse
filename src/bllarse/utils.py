@@ -246,7 +246,7 @@ def run_bayesian_training(
     *,
     num_epochs: int = 1,
     batch_size: int = 32,
-    update_iters: int = 32,  # CAVI/PG iterations per mini-batch
+    num_update_iters: int = 32,  # CAVI/PG iterations per mini-batch
 ):
     """
     Variational Bayes fine-tuning of the last layer (`loss_fn`) while the
