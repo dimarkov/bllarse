@@ -281,10 +281,10 @@ def run_bayesian_training(
     @eqx.filter_jit
     def batch_update(current_model, batch_imgs, batch_labels, k):
         aug_imgs   = data_augmentation(batch_imgs, key=k)
-        feats      = extract_features(aug_imgs)
-        # closed-form VI update; returns *new* loss_fn
+        feats      = extract_features(headless_nnet, aug_imgs)
+        # closed-form VI update; returns *new* model where prior parameters = posterior params at the end of updating
         updated_model = current_model.update(feats, batch_labels,
-                                            num_iters=update_iters)
+                                            num_iters=num_update_iters)
         # training NLL (after the update)
         loss = updated_model(feats, batch_labels).mean()
         return updated_model, loss
