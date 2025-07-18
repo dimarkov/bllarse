@@ -7,11 +7,16 @@ from jax.scipy.linalg import lu_factor, lu_solve, solve
 from jaxtyping import Array, PRNGKeyArray as PRNGKey
 from typing import Optional, Tuple, Callable
 from functools import partial
+from einops import einsum
 
 const = jnp.sqrt(2 / jnp.pi)
 
 def approx_cdf(x):
-    return 0.5 * ( 1 + jnp.tanh(const * (x + 0.044715 * x ** 3)))
+    return nn.sigmoid(2 * const * (x + 0.044715 * x ** 3) )
+
+def approx_logcdf(x):
+    z = 2 * const * (x + 0.044715 * x ** 3)
+    return z - nn.softplus(z)
 
 class IBProbit(eqx.Module):
     """
@@ -20,8 +25,10 @@ class IBProbit(eqx.Module):
     """
     eta: Array  # natural parameter Sigma_inv @ mu
     Sigma: Array
-    use_bias: bool = eqx.static_field()
-    cdf: Callable = eqx.static_field()  # cumulative distribution function, default is approx_cdf
+    use_bias: bool
+    cdf: Callable
+    logcdf: Callable
+    norm: eqx.nn.LayerNorm
 
     def __init__(
         self,
@@ -37,6 +44,8 @@ class IBProbit(eqx.Module):
         self.Sigma = jnp.eye(input_dim + int(use_bias))
         self.use_bias = use_bias
         self.cdf = approx_cdf if use_approx_cdf else norm.cdf
+        self.logcdf = approx_logcdf if use_approx_cdf else norm.logcdf
+        self.norm = eqx.nn.LayerNorm(input_dim, use_weight=False, use_bias=False)
 
     def reset(self, key: PRNGKey) -> "IBProbit":
         d, num_classes = self.eta.shape
@@ -45,9 +54,11 @@ class IBProbit(eqx.Module):
         return eqx.tree_at(lambda x: (x.eta, x.Sigma), self, (eta, Sigma))
 
     def update(self, features: Array, y: Array, *, num_iters: int = 32) -> "IBProbit":
-        fts = jnp.pad(lax.stop_gradient(features), [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
+        fts = vmap(self.norm)(lax.stop_gradient(features))
+        fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
 
-        luf = lu_factor(jnp.eye(fts.shape[-1]) + self.Sigma @ (fts.T @ fts))
+        xxT = einsum(fts, fts, 'batch i, batch j -> i j')
+        luf = lu_factor(jnp.eye(fts.shape[-1]) + self.Sigma @ xxT)
         Sigma_new = lu_solve(luf, self.Sigma)
         y_one_hot = nn.one_hot(y, self.eta.shape[-1])
         
@@ -64,8 +75,8 @@ class IBProbit(eqx.Module):
             Phi = self.cdf(-pred)
 
             # Update variational mean
-            E_q_z = pred + phi * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-8)
-            eta = self.eta + fts.T @ E_q_z
+            E_q_z = pred + phi * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
+            eta = self.eta + einsum(fts, E_q_z, 'batch d, batch k -> d k')
             return eta, None
 
         eta_new, _ = lax.scan(step_fn, self.eta, jnp.arange(num_iters))
@@ -81,9 +92,10 @@ class IBProbit(eqx.Module):
         weights, bias = self.params
 
         y_one_hot = nn.one_hot(y, weights.shape[-1])
+        fts = vmap(self.norm)(features)
 
         # compute loss
-        logits = features @ weights + bias if self.use_bias else features @ weights
+        logits = fts @ weights + bias if self.use_bias else fts @ weights
 
         # note: computation of loss is relevant for gradients over model parameters
         if loss_type == 0:
@@ -92,23 +104,21 @@ class IBProbit(eqx.Module):
 
         elif loss_type == 1:
             # CBM Loss
-            logits = jnp.log(self.cdf(logits))
+            logits = self.logcdf(logits) # jnp.log(self.cdf(logits))
             loss = optax.safe_softmax_cross_entropy(logits, y_one_hot)
 
         elif loss_type == 2:
             # CBC Loss
-            probs = self.cdf(logits)
-            logits = jnp.nan_to_num(jnp.log(probs) - jnp.log(1 - probs))
+            logits = self.logcdf(logits) - self.logcdf(- logits)
             loss = optax.safe_softmax_cross_entropy(logits, y_one_hot)
 
         elif loss_type == 3:
             # mixed loss
-            probs = self.cdf(logits)
-            logits = jnp.log(probs)
-            logits2 = jnp.nan_to_num(logits - jnp.log(1 - probs))
+            logits1 = self.logcdf(logits)
+            logits = logits1 - self.logcdf(-logits)
 
-            loss_cbm = optax.safe_softmax_cross_entropy(jnp.nan_to_num(logits), y_one_hot)
-            loss_cbc = optax.safe_softmax_cross_entropy(logits2, y_one_hot)
+            loss_cbm = optax.safe_softmax_cross_entropy(logits1, y_one_hot)
+            loss_cbc = optax.safe_softmax_cross_entropy(logits, y_one_hot)
 
             loss = loss_cbm - nn.softplus(loss_cbm - loss_cbc) + jnp.log(2)
 
