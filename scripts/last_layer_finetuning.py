@@ -24,6 +24,8 @@ from bllarse.losses import MSE, CrossEntropy, IBProbit
 from bllarse.layers import LastLayer
 from bllarse.utils import run_training, run_bayesian_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, evaluate_bayesian_model, MEAN_DICT, STD_DICT
 
+config.update("jax_default_matmul_precision", "highest")
+
 def main(args, m_config, o_config):
     dataset = args.dataset
     seed = args.seed
@@ -97,10 +99,13 @@ def main(args, m_config, o_config):
             eqx.tree_at(lambda m: m.fc, pretrained_nnet, eqx.nn.Identity()),
             True,            
         )
-        acc, nll, ece = evaluate_bayesian_model(augdata, loss_fn, headless_nnet, test_ds['image'], test_ds['label'])
     else:
         nnet = partial(last_layer, pretrained_nnet)
-        acc, nll, ece = evaluate_model(augdata, loss_fn, nnet, test_ds['image'], test_ds['label'])
+    
+    # evaluate original model
+    nnet = partial(last_layer, pretrained_nnet)
+    _loss_fn = CrossEntropy(0.0, m_config['num_classes'])
+    acc, nll, ece = evaluate_model(augdata, _loss_fn, nnet, test_ds['image'], test_ds['label'])
     print(f'pre-trained test acc={acc:.3f}, ece={ece:.3f}, nll={nll:.3f}')
 
     # set optimizer
