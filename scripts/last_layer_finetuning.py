@@ -37,8 +37,8 @@ def main(args, m_config, o_config):
 
     # load data
     ds = load_dataset(dataset).with_format("jax")
-    train_ds = {'image': ds['train']['img'].astype(jnp.float32), 'label': ds['train']['label'] }
-    test_ds = {'image': ds['test']['img'].astype(jnp.float32), 'label': ds['test']['label'] }
+    train_ds = {'image': ds['train']['img'][:].astype(jnp.float32), 'label': ds['train']['label'][:] }
+    test_ds = {'image': ds['test']['img'][:].astype(jnp.float32), 'label': ds['test']['label'][:] }
 
     datasize = ds['train'].num_rows
     num_iters = num_epochs * datasize // batch_size
@@ -169,8 +169,8 @@ def main(args, m_config, o_config):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="deep MLP training")
-    parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', "cavi"], default='ivon', type=str)
-    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='CrossEntropy', type=str)
+    parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', "cavi"], default='cavi', type=str)
+    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='IBProbit', type=str)
     parser.add_argument('--num-blocks', choices=[6, 12], default=6, type=int, help='Allowed number of blocks/layers')
     parser.add_argument('--embed-dim', choices=[512, 1024], default=512, type=int, help='Allowed embedding dimensions')
     parser.add_argument("--device", nargs='?', default='gpu', type=str)

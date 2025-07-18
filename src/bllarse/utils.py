@@ -292,8 +292,10 @@ def run_bayesian_training(
     # ----------------------------------------------------------------
     # 4)  One training epoch (scan over mini-batches)
     # ----------------------------------------------------------------
+
+    params, static = eqx.partition(bayesian_model, eqx.is_array)
     def epoch_body(carry, epoch_key):
-        current_model = carry
+        current_model_params = carry
         ds_size         = train_ds["label"].shape[0]
         img_shape       = train_ds["image"].shape[1:]
         n_batches       = ds_size // batch_size
@@ -316,13 +318,18 @@ def run_bayesian_training(
         batch_keys = jr.split(aug_key, n_batches)
 
         # scan over mini-batches
-        def batch_body(loss_fn_b, scans):
-            imgs, labs, k = scans
-            return batch_update(loss_fn_b, imgs, labs, k)
+        def batch_body(loss_params, scans):
+            loss_fn = eqx.combine(loss_params, static)
+            imgs, labels, k = scans
+            updated_loss_model, loss = batch_update(loss_fn, imgs, labels, k)
+            updated_loss_params = eqx.filter(updated_loss_model, eqx.is_array)
+            return updated_loss_params, loss
 
-        updated_model, batch_losses = lax.scan(
-            batch_body, current_model, (img_batches, label_batches, batch_keys)
+        updated_loss_params, batch_losses = lax.scan(
+            batch_body, current_model_params, (img_batches, label_batches, batch_keys)
         )
+
+        updated_model = eqx.combine(updated_loss_params, static)
 
         # validation metrics (after epoch)
         acc, nll, ece = evaluate(
@@ -338,12 +345,14 @@ def run_bayesian_training(
             'nll': nll,
         }
 
-        return updated_model, metrics
+        return updated_loss_params, metrics
 
     # ----------------------------------------------------------------
     # 5)  Main training loop (scan over epochs)
     # ----------------------------------------------------------------
     epoch_keys = jr.split(key, num_epochs)
-    trained_loss_fn, metrics_seq = lax.scan(epoch_body, bayesian_model, epoch_keys)
+    updated_loss_params, metrics_seq = lax.scan(epoch_body, params, epoch_keys)
 
-    return trained_loss_fn, metrics_seq
+    trained_loss_model = eqx.combine(updated_loss_params, static)
+
+    return trained_loss_model, metrics_seq
