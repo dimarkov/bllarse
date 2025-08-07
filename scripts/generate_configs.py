@@ -23,8 +23,8 @@ def make_base(args):
         dataset        = "cifar10",
         epochs         = 100,
         save_every     = 10,
-        embed_dim      = 512,
-        num_blocks     = 6,
+        embed_dim      = 1024,
+        num_blocks     = 12,
         pretrained     = "in21k_cifar",
         enable_wandb   = True,
         group_id       = args.group,
@@ -32,8 +32,8 @@ def make_base(args):
 
 GRID = dict(
     seed            = [0, 1, 2, 3, 4, 5],
-    batch_size      = [32, 64, 128],
-    num_update_iters= [8, 16, 32, 64],
+    batch_size      = [32, 64, 128, 256, 512],
+    num_update_iters= [1, 2, 4, 8, 16, 32],
 )
 
 def main(args):
