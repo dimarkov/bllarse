@@ -15,8 +15,6 @@ set -euo pipefail
 
 # ---------------- inputs ----------------
 YAML=$1          # first positional arg
-SWEEP_NAME=$2    # second positional arg → becomes job-name
-# ----------------------------------------
 
 # path to repo root (visible both outside & inside the container)
 REPO_ROOT=$(git rev-parse --show-toplevel)
