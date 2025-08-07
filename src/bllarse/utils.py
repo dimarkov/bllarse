@@ -4,6 +4,8 @@ from jax import nn, lax, numpy as jnp, vmap, random as jr
 from tensorflow_probability.substrates.jax.stats import expected_calibration_error as compute_ece
 from functools import partial
 import optax
+import wandb
+import numpy as onp
 
 from blrax.states import ScaleByIvonState
 from blrax.utils import noisy_value_and_grad, get_scale, sample_posterior
@@ -250,6 +252,7 @@ def run_bayesian_training(
     num_epochs: int = 1,
     batch_size: int = 32,
     num_update_iters: int = 32,  # CAVI/PG iterations per mini-batch
+    log_to_wandb=False,
 ):
     """
     Variational Bayes fine-tuning of the last layer (`loss_fn`) while the
@@ -392,5 +395,19 @@ def run_bayesian_training(
 
     trained_loss_model = eqx.combine(updated_loss_params, loss_static)
     trained_nnet = eqx.combine(nnet_params, nnet_static)
+
+    if log_to_wandb:
+        # turn DeviceArrays → python scalars so wandb is happy
+        metrics_np = jtu.tree_map(lambda x: onp.asarray(x), metrics_seq)
+        for ep in range(num_epochs):
+            wandb.log(
+                {
+                    "epoch": ep + 1,
+                    "loss": float(metrics_np["loss"][ep]),
+                    "nll":  float(metrics_np["nll"][ep]),
+                    "acc":  float(metrics_np["acc"][ep]),
+                    "ece":  float(metrics_np["ece"][ep]),
+                }
+            )
 
     return trained_loss_model, trained_nnet, opt_state, metrics_seq
