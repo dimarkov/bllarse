@@ -95,10 +95,6 @@ def main(args, m_config, o_config):
     # get pretrained network test stats
     if hasattr(loss_fn, "update"):  
         assert "cavi" in o_config, "Bayesian last layer requires CAVI optimizer"
-        headless_nnet = eqx.nn.inference_mode(
-            eqx.tree_at(lambda m: m.fc, pretrained_nnet, eqx.nn.Identity()),
-            True,            
-        )
     else:
         nnet = partial(last_layer, pretrained_nnet)
     
