@@ -71,11 +71,22 @@ class IBProbit(eqx.Module):
             pred = x @ eta
 
             # Compute E_q[z_ik]
-            phi = norm.pdf(-pred)
-            Phi = self.cdf(-pred)
+            # pred has shape (batch, num_classes)
+            # y_one_hot is one-hot in the same shape
+            s = 2.0 * y_one_hot - 1.0                      # {-1, +1}
 
-            # Update variational mean
-            E_q_z = pred + phi * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
+            # log phi(mu) = -mu²/2 - log(sqrt(2*pi))
+            log_phi = -0.5 * pred**2 + jnp.log(0.5 * const)
+
+            # log Phi(s mu) )
+            log_Phi   = self.logcdf(s * pred)
+
+            # phi(mu)/Phi(s mu) computed stably
+            ratio   = jnp.exp(log_phi - log_Phi)
+
+            # Update variational mean, using truncated-normal expectation
+            E_q_z   = pred + s * ratio
+
             eta = self.eta + einsum(fts, E_q_z, 'batch d, batch k -> d k')
             return eta, None
 
