@@ -10,6 +10,41 @@ from functools import partial
 
 from bllarse.losses.bayesian import IBProbit, IBPolyaGamma, MultinomialPolyaGamma
 
+from jax import nn, lax
+from jax.scipy.stats import norm
+from jax.scipy.linalg import lu_factor, lu_solve
+from einops import einsum
+
+from tensorflow_probability.substrates.jax.stats import expected_calibration_error as compute_ece
+
+class IBProbit_BUG(IBProbit):
+    def update(self, features, y, *, num_iters: int = 32):
+        fts = jax.vmap(self.norm)(lax.stop_gradient(features))
+        fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
+
+        xxT = einsum(fts, fts, 'batch i, batch j -> i j')
+        Sigma_new = lu_solve(lu_factor(jnp.eye(fts.shape[-1]) + self.Sigma @ xxT), self.Sigma)
+        y_one_hot = nn.one_hot(y, self.eta.shape[-1])
+        x = fts @ Sigma_new
+
+        def step_fn(carry, *args):
+            # One step of Coordinate Ascent Variational Inference (CAVI) for the probit model.
+            eta = carry
+
+            pred = x @ eta
+
+            # Compute E_q[z_ik]
+            phi = norm.pdf(-pred)
+            Phi = self.cdf(-pred)
+
+            # Update variational mean
+            E_q_z = pred + phi * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
+            eta = self.eta + einsum(fts, E_q_z, 'batch d, batch k -> d k')
+            return eta, None
+
+        eta_new, _ = lax.scan(step_fn, self.eta, jnp.arange(num_iters))
+        return eqx.tree_at(lambda z: (z.eta, z.Sigma), self, (eta_new, Sigma_new))
+    
 def generate_data(key, n_samples, n_features, n_classes):
     """Generate synthetic data for multinomial logistic regression."""
     key, subkey = jr.split(key)
@@ -72,6 +107,70 @@ def benchmark_loss_vs_iterations(key):
     plt.grid(True)
     plt.savefig("loss_vs_iterations.png")
     plt.close()
+
+
+def compare_ez_fix_synthetic(key):
+    n_samples, n_features, n_classes = 10_000, 200, 50
+    X, y, *_ = generate_data(key, n_samples, n_features, n_classes)
+    y = y.astype(jnp.int32)  # ensure integer labels for one-hot/ECE
+
+    # initialise both models identically
+    key, k1, k2 = jr.split(key, 3)
+    new = IBProbit(n_features, n_classes, key=k1)
+    old = IBProbit_BUG(n_features, n_classes, key=k2)
+    old = eqx.tree_at(lambda z: (z.eta, z.Sigma), old, (new.eta, new.Sigma))
+
+    iters = jnp.arange(1, 16)  # 1..64
+    nll_new, nll_old, ece_new, ece_old = [], [], [], []
+
+    for n in iters:
+        m_new = new.update(X, y, num_iters=int(n))
+        m_old = old.update(X, y, num_iters=int(n))
+
+        # CBC-style NLL (loss_type=2 gives log-odds via logcdf/logcdf)
+        loss_new, logits_new = m_new(X, y, with_logits=True, loss_type=2)
+        loss_old, logits_old = m_old(X, y, with_logits=True, loss_type=2)
+        nll_new.append(loss_new.mean())
+        nll_old.append(loss_old.mean())
+
+        pred_new = jnp.argmax(logits_new, axis=-1)
+        pred_old = jnp.argmax(logits_old, axis=-1)
+        ece_new.append(compute_ece(20, logits=logits_new, labels_true=y, labels_predicted=pred_new))
+        ece_old.append(compute_ece(20, logits=logits_old, labels_true=y, labels_predicted=pred_old))
+
+    nll_new = jnp.stack(nll_new); nll_old = jnp.stack(nll_old)
+    ece_new = jnp.stack(ece_new); ece_old = jnp.stack(ece_old)
+
+    # plots
+    plt.figure(figsize=(10,4))
+    # Left: NLL (symlog) up to 32 iters
+    plt.subplot(1,2,1)
+    plt.plot(iters, nll_old[:len(iters)], label="old E[z]")
+    plt.plot(iters, nll_new[:len(iters)], label="fixed E[z]")
+    plt.yscale("symlog", linthresh=1e-3)
+    plt.xlabel("# CAVI iterations (≤32)")
+    plt.ylabel("NLL")
+    plt.title("Synthetic NLL (symlog)")
+    plt.grid(True); plt.legend()
+
+    # Right: ECE up to 32 iters
+    plt.subplot(1,2,2)
+    plt.plot(iters, ece_old[:len(iters)], label="old E[z]")
+    plt.plot(iters, ece_new[:len(iters)], label="fixed E[z]")
+    plt.xlabel("# CAVI iterations (≤32)")
+    plt.ylabel("ECE (20 bins)")
+    plt.title("Synthetic ECE")
+    plt.grid(True); plt.legend()
+    plt.tight_layout(); plt.savefig("ibprobit_ez_fix_synthetic.png"); plt.close()
+
+    plt.figure(figsize=(8,4))
+    plt.plot(iters, (nll_old - nll_new)[:len(iters)], label="ΔNLL (old - fixed)")
+    plt.plot(iters, (ece_old - ece_new)[:len(iters)], label="ΔECE (old - fixed)")
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.xlabel("# CAVI iterations (≤32)")
+    plt.title("Benefit of corrected E[z]")
+    plt.grid(True); plt.legend()
+    plt.tight_layout(); plt.savefig("ibprobit_ez_fix_synthetic_delta.png"); plt.close()
 
 def benchmark_runtimes(key):
     n_classes = 10
@@ -384,7 +483,11 @@ def benchmark_accuracy(key):
 
 
 if __name__ == "__main__":
-    main_key = jr.PRNGKey(42)
+    main_key = jr.PRNGKey(3)
+
+    print("--- Benchmarking E[z] Fix ---")
+    compare_ez_fix_synthetic(main_key)
+    print("Plot saved to ibprobit_ez_fix_synthetic.png")
     
     print("--- Benchmarking Loss vs. Iterations ---")
     benchmark_loss_vs_iterations(main_key)
