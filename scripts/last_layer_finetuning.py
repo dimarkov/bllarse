@@ -97,11 +97,16 @@ def main(args, m_config, o_config):
         assert "cavi" in o_config, "Bayesian last layer requires CAVI optimizer"
     else:
         nnet = partial(last_layer, pretrained_nnet)
+
+    if args.nodataaug:
+        _augdata = lambda img, key=None, **kwargs: augdata(img, key=None, **kwargs)
+    else:
+        _augdata = augdata
     
     # evaluate original model
     nnet = partial(last_layer, pretrained_nnet)
     _loss_fn = CrossEntropy(0.0, m_config['num_classes'])
-    acc, nll, ece = evaluate_model(augdata, _loss_fn, nnet, test_ds['image'], test_ds['label'])
+    acc, nll, ece = evaluate_model(_augdata, _loss_fn, nnet, test_ds['image'], test_ds['label'])
     print(f'pre-trained test acc={acc:.3f}, ece={ece:.3f}, nll={nll:.3f}')
 
     # set optimizer
@@ -138,7 +143,7 @@ def main(args, m_config, o_config):
                 _key,
                 pretrained_nnet,
                 trained_loss_fn,
-                augdata,
+                _augdata,
                 train_ds,
                 test_ds,
                 num_epochs=save_every,
@@ -152,7 +157,7 @@ def main(args, m_config, o_config):
                 pretrained_nnet,
                 trained_loss_fn,
                 optim,
-                augdata,
+                _augdata,
                 train_ds,
                 test_ds,
                 opt_state=opt_state,
@@ -186,6 +191,7 @@ if __name__ == '__main__':
     parser.add_argument("--num-update-iters", nargs='?', default=32, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
     parser.add_argument("--reinitialize", action="store_true")
+    parser.add_argument("--nodataaug", action="store_true")
 
     args = parser.parse_args()
     config.update("jax_platform_name", args.device)
