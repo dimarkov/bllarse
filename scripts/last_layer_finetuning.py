@@ -20,9 +20,11 @@ from jax import random as jr, nn, vmap, config
 from blrax.optim import ivon
 from mlpox.load_models import load_model
 
-from bllarse.losses import MSE, CrossEntropy, BayesianMultinomialProbit
+from bllarse.losses import MSE, CrossEntropy, IBProbit
 from bllarse.layers import LastLayer
-from bllarse.utils import run_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, MEAN_DICT, STD_DICT
+from bllarse.utils import run_training, run_bayesian_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, evaluate_bayesian_model, MEAN_DICT, STD_DICT
+
+config.update("jax_default_matmul_precision", "highest")
 
 def main(args, m_config, o_config):
     dataset = args.dataset
@@ -37,8 +39,8 @@ def main(args, m_config, o_config):
 
     # load data
     ds = load_dataset(dataset).with_format("jax")
-    train_ds = {'image': ds['train']['img'].astype(jnp.float32), 'label': ds['train']['label'] }
-    test_ds = {'image': ds['test']['img'].astype(jnp.float32), 'label': ds['test']['label'] }
+    train_ds = {'image': ds['train']['img'][:].astype(jnp.float32), 'label': ds['train']['label'][:] }
+    test_ds = {'image': ds['test']['img'][:].astype(jnp.float32), 'label': ds['test']['label'][:] }
 
     datasize = ds['train'].num_rows
     num_iters = num_epochs * datasize // batch_size
@@ -85,16 +87,21 @@ def main(args, m_config, o_config):
         loss_fn = MSE(m_config['num_classes'])
     if args.loss_function == 'CrossEntropy':
         loss_fn = CrossEntropy(args.label_smooth, m_config['num_classes'])
-    if args.loss_function == 'BayesianMultinomialProbit':
+    if args.loss_function == 'IBProbit':
+        assert "cavi" in o_config, "Bayesian last layer requires CAVI optimizer"
         key, _key = jr.split(key)
-        loss_fn = BayesianMultinomialProbit(_key, m_config['embed_dim'], m_config['num_classes'])
+        loss_fn = IBProbit(m_config['embed_dim'], m_config['num_classes'], key=_key)
 
     # get pretrained network test stats
-    if hasattr(loss_fn, 'mu'):
-        acc, nll, ece = evaluate_model(augdata, loss_fn, pretrained_nnet, test_ds['image'], test_ds['label'])
+    if hasattr(loss_fn, "update"):  
+        assert "cavi" in o_config, "Bayesian last layer requires CAVI optimizer"
     else:
         nnet = partial(last_layer, pretrained_nnet)
-        acc, nll, ece = evaluate_model(augdata, loss_fn, nnet, test_ds['image'], test_ds['label'])
+    
+    # evaluate original model
+    nnet = partial(last_layer, pretrained_nnet)
+    _loss_fn = CrossEntropy(0.0, m_config['num_classes'])
+    acc, nll, ece = evaluate_model(augdata, _loss_fn, nnet, test_ds['image'], test_ds['label'])
     print(f'pre-trained test acc={acc:.3f}, ece={ece:.3f}, nll={nll:.3f}')
 
     # set optimizer
@@ -113,6 +120,10 @@ def main(args, m_config, o_config):
         conf['num_data'] = num_epochs * datasize
         optim = ivon(_key, lr_schd, **conf)
         mc_samples = o_config['ivon']['mc_samples']
+    elif 'cavi' in o_config:
+        optim = None
+        num_update_iters = o_config['cavi']['num_update_iters']
+        assert hasattr(loss_fn, "update"), "Using CAVI optimizer requires Bayesian loss function for last layer"
     
     num_params = get_number_of_parameters(pretrained_nnet)
     print(f"Number of parameters of {name} is {num_params}.")
@@ -122,19 +133,34 @@ def main(args, m_config, o_config):
     trained_loss_fn = loss_fn
     for i in range(num_epochs // save_every):
         key, _key = jr.split(key)
-        trained_loss_fn, opt_state, metrics = run_training(
-            _key,
-            pretrained_nnet,
-            trained_loss_fn,
-            optim,
-            augdata,
-            train_ds, 
-            test_ds,
-            opt_state=opt_state,
-            mc_samples=mc_samples,
-            num_epochs=save_every,
-            batch_size=batch_size
-        )
+        if hasattr(trained_loss_fn, "update"):     # ==> Bayesian last layer
+            trained_loss_fn, metrics = run_bayesian_training(
+                _key,
+                pretrained_nnet,
+                trained_loss_fn,
+                augdata,
+                train_ds,
+                test_ds,
+                num_epochs=save_every,
+                batch_size=batch_size,
+                num_update_iters=num_update_iters,
+            )
+            opt_state = None                       # keep interface untouched
+        else:                                      # ==> classical optimiser-based
+            trained_loss_fn, opt_state, metrics = run_training(
+                _key,
+                pretrained_nnet,
+                trained_loss_fn,
+                optim,
+                augdata,
+                train_ds,
+                test_ds,
+                opt_state=opt_state,
+                mc_samples=mc_samples,
+                num_epochs=save_every,
+                batch_size=batch_size,
+            )
+
 
         #TODO: save model checkpoint, opt_state, and test metrics
         to_save = {"loss_fn": trained_loss_fn, "opt_state": opt_state, "metrics": metrics}
@@ -144,8 +170,8 @@ def main(args, m_config, o_config):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="deep MLP training")
-    parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion'], default='ivon', type=str)
-    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'BayesianMultinomialProbit'], default='CrossEntropy', type=str)
+    parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', "cavi"], default='cavi', type=str)
+    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='IBProbit', type=str)
     parser.add_argument('--num-blocks', choices=[6, 12], default=6, type=int, help='Allowed number of blocks/layers')
     parser.add_argument('--embed-dim', choices=[512, 1024], default=512, type=int, help='Allowed embedding dimensions')
     parser.add_argument("--device", nargs='?', default='gpu', type=str)
@@ -157,6 +183,7 @@ if __name__ == '__main__':
     parser.add_argument("-bs", "--batch-size", nargs='?', default=64, type=int)
     parser.add_argument("-ls", "--label-smooth", nargs='?', default=0.0, type=float)
     parser.add_argument("-mc", "--mc-samples", nargs='?', default=1, type=int)
+    parser.add_argument("--num-update-iters", nargs='?', default=32, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
     parser.add_argument("--reinitialize", action="store_true")
 
@@ -191,6 +218,8 @@ if __name__ == '__main__':
                 'end_value': 5e-5
             }
         }
+    if args.optimizer == 'cavi':
+        opt_config = {'cavi': {'num_update_iters': args.num_update_iters}}
 
         
     main(args, model_config, opt_config)

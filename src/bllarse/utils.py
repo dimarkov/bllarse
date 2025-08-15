@@ -81,15 +81,29 @@ def augmentdata(img, key=None, **kwargs):
 
 def evaluate_model(data_augmentation, loss_fn, nnet, images, labels):
     aug_images = data_augmentation(images, key=None)
-    if hasattr(loss_fn, 'mu'): # Bayesian case
-        loss, logits, _ = loss_fn(nnet, aug_images, labels, with_logits=True)
-    else: # Classical case
-        loss, logits = loss_fn(nnet, aug_images, labels, with_logits=True)
-    
+    loss, logits = loss_fn(nnet, aug_images, labels, with_logits=True)
     predictions = jnp.argmax(logits, axis=-1)
     acc = jnp.mean(predictions == labels)
     ece = compute_ece(20, logits=logits, labels_true=labels, labels_predicted=predictions)
     return acc, loss, ece
+
+def evaluate_bayesian_model(data_augmentation, loss_fn, pretrained_nnet, images, labels):
+    """
+    Bayesian version of `evaluate_model`. 
+    #TODO: Re-write `evaluate_model` and `evaluate_bayesian_model()` into a single function
+    with branching on `if any(hasattr(loss_fn, attr) for attr in ["eta", "mu"])`:
+    """
+    aug_images = data_augmentation(images, key=None)
+    feats    = extract_features(pretrained_nnet, aug_images)
+    loss, logits = loss_fn(feats, labels, with_logits=True)
+    predictions = jnp.argmax(logits, axis=-1)
+    acc = jnp.mean(predictions == labels)
+    ece = compute_ece(20, logits=logits, labels_true=labels, labels_predicted=predictions)
+    return acc, loss.mean(), ece
+
+def extract_features(nnet, x):
+    # vmap to keep things simple (batch, …) → (batch, embed_dim)
+    return vmap(nnet)(x)
 
 def run_training(
     key,
@@ -221,3 +235,124 @@ def run_training(
     )
     trained_loss_module = eqx.combine(params, static)
     return trained_loss_module, final_opt_state, metrics
+
+def run_bayesian_training(
+    key,
+    pretrained_nnet,
+    bayesian_model,                 # e.g. IBProbit / IBPolyaGamma / MultinomialPolyaGamma
+    data_augmentation,
+    train_ds,
+    test_ds,
+    *,
+    num_epochs: int = 1,
+    batch_size: int = 32,
+    num_update_iters: int = 32,  # CAVI/PG iterations per mini-batch
+):
+    """
+    Variational Bayes fine-tuning of the last layer (`loss_fn`) while the
+    pretrained feature extractor stays frozen.
+
+    Returns
+    -------
+    trained_loss_fn : updated Bayesian layer (same type as `loss_fn`)
+    metrics         : dict with per-epoch jnp arrays (shape (num_epochs,))
+    """
+
+    # ----------------------------------------------------------------
+    # 1)  Freeze the feature extractor (remove its final `fc`)
+    # ----------------------------------------------------------------
+    headless_nnet = eqx.nn.inference_mode(
+        eqx.tree_at(lambda m: m.fc, pretrained_nnet, eqx.nn.Identity()),
+        True,            # turn off dropout / BN statistics
+    )
+
+    # ----------------------------------------------------------------
+    # 2)  Helper: evaluate on (full) test set
+    # ----------------------------------------------------------------
+    # Evaluation function
+    @eqx.filter_jit
+    def evaluate(model, images, labels):
+        return evaluate_bayesian_model(
+            data_augmentation, model, headless_nnet, images, labels
+        )
+    # ----------------------------------------------------------------
+    # 3)  One mini-batch update (CAVI / PG)
+    # ----------------------------------------------------------------
+    @eqx.filter_jit
+    def batch_update(current_model, batch_imgs, batch_labels, k):
+        aug_imgs   = data_augmentation(batch_imgs, key=k)
+        feats      = extract_features(headless_nnet, aug_imgs)
+        # closed-form VI update; returns *new* model where prior parameters = posterior params at the end of updating
+        updated_model = current_model.update(feats, batch_labels,
+                                            num_iters=num_update_iters)
+        # training NLL (after the update)
+        loss = updated_model(feats, batch_labels).mean()
+        return updated_model, loss
+
+    # ----------------------------------------------------------------
+    # 4)  One training epoch (scan over mini-batches)
+    # ----------------------------------------------------------------
+
+    params, static = eqx.partition(bayesian_model, eqx.is_array)
+    def epoch_body(carry, epoch_key):
+        current_model_params = carry
+        ds_size         = train_ds["label"].shape[0]
+        img_shape       = train_ds["image"].shape[1:]
+        n_batches       = ds_size // batch_size
+
+        # shuffle dataset
+        epoch_key, perm_key, aug_key = jr.split(epoch_key, 3)
+        perm        = jr.permutation(perm_key, ds_size)
+        shuf_imgs   = train_ds["image"][perm]
+        shuf_labels = train_ds["label"][perm]
+
+        # reshape into (n_batches, batch, …)
+        img_batches   = shuf_imgs[: n_batches * batch_size].reshape(
+            n_batches, batch_size, *img_shape
+        )
+        label_batches = shuf_labels[: n_batches * batch_size].reshape(
+            n_batches, batch_size
+        )
+
+        # mini-batch keys for stochastic augmentation
+        batch_keys = jr.split(aug_key, n_batches)
+
+        # scan over mini-batches
+        def batch_body(loss_params, scans):
+            loss_fn = eqx.combine(loss_params, static)
+            imgs, labels, k = scans
+            updated_loss_model, loss = batch_update(loss_fn, imgs, labels, k)
+            updated_loss_params = eqx.filter(updated_loss_model, eqx.is_array)
+            return updated_loss_params, loss
+
+        updated_loss_params, batch_losses = lax.scan(
+            batch_body, current_model_params, (img_batches, label_batches, batch_keys)
+        )
+
+        updated_model = eqx.combine(updated_loss_params, static)
+
+        # validation metrics (after epoch)
+        acc, nll, ece = evaluate(
+            updated_model,
+            test_ds['image'],
+            test_ds['label'],
+        )
+
+        metrics = {
+            'loss': batch_losses.mean(),
+            'acc': acc,
+            'ece': ece,
+            'nll': nll,
+        }
+
+        return updated_loss_params, metrics
+
+    # ----------------------------------------------------------------
+    # 5)  Main training loop (scan over epochs)
+    # ----------------------------------------------------------------
+    epoch_keys = jr.split(key, num_epochs)
+    updated_loss_params, metrics_seq = lax.scan(epoch_body, params, epoch_keys)
+
+    trained_loss_model = eqx.combine(updated_loss_params, static)
+
+    return trained_loss_model, metrics_seq
