@@ -239,11 +239,14 @@ def run_training(
 def run_bayesian_training(
     key,
     pretrained_nnet,
-    bayesian_model,                 # e.g. IBProbit / IBPolyaGamma / MultinomialPolyaGamma
+    bayesian_loss_model,                 # e.g. IBProbit / IBPolyaGamma / MultinomialPolyaGamma / BayesianLinearRegression
     data_augmentation,
     train_ds,
     test_ds,
-    *,
+    *,  
+    optimizer = None,
+    opt_state = None,
+    loss_type: int = 3,
     num_epochs: int = 1,
     batch_size: int = 32,
     num_update_iters: int = 32,  # CAVI/PG iterations per mini-batch
@@ -266,36 +269,62 @@ def run_bayesian_training(
         True,            # turn off dropout / BN statistics
     )
 
+    nnet_params, nnet_static = eqx.partition(headless_nnet, eqx.is_array)
+    if opt_state is None:
+        opt_state = None if optimizer is None else optimizer.init(nnet_params) 
+
     # ----------------------------------------------------------------
     # 2)  Helper: evaluate on (full) test set
     # ----------------------------------------------------------------
     # Evaluation function
-    @eqx.filter_jit
-    def evaluate(model, images, labels):
+    def evaluate(model, nnet_params, images, labels):
+        nnet = eqx.combine(nnet_params, nnet_static)
         return evaluate_bayesian_model(
-            data_augmentation, model, headless_nnet, images, labels
+            data_augmentation, model, nnet, images, labels
         )
+
+    def loss_fn(params, loss_model, images, labels):
+        nnet = eqx.combine(params, nnet_static)
+        feats = extract_features(nnet, images)
+        updated_lm = loss_model.update(feats, labels, num_iters=num_update_iters)
+        loss = updated_lm(feats, labels, loss_type=loss_type).mean()
+        return loss, updated_lm
+    
     # ----------------------------------------------------------------
     # 3)  One mini-batch update (CAVI / PG)
     # ----------------------------------------------------------------
-    @eqx.filter_jit
-    def batch_update(current_model, batch_imgs, batch_labels, k):
-        aug_imgs   = data_augmentation(batch_imgs, key=k)
-        feats      = extract_features(headless_nnet, aug_imgs)
-        # closed-form VI update; returns *new* model where prior parameters = posterior params at the end of updating
-        updated_model = current_model.update(feats, batch_labels,
-                                            num_iters=num_update_iters)
+    def batch_update(current_loss_model, nnet_params, opt_state, batch_imgs, batch_labels, key):
+        aug_imgs   = data_augmentation(batch_imgs, key=key)
+
         # training NLL (after the update)
-        loss = updated_model(feats, batch_labels).mean()
-        return updated_model, loss
+        if optimizer is None:
+            loss, updated_model = loss_fn(
+                nnet_params,
+                current_loss_model,
+                aug_imgs,
+                batch_labels
+            )
+        else:
+            func = eqx.filter_value_and_grad(loss_fn, has_aux=True)
+            (loss, updated_model), grads = func(
+                nnet_params,
+                current_loss_model,
+                aug_imgs,
+                batch_labels
+            )
+
+            updates, opt_state = optimizer.update(grads, opt_state, nnet_params)
+            nnet_params = optax.apply_updates(nnet_params, updates)
+
+        return updated_model, nnet_params, opt_state, loss
 
     # ----------------------------------------------------------------
     # 4)  One training epoch (scan over mini-batches)
     # ----------------------------------------------------------------
 
-    params, static = eqx.partition(bayesian_model, eqx.is_array)
+    loss_params, loss_static = eqx.partition(bayesian_loss_model, eqx.is_array)
     def epoch_body(carry, epoch_key):
-        current_model_params = carry
+        current_loss_params, current_nnet_params, opt_state = carry
         ds_size         = train_ds["label"].shape[0]
         img_shape       = train_ds["image"].shape[1:]
         n_batches       = ds_size // batch_size
@@ -318,22 +347,29 @@ def run_bayesian_training(
         batch_keys = jr.split(aug_key, n_batches)
 
         # scan over mini-batches
-        def batch_body(loss_params, scans):
-            loss_fn = eqx.combine(loss_params, static)
-            imgs, labels, k = scans
-            updated_loss_model, loss = batch_update(loss_fn, imgs, labels, k)
+        def batch_body(carry, scans):
+            loss_params, nnet_params, opt_state = carry
+            loss_model = eqx.combine(loss_params, loss_static)
+            imgs, labels, key = scans
+            updated_loss_model, updated_nnet_params, opt_state, loss = batch_update(
+                loss_model, nnet_params, opt_state, imgs, labels, key
+            )
             updated_loss_params = eqx.filter(updated_loss_model, eqx.is_array)
-            return updated_loss_params, loss
-
-        updated_loss_params, batch_losses = lax.scan(
-            batch_body, current_model_params, (img_batches, label_batches, batch_keys)
+            return (updated_loss_params, updated_nnet_params, opt_state), loss
+        
+        init = (current_loss_params, current_nnet_params, opt_state)
+        (updated_loss_params, updated_nnet_params, opt_state), batch_losses = lax.scan(
+            batch_body, 
+            init, 
+            (img_batches, label_batches, batch_keys)
         )
 
-        updated_model = eqx.combine(updated_loss_params, static)
+        updated_model = eqx.combine(updated_loss_params, loss_static)
 
         # validation metrics (after epoch)
         acc, nll, ece = evaluate(
             updated_model,
+            updated_nnet_params,
             test_ds['image'],
             test_ds['label'],
         )
@@ -345,14 +381,16 @@ def run_bayesian_training(
             'nll': nll,
         }
 
-        return updated_loss_params, metrics
+        return (updated_loss_params, updated_nnet_params, opt_state), metrics
 
     # ----------------------------------------------------------------
     # 5)  Main training loop (scan over epochs)
     # ----------------------------------------------------------------
     epoch_keys = jr.split(key, num_epochs)
-    updated_loss_params, metrics_seq = lax.scan(epoch_body, params, epoch_keys)
+    init = (loss_params, nnet_params, opt_state)
+    (updated_loss_params, updated_nnet_params, opt_state), metrics_seq = lax.scan(epoch_body, init, epoch_keys)
 
-    trained_loss_model = eqx.combine(updated_loss_params, static)
+    trained_loss_model = eqx.combine(updated_loss_params, loss_static)
+    trained_nnet = eqx.combine(nnet_params, nnet_static)
 
-    return trained_loss_model, metrics_seq
+    return trained_loss_model, trained_nnet, opt_state, metrics_seq

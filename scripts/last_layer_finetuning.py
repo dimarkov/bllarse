@@ -139,7 +139,7 @@ def main(args, m_config, o_config):
     for i in range(num_epochs // save_every):
         key, _key = jr.split(key)
         if hasattr(trained_loss_fn, "update"):     # ==> Bayesian last layer
-            trained_loss_fn, metrics = run_bayesian_training(
+            trained_loss_fn, _, _, metrics = run_bayesian_training(
                 _key,
                 pretrained_nnet,
                 trained_loss_fn,
