@@ -10,6 +10,7 @@ from functools import partial
 from einops import einsum
 
 const = jnp.sqrt(2 / jnp.pi)
+initializer = nn.initializers.lecun_normal()
 
 def approx_cdf(x):
     return nn.sigmoid(2 * const * (x + 0.044715 * x ** 3) )
@@ -40,7 +41,7 @@ class IBProbit(eqx.Module):
         use_approx_cdf: bool = True
     ):
 
-        self.eta = jr.normal(key, shape=(input_dim + int(use_bias), num_classes)) * 1e-3
+        self.eta = initializer(key, (input_dim + int(use_bias), num_classes), jnp.float32)
         self.Sigma = jnp.eye(input_dim + int(use_bias))
         self.use_bias = use_bias
         self.cdf = approx_cdf if use_approx_cdf else norm.cdf
@@ -49,7 +50,7 @@ class IBProbit(eqx.Module):
 
     def reset(self, key: PRNGKey) -> "IBProbit":
         d, num_classes = self.eta.shape
-        eta = jr.normal(key, shape=(d, num_classes)) * 0.01
+        eta = initializer(key, (d, num_classes), jnp.float32)
         Sigma = jnp.eye(d)
         return eqx.tree_at(lambda x: (x.eta, x.Sigma), self, (eta, Sigma))
 
