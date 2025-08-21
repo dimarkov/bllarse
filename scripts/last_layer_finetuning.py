@@ -70,9 +70,9 @@ def main(args, m_config, o_config):
 
     # load data
     ds = load_dataset(dataset).with_format("jax")
-    label = 'fine_label' if dataset == 'cifar100' else 'label'
-    train_ds = {'image': ds['train']['img'][:].astype(jnp.float32), 'label': ds['train'][label][:] }
-    test_ds = {'image': ds['test']['img'][:].astype(jnp.float32), 'label': ds['test'][label][:] }
+    label_key = 'fine_label' if dataset == 'cifar100' else 'label'
+    train_ds = {'image': ds['train']['img'][:].astype(jnp.float32), 'label': ds['train'][label_key][:] }
+    test_ds = {'image': ds['test']['img'][:].astype(jnp.float32), 'label': ds['test'][label_key][:] }
 
     datasize = ds['train'].num_rows
     num_iters = num_epochs * datasize // batch_size
