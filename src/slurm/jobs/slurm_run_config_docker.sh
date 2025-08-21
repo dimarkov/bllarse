@@ -19,6 +19,8 @@ export BLLARSE_REPO_ROOT="$REPO_ROOT"
 #    NOTE: VENV_NAME and BLLARSE_SWEEP_SOURCE are set by run_sweep.py
 scripts/start_docker_sbatch.sh \
   bash -lc "set -euo pipefail; \
+            export WANDB_DIR=\${WANDB_DIR:-\$HOME/wandb}; mkdir -p \"\$WANDB_DIR\"; \
+            export WANDB_CACHE_DIR=\${WANDB_CACHE_DIR:-\$HOME/.cache/wandb}; mkdir -p \"\$WANDB_CACHE_DIR\"; \
             cd \"$REPO_ROOT\"; \
             if [[ -n \"${VENV_NAME:-}\" && -f \"${VENV_NAME}/bin/activate\" ]]; then source \"${VENV_NAME}/bin/activate\"; \
             elif [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi; \
