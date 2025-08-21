@@ -1,14 +1,14 @@
 import os
 import argparse
 
-# do not prealocate memory
+# do not preallocate memory
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
 import jax.numpy as jnp
 import equinox as eqx
 import optax
-import augmax
+import wandb
 import jax.tree_util as jtu
 
 from functools import partial
@@ -22,7 +22,7 @@ from mlpox.load_models import load_model
 
 from bllarse.losses import MSE, CrossEntropy, IBProbit
 from bllarse.layers import LastLayer
-from bllarse.utils import run_training, run_bayesian_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, evaluate_bayesian_model, MEAN_DICT, STD_DICT
+from bllarse.utils import run_training, run_bayesian_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, MEAN_DICT, STD_DICT
 
 config.update("jax_default_matmul_precision", "highest")
 
@@ -34,6 +34,32 @@ def main(args, m_config, o_config):
     batch_size = args.batch_size
     save_every = args.save_every
     platform = args.device
+
+    if args.enable_wandb:
+        wandb.init(
+            project="bllarse_experiments",
+            id=args.uid if args.uid else wandb.util.generate_id(),
+            group=args.group_id,      # <-- lets you filter by group_id in the UI
+            config=dict(              # everything you later want to slice on
+                dataset=args.dataset,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                num_vb_iters=args.num_update_iters,
+                optimizer=args.optimizer,
+                loss_fn=args.loss_function,
+                embed_dim=args.embed_dim,
+                num_blocks=args.num_blocks,
+                pretrained=args.pretrained,
+                label_smooth=args.label_smooth,
+            ),
+            # Entity / mode / tags can be added here if you use them
+            reinit=True,
+      )
+        wandb.define_metric("epoch")                 # x-axis
+        wandb.define_metric("loss", step_metric="epoch", summary="min")
+        wandb.define_metric("nll",  step_metric="epoch", summary="min")
+        wandb.define_metric("acc",  step_metric="epoch", summary="max")
+        wandb.define_metric("ece",  step_metric="epoch", summary="min")
 
     key = jr.PRNGKey(seed)
 
@@ -149,6 +175,7 @@ def main(args, m_config, o_config):
                 num_epochs=save_every,
                 batch_size=batch_size,
                 num_update_iters=num_update_iters,
+                log_to_wandb=args.enable_wandb,
             )
             opt_state = None                       # keep interface untouched
         else:                                      # ==> classical optimiser-based
@@ -170,11 +197,16 @@ def main(args, m_config, o_config):
         #TODO: save model checkpoint, opt_state, and test metrics
         to_save = {"loss_fn": trained_loss_fn, "opt_state": opt_state, "metrics": metrics}
         vals = jtu.tree_map(lambda x: x[-1], metrics)
-        print(i, [(name, f'{vals[name].item():.3f}') for name in vals])
+
+        if args.enable_wandb:
+            wandb.log({"epoch": (i + 1) * save_every, **vals})
+        else: 
+            # only print to console if not logging to wandb
+            print(i, [(name, f'{vals[name].item():.3f}') for name in vals])
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="deep MLP training")
+def build_argparser():
+    parser = argparse.ArgumentParser(description="last layer finetuning")
     parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', "cavi"], default='cavi', type=str)
     parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='IBProbit', type=str)
     parser.add_argument('--num-blocks', choices=[6, 12], default=6, type=int, help='Allowed number of blocks/layers')
@@ -192,10 +224,12 @@ if __name__ == '__main__':
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
     parser.add_argument("--reinitialize", action="store_true")
     parser.add_argument("--nodataaug", action="store_true")
+    parser.add_argument("--enable_wandb", "--enable-wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--group-id", type=str, default="vb_sweep", help="Put all runs of this sweep in the same W&B group")
+    parser.add_argument("--uid", type=str, default=None, help="Unique identifier for the W&B run. If not provided, a random one will be generated.")
+    return parser
 
-    args = parser.parse_args()
-    config.update("jax_platform_name", args.device)
-
+def build_configs(args):
     num_classes = 1
     if args.dataset == 'cifar10':
         num_classes = 10
@@ -226,6 +260,14 @@ if __name__ == '__main__':
         }
     if args.optimizer == 'cavi':
         opt_config = {'cavi': {'num_update_iters': args.num_update_iters}}
+    
+    return model_config, opt_config
 
-        
-    main(args, model_config, opt_config)
+if __name__ == '__main__':
+    parser = build_argparser()
+    args = parser.parse_args()
+    config.update("jax_platform_name", args.device)
+
+    model_conf, opt_conf = build_configs(args)
+
+    main(args, model_conf, opt_conf)
