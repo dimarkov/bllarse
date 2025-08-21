@@ -4,7 +4,11 @@ from jax import nn, lax, numpy as jnp, vmap, random as jr
 from tensorflow_probability.substrates.jax.stats import expected_calibration_error as compute_ece
 from functools import partial
 import optax
-import wandb
+try:
+    import wandb
+    no_wandb = False
+except:
+    no_wandb = True
 import numpy as onp
 
 from blrax.states import ScaleByIvonState
@@ -396,7 +400,7 @@ def run_bayesian_training(
     trained_loss_model = eqx.combine(updated_loss_params, loss_static)
     trained_nnet = eqx.combine(nnet_params, nnet_static)
 
-    if log_to_wandb:
+    if log_to_wandb and not no_wandb:
         # turn DeviceArrays → python scalars so wandb is happy
         metrics_np = jtu.tree_map(lambda x: onp.asarray(x), metrics_seq)
         for ep in range(num_epochs):

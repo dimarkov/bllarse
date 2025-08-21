@@ -8,7 +8,12 @@ os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 import jax.numpy as jnp
 import equinox as eqx
 import optax
-import wandb
+try:
+    import wandb
+    no_wandb = False
+except:
+    print('wandb not installed')
+    no_wandb = True
 import jax.tree_util as jtu
 
 from functools import partial
@@ -35,7 +40,7 @@ def main(args, m_config, o_config):
     save_every = args.save_every
     platform = args.device
 
-    if args.enable_wandb:
+    if args.enable_wandb and not no_wandb:
         wandb.init(
             project="bllarse_experiments",
             id=args.uid if args.uid else wandb.util.generate_id(),
@@ -65,8 +70,9 @@ def main(args, m_config, o_config):
 
     # load data
     ds = load_dataset(dataset).with_format("jax")
-    train_ds = {'image': ds['train']['img'][:].astype(jnp.float32), 'label': ds['train']['label'][:] }
-    test_ds = {'image': ds['test']['img'][:].astype(jnp.float32), 'label': ds['test']['label'][:] }
+    label = 'fine_label' if dataset == 'cifar100' else 'label'
+    train_ds = {'image': ds['train']['img'][:].astype(jnp.float32), 'label': ds['train'][label][:] }
+    test_ds = {'image': ds['test']['img'][:].astype(jnp.float32), 'label': ds['test'][label][:] }
 
     datasize = ds['train'].num_rows
     num_iters = num_epochs * datasize // batch_size
