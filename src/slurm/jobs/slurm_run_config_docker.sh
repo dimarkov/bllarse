@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 #SBATCH --time=12:00:00
 #SBATCH --mem=40G
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH -G 1                             # one GPU, cluster’s preferred flag
 #SBATCH --output=slurm/logs/%x.%A_%a.out
 #SBATCH --error=slurm/logs/%x.%A_%a.err
-#SBATCH --job-name=bllarse_sweep
 
 set -euo pipefail
 set -x
