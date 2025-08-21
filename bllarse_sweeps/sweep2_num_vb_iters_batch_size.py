@@ -7,6 +7,7 @@ DATASETS    = ["cifar10", "cifar100"]
 PRETRAINED  = ["in21k", "in21k_cifar"]
 
 BATCH_SIZES = [512, 1024, 2048, 4096, 8192, 16384, 30000]
+SEEDS       = [0, 1, 2, 3, 4]  # 5 seeds
 
 # vb iters:
 VB_OFF = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]   # data aug OFF
@@ -31,6 +32,7 @@ def _mk_cfg(
     pretrained: str,
     batch_size: int,
     num_update_iters: int,
+    seed: int,
     dataaug_on: bool,
 ) -> Dict[str, Any]:
     epochs = 20 if dataaug_on else 5
@@ -41,23 +43,24 @@ def _mk_cfg(
         batch_size=batch_size,
         num_update_iters=num_update_iters,
         epochs=epochs,
-        nodataaug=(not dataaug_on),   # your script: True == OFF
+        nodataaug=(not dataaug_on),   # True == OFF
         embed_dim=EMBED_DIM,
         num_blocks=NUM_BLOCKS,
         group_id="sweep2_batchsize_numiters",
+        seed=seed,
     )
 
 def create_configs() -> List[Dict[str, Any]]:
     # OFF (no aug): bigger VB list, epochs=5
     off = [
-        _mk_cfg(ds, pt, bs, vbi, dataaug_on=False)
-        for (ds, pt, bs, vbi) in product(DATASETS, PRETRAINED, BATCH_SIZES, VB_OFF)
+        _mk_cfg(ds, pt, bs, vbi, sd, dataaug_on=False)
+        for (ds, pt, bs, vbi, sd) in product(DATASETS, PRETRAINED, BATCH_SIZES, VB_OFF, SEEDS)
     ]
 
     # ON (aug): reduced VB list, epochs=20
     on = [
-        _mk_cfg(ds, pt, bs, vbi, dataaug_on=True)
-        for (ds, pt, bs, vbi) in product(DATASETS, PRETRAINED, BATCH_SIZES, VB_ON)
+        _mk_cfg(ds, pt, bs, vbi, sd, dataaug_on=True)
+        for (ds, pt, bs, vbi, sd) in product(DATASETS, PRETRAINED, BATCH_SIZES, VB_ON, SEEDS)
     ]
 
     return off + on
