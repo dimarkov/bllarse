@@ -2,8 +2,8 @@
 #SBATCH --time=08:00:00
 #SBATCH --mem=40G
 #SBATCH -G 1
-#SBATCH --output=slurm/logs/%x.%A_%a.out
-#SBATCH --error=slurm/logs/%x.%A_%a.err
+#SBATCH --output=slurm_logs/%x.%A_%a.out
+#SBATCH --error=slurm_logs/%x.%A_%a.err
 
 set -euo pipefail
 set -x
@@ -20,6 +20,6 @@ else
   exit 1
 fi
 
-python -m bllarse.tools.run_config \
+python src/bllarse/tools/run_config.py \
   "${BLLARSE_SWEEP_SOURCE}" \
   "${SLURM_ARRAY_TASK_ID}"

@@ -2,8 +2,8 @@
 #SBATCH --time=12:00:00
 #SBATCH --mem=40G
 #SBATCH -G 1                             # one GPU, cluster’s preferred flag
-#SBATCH --output=slurm/logs/%x.%A_%a.out
-#SBATCH --error=slurm/logs/%x.%A_%a.err
+#SBATCH --output=slurm_logs/%x.%A_%a.out
+#SBATCH --error=slurm_logs/%x.%A_%a.err
 
 set -euo pipefail
 set -x
@@ -22,4 +22,4 @@ scripts/start_docker_sbatch.sh \
             cd \"$REPO_ROOT\"; \
             if [[ -n \"${VENV_NAME:-}\" && -f \"${VENV_NAME}/bin/activate\" ]]; then source \"${VENV_NAME}/bin/activate\"; \
             elif [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi; \
-            python -m bllarse.tools.run_config \"${BLLARSE_SWEEP_SOURCE}\" \"${SLURM_ARRAY_TASK_ID}\""
+            python src/bllarse/tools/run_config.py \"${BLLARSE_SWEEP_SOURCE}\" \"${SLURM_ARRAY_TASK_ID}\""
