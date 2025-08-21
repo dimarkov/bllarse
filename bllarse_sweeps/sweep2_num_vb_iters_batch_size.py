@@ -44,7 +44,7 @@ def _mk_cfg(
         nodataaug=(not dataaug_on),   # your script: True == OFF
         embed_dim=EMBED_DIM,
         num_blocks=NUM_BLOCKS,
-        group_id=f"sweep2_batchsize_numiters",
+        group_id="sweep2_batchsize_numiters",
     )
 
 def create_configs() -> List[Dict[str, Any]]:
