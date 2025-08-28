@@ -56,6 +56,8 @@ def main(args, m_config, o_config):
                 num_blocks=args.num_blocks,
                 pretrained=args.pretrained,
                 label_smooth=args.label_smooth,
+                epochs=args.epochs,
+                nodataaug=not args.nodataaug,
             ),
             # Entity / mode / tags can be added here if you use them
             reinit=True,
