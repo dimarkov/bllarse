@@ -113,6 +113,7 @@ def extract_features(nnet, x):
 
 def run_training(
     key,
+    last_layer,
     pretrained_nnet,
     loss_fn,
     optim,
@@ -123,6 +124,7 @@ def run_training(
     mc_samples=(),
     num_epochs=1,
     batch_size=32,
+    log_to_wandb=False,
     ):
     """
     Train a neural network using Equinox and Optax.
@@ -130,8 +132,8 @@ def run_training(
     Args:
         key: JAX PRNG key
         last_layer: Equinox neural network
-        pretrauned_nnet: Equinox neural network
-        loss_fn: Eqionox loss function
+        pretrained_nnet: Equinox neural network
+        loss_fn: Equinox loss function
         optim: Optax (or blrax) optimizer
         data_augmentation: Jax compatible data augmentation function
         train_ds: Training dataset dictionary with 'image' and 'label' keys
@@ -139,35 +141,25 @@ def run_training(
         opt_state: Initial optimizer state, if None it is initiated localy
         num_epochs: Number of epochs to train
         batch_size: Batch size for training
+        log_to_wandb: Whether to log metrics to Weights & Biases
     """
     
-    
-    if hasattr(loss_fn, 'mu'): # Bayesian case
-        params, static = eqx.partition(loss_fn, eqx.is_array)
-    else: # Classical case
-        params, static = eqx.partition(loss_fn, eqx.is_array)
+    params, static = eqx.partition(last_layer, eqx.is_array)
 
     opt_state = optim.init(params) if opt_state is None else opt_state  # initialize optimizer state
 
     def local_loss(params, x, y, *args, **kwargs):
-        loss_module = eqx.combine(params, static)
-        model = pretrained_nnet
-        if hasattr(loss_module, 'mu'): # Bayesian case
-            loss, _, new_loss_module = loss_module(model, x, y, *args, **kwargs)
-            return loss, new_loss_module
-        else: # Classical case
-            return loss_module(model, x, y, *args, **kwargs)
+        ll = eqx.combine(params, static)
+        return loss_fn(partial(ll, pretrained_nnet), x, y)
 
     
     # Training step function
     @eqx.filter_jit
-    def train_step(loss_fn, params, opt_state, x, y, key):
+    def train_step(loss_fn_in_train_step, params, opt_state, x, y, key):
         keys = jr.split(key, mc_samples)
-        (loss_value, new_loss_module), grads = noisy_value_and_grad(loss_fn, opt_state[0], params, x, y, key=keys)
+        loss_value, grads = noisy_value_and_grad(loss_fn_in_train_step, opt_state[0], params, x, y, key=keys)
         updates, opt_state = optim.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        if hasattr(new_loss_module, 'mu'):
-            params, _ = eqx.partition(new_loss_module, eqx.is_array)
         return params, opt_state, loss_value
     
     # Evaluation function
@@ -215,9 +207,9 @@ def run_training(
         
         # Calculate metrics
         key, _key = jr.split(key)
-        loss_module = eqx.combine(params, static)
+        nnet = partial(eqx.combine(params, static), pretrained_nnet)
         acc, nll, ece = evaluate(
-            pretrained_nnet,
+            nnet,
             test_ds['image'],
             test_ds['label'],
         )
@@ -234,13 +226,27 @@ def run_training(
     # Run training for multiple epochs
     keys = jr.split(key, num_epochs)
     init_carry = (params, opt_state)
-    (params, final_opt_state), metrics = lax.scan(
+    (params, final_opt_state), metrics_seq = lax.scan(
         train_epoch,
         init_carry,
         (keys, jnp.arange(num_epochs))
     )
-    trained_loss_module = eqx.combine(params, static)
-    return trained_loss_module, final_opt_state, metrics
+    if log_to_wandb and not no_wandb:
+        # turn DeviceArrays → python scalars so wandb is happy
+        metrics_np = jtu.tree_map(lambda x: onp.asarray(x), metrics_seq)
+        for ep in range(num_epochs):
+            wandb.log(
+                {
+                    "epoch": ep + 1,
+                    "loss": float(metrics_np["loss"][ep]),
+                    "nll":  float(metrics_np["nll"][ep]),
+                    "acc":  float(metrics_np["acc"][ep]),
+                    "ece":  float(metrics_np["ece"][ep]),
+                }
+            )
+
+    trained_last_layer = eqx.combine(params, static)
+    return trained_last_layer, final_opt_state, metrics_seq
 
 def run_bayesian_training(
     key,
