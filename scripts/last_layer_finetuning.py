@@ -170,6 +170,7 @@ def main(args, m_config, o_config):
     # run training
     opt_state = None
     trained_loss_fn = loss_fn
+    trained_last_layer = last_layer
     for i in range(num_epochs // save_every):
         key, _key = jr.split(key)
         if hasattr(trained_loss_fn, "update"):     # ==> Bayesian last layer
@@ -191,7 +192,7 @@ def main(args, m_config, o_config):
                 _key,
                 last_layer,
                 pretrained_nnet,
-                loss_fn,
+                trained_last_layer,
                 optim,
                 _augdata,
                 train_ds,
