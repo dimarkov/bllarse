@@ -170,6 +170,7 @@ def main(args, m_config, o_config):
     # run training
     opt_state = None
     trained_loss_fn = loss_fn
+    trained_last_layer = last_layer
     for i in range(num_epochs // save_every):
         key, _key = jr.split(key)
         if hasattr(trained_loss_fn, "update"):     # ==> Bayesian last layer
@@ -187,10 +188,11 @@ def main(args, m_config, o_config):
             )
             opt_state = None                       # keep interface untouched
         else:                                      # ==> classical optimiser-based
-            trained_loss_fn, opt_state, metrics = run_training(
+            trained_last_layer, opt_state, metrics = run_training(
                 _key,
+                trained_last_layer,
                 pretrained_nnet,
-                trained_loss_fn,
+                loss_fn,
                 optim,
                 _augdata,
                 train_ds,
@@ -199,11 +201,16 @@ def main(args, m_config, o_config):
                 mc_samples=mc_samples,
                 num_epochs=save_every,
                 batch_size=batch_size,
+                log_to_wandb=args.enable_wandb,
             )
 
 
         #TODO: save model checkpoint, opt_state, and test metrics
-        to_save = {"loss_fn": trained_loss_fn, "opt_state": opt_state, "metrics": metrics}
+        if hasattr(trained_loss_fn, "update"):
+            to_save = {"loss_fn": trained_loss_fn, "opt_state": opt_state, "metrics": metrics}
+        else:
+            to_save = {"last_layer": trained_last_layer, "opt_state": opt_state, "metrics": metrics}
+
         vals = jtu.tree_map(lambda x: x[-1], metrics)
 
         if args.enable_wandb:
