@@ -190,9 +190,9 @@ def main(args, m_config, o_config):
         else:                                      # ==> classical optimiser-based
             trained_last_layer, opt_state, metrics = run_training(
                 _key,
-                last_layer,
-                pretrained_nnet,
                 trained_last_layer,
+                pretrained_nnet,
+                loss_fn,
                 optim,
                 _augdata,
                 train_ds,
