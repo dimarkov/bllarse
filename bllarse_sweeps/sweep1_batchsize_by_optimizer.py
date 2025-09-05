@@ -38,6 +38,8 @@ def _mk_cfg(
         dataset=dataset,
         batch_size=batch_size,
         optimizer=optimizer,
+        learning_rate=2e-4 if optimizer == "lion" else 1e-3,
+        weight_decay=3e-2 if optimizer == "lion" else 1e-2,
         epochs=epochs,
         group_id="sweep1_batchsize_by_optimizer",
         seed=seed,
