@@ -11,8 +11,7 @@ except:
     no_wandb = True
 import numpy as onp
 
-from blrax.states import ScaleByIvonState
-from blrax.utils import noisy_value_and_grad, get_scale, sample_posterior
+from blrax.utils import noisy_value_and_grad
 
 import jax.scipy.linalg as linalg
 from jax.lax.linalg import triangular_solve
@@ -121,7 +120,7 @@ def run_training(
     train_ds,
     test_ds,
     opt_state=None,
-    mc_samples=(),
+    mc_samples=1,
     num_epochs=1,
     batch_size=32,
     log_to_wandb=False,
@@ -145,19 +144,24 @@ def run_training(
     """
     
     params, static = eqx.partition(last_layer, eqx.is_array)
-
     opt_state = optim.init(params) if opt_state is None else opt_state  # initialize optimizer state
 
     def local_loss(params, x, y, *args, **kwargs):
         ll = eqx.combine(params, static)
         return loss_fn(partial(ll, pretrained_nnet), x, y)
 
-    
     # Training step function
     @eqx.filter_jit
-    def train_step(loss_fn_in_train_step, params, opt_state, x, y, key):
-        keys = jr.split(key, mc_samples)
-        loss_value, grads = noisy_value_and_grad(loss_fn_in_train_step, opt_state[0], params, x, y, key=keys)
+    def train_step(params, opt_state, x, y, key):
+        loss_value, grads, opt_state = noisy_value_and_grad(
+            local_loss,
+            opt_state,
+            params, 
+            key, 
+            x, 
+            y, 
+            mc_samples=mc_samples
+        )
         updates, opt_state = optim.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss_value
@@ -189,7 +193,7 @@ def run_training(
             aug_batch_images = data_augmentation(batch_images, key=_key)
             key, _key = jr.split(key)
             params, opt_state, loss_value = train_step(
-                local_loss, params, opt_state, aug_batch_images, batch_labels, _key
+                params, opt_state, aug_batch_images, batch_labels, _key
             )
             return (params, opt_state, key), loss_value
         
@@ -318,13 +322,16 @@ def run_bayesian_training(
                 batch_labels
             )
         else:
-            func = eqx.filter_value_and_grad(loss_fn, has_aux=True)
-            (loss, updated_model), grads = func(
-                nnet_params,
-                current_loss_model,
-                aug_imgs,
-                batch_labels
-            )
+            (loss, updated_model), grads = \
+                noisy_value_and_grad(
+                    loss_fn,
+                    opt_state[0],
+                    nnet_params,
+                    aug_imgs,
+                    batch_labels,
+                    key=keys,
+                    has_aux=True
+                )
 
             updates, opt_state = optimizer.update(grads, opt_state, nnet_params)
             nnet_params = optax.apply_updates(nnet_params, updates)

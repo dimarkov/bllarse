@@ -117,11 +117,11 @@ def main(args, m_config, o_config):
             last_layer = LastLayer(pretrained_nnet.fc)
 
     # specify loss function
-    if args.loss_function == 'MSE':
+    if args.loss_fn == 'MSE':
         loss_fn = MSE(m_config['num_classes'])
-    if args.loss_function == 'CrossEntropy':
+    if args.loss_fn == 'CrossEntropy':
         loss_fn = CrossEntropy(args.label_smooth, m_config['num_classes'])
-    if args.loss_function == 'IBProbit':
+    if args.loss_fn == 'IBProbit':
         assert "cavi" in o_config, "Bayesian last layer requires CAVI optimizer"
         key, _key = jr.split(key)
         loss_fn = IBProbit(m_config['embed_dim'], m_config['num_classes'], key=_key)
@@ -146,7 +146,7 @@ def main(args, m_config, o_config):
     # set optimizer
     if 'lion' in o_config:
         optim = optax.lion(**o_config['lion'])
-        mc_samples = ()
+        mc_samples = 1
     elif 'ivon' in o_config:
         lr_conf = o_config['lr']
         lr_conf['decay_steps'] = num_iters
@@ -154,17 +154,17 @@ def main(args, m_config, o_config):
         lr_schd = optax.schedules.warmup_cosine_decay_schedule(
             **lr_conf
         )
-        key, _key = jr.split(key)
         conf = o_config['ivon']
-        conf['num_data'] = num_epochs * datasize
-        optim = ivon(_key, lr_schd, **conf)
-        mc_samples = o_config['ivon']['mc_samples']
+        mc_samples = o_config['ivon'].pop('mc_samples')
+        conf['ess'] = datasize if args.nodataaug else num_epochs * datasize
+        optim = ivon(lr_schd, **conf)
     elif 'cavi' in o_config:
         optim = None
         num_update_iters = o_config['cavi']['num_update_iters']
         assert hasattr(loss_fn, "update"), "Using CAVI optimizer requires Bayesian loss function for last layer"
     
     num_params = get_number_of_parameters(pretrained_nnet)
+    print('Loss Function: ', args.loss_fn, 'Optimizer: ', args.optimizer)
     print(f"Number of parameters of {name} is {num_params}.")
 
     # run training
@@ -223,7 +223,7 @@ def main(args, m_config, o_config):
 def build_argparser():
     parser = argparse.ArgumentParser(description="last layer finetuning")
     parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', "cavi"], default='cavi', type=str)
-    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='IBProbit', type=str)
+    parser.add_argument("--loss-fn", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='IBProbit', type=str)
     parser.add_argument('--num-blocks', choices=[6, 12], default=6, type=int, help='Allowed number of blocks/layers')
     parser.add_argument('--embed-dim', choices=[512, 1024], default=512, type=int, help='Allowed embedding dimensions')
     parser.add_argument("--device", nargs='?', default='gpu', type=str)
@@ -262,15 +262,21 @@ def build_configs(args):
         'num_classes': num_classes
         }
 
+    if args.loss_fn == 'IBProbit':
+        args.optimizer = 'cavi'
+    else:
+        if args.optimizer == 'cavi':
+            args.optimizer = 'lion'
+
     if args.optimizer == 'lion':
         opt_config = {'lion': {'learning_rate': 5e-5, 'weight_decay': 1e-2}}
     if args.optimizer == 'ivon':
         opt_config = {
-            'ivon': {'s0': 1., 'h0': 1., 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
+            'ivon': {'weight_decay': 1e-5, 'hess_init': 1.0, 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
             'lr': {
-                'init_value': 5e-4,
-                'peak_value': 1e-2,
-                'end_value': 5e-5
+                'init_value': 1e-3,
+                'peak_value': 2e-2,
+                'end_value': 1e-4
             }
         }
     if args.optimizer == 'cavi':
