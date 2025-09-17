@@ -58,23 +58,24 @@ class IBProbit(eqx.Module):
         fts = vmap(self.norm)(features)
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
 
-        Sigma_new = solve(jnp.eye(fts.shape[-1]) + self.Sigma @ (fts.T @ fts), self.Sigma)
+        xxT = jnp.matmul(fts.T, fts, precision=lax.Precision.HIGHEST)
+        Sigma_new = solve(jnp.eye(fts.shape[-1]) + jnp.matmul(self.Sigma, xxT, precision=lax.Precision.HIGHEST), self.Sigma)
         y_one_hot = nn.one_hot(y, self.eta.shape[-1])
         
-        x = fts @ Sigma_new
+        x = jnp.matmul(fts, Sigma_new, precision=lax.Precision.HIGHEST)
 
         def step_fn(carry, *args):
             # One step of Coordinate Ascent Variational Inference (CAVI) for the probit model.
             eta = carry
 
-            pred = x @ eta
+            pred = jnp.matmul(x, eta, precision=lax.Precision.HIGHEST)
 
             # Compute E_q[z_ik]
             Phi = self.cdf(-pred)
             E_q_z = pred + norm.pdf(-pred) * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
             
             # Update variational mean
-            eta = self.eta + fts.T @ E_q_z
+            eta = self.eta + jnp.matmul(fts.T, E_q_z, precision=lax.Precision.HIGHEST)
             return eta, None
 
         eta_new, _ = lax.scan(step_fn, self.eta, jnp.arange(num_iters))
@@ -83,7 +84,7 @@ class IBProbit(eqx.Module):
     
     @property
     def params(self) -> Tuple[Array, Array]:
-        params = self.Sigma @ self.eta
+        params = jnp.matmul(self.Sigma, self.eta, precision=lax.Precision.HIGHEST)
         return (params[:-1], params[-1]) if self.use_bias else (params, None)
 
     def __call__(self, features: Array, y: Array, *, with_logits: bool = False, loss_type: int = 3) -> Tuple[Array, Optional[Array]]:
