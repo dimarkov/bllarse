@@ -156,7 +156,7 @@ def main(args, m_config, o_config):
         )
         conf = o_config['ivon']
         mc_samples = o_config['ivon'].pop('mc_samples')
-        conf['ess'] = datasize if args.nodataaug else num_epochs * datasize
+        conf['ess'] = datasize
         optim = ivon(lr_schd, **conf)
     elif 'cavi' in o_config:
         optim = None
@@ -235,7 +235,7 @@ def build_argparser():
     parser.add_argument("-bs", "--batch-size", nargs='?', default=64, type=int)
     parser.add_argument("-ls", "--label-smooth", nargs='?', default=0.0, type=float)
     parser.add_argument("-mc", "--mc-samples", nargs='?', default=1, type=int)
-    parser.add_argument("--num-update-iters", nargs='?', default=32, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
+    parser.add_argument("--num-update-iters", nargs='?', default=16, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
     parser.add_argument("--reinitialize", action="store_true")
     parser.add_argument("--nodataaug", action="store_true")
@@ -272,7 +272,7 @@ def build_configs(args):
         opt_config = {'lion': {'learning_rate': 5e-5, 'weight_decay': 1e-2}}
     if args.optimizer == 'ivon':
         opt_config = {
-            'ivon': {'weight_decay': 1e-5, 'hess_init': 1.0, 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
+            'ivon': {'weight_decay': 1e-6, 'hess_init': 1.0, 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
             'lr': {
                 'init_value': 1e-3,
                 'peak_value': 2e-2,
