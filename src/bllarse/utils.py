@@ -1,5 +1,5 @@
 import equinox as eqx
-import jax.tree_util as jtu
+import jax.tree as jtu
 from jax import nn, lax, numpy as jnp, vmap, random as jr
 from tensorflow_probability.substrates.jax.stats import expected_calibration_error as compute_ece
 from functools import partial
@@ -54,9 +54,9 @@ def solve_precision(L, b):
 
 def get_number_of_parameters(model):
     params, _ = eqx.partition(model, eqx.is_array)
-    leafs = jtu.tree_flatten(params)[0]
+    leaves = jtu.leaves(params)
 
-    return sum([prod(l.shape) for l in leafs])
+    return sum([prod(l.shape) for l in leaves])
 
 def resize_images(img, img_size):
     func = augmax.Chain(
@@ -192,10 +192,11 @@ def run_training(
             key, _key = jr.split(key)
             aug_batch_images = data_augmentation(batch_images, key=_key)
             key, _key = jr.split(key)
-            params, opt_state, loss_value = train_step(
+            new_params, new_opt_state, loss_value = train_step(
                 params, opt_state, aug_batch_images, batch_labels, _key
             )
-            return (params, opt_state, key), loss_value
+
+            return (new_params, new_opt_state, key), loss_value
         
         # Run training steps for one epoch
         data = (
@@ -237,7 +238,7 @@ def run_training(
     )
     if log_to_wandb and not no_wandb:
         # turn DeviceArrays → python scalars so wandb is happy
-        metrics_np = jtu.tree_map(lambda x: onp.asarray(x), metrics_seq)
+        metrics_np = jtu.map(lambda x: onp.asarray(x), metrics_seq)
         for ep in range(num_epochs):
             wandb.log(
                 {
@@ -266,6 +267,7 @@ def run_bayesian_training(
     num_epochs: int = 1,
     batch_size: int = 32,
     num_update_iters: int = 32,  # CAVI/PG iterations per mini-batch
+    mc_samples: int = 1,
     log_to_wandb=False,
 ):
     """
@@ -294,49 +296,52 @@ def run_bayesian_training(
     # 2)  Helper: evaluate on (full) test set
     # ----------------------------------------------------------------
     # Evaluation function
-    def evaluate(model, nnet_params, images, labels):
+    def evaluate(bll_model, nnet_params, images, labels):
         nnet = eqx.combine(nnet_params, nnet_static)
         return evaluate_bayesian_model(
-            data_augmentation, model, nnet, images, labels
+            data_augmentation, partial(bll_model, loss_type=loss_type), nnet, images, labels
         )
-
-    def loss_fn(params, loss_model, images, labels):
-        nnet = eqx.combine(params, nnet_static)
-        feats = extract_features(nnet, images)
-        updated_lm = loss_model.update(feats, labels, num_iters=num_update_iters)
-        loss = updated_lm(feats, labels, loss_type=loss_type).mean()
-        return loss, updated_lm
     
     # ----------------------------------------------------------------
     # 3)  One mini-batch update (CAVI / PG)
     # ----------------------------------------------------------------
     def batch_update(current_loss_model, nnet_params, opt_state, batch_imgs, batch_labels, key):
-        aug_imgs   = data_augmentation(batch_imgs, key=key)
+        key, _key = jr.split(key)
+        aug_imgs   = data_augmentation(batch_imgs, key=_key)
 
-        # training NLL (after the update)
+        nnet = eqx.combine(nnet_params, nnet_static)
+        feats = extract_features(nnet, aug_imgs)
+        updated_loss_model = current_loss_model.update(
+            feats,
+            batch_labels,
+            num_iters=num_update_iters
+        )
+
+        # training NLL (after the BLL update)
         if optimizer is None:
-            loss, updated_model = loss_fn(
-                nnet_params,
-                current_loss_model,
-                aug_imgs,
-                batch_labels
-            )
+            loss = updated_loss_model(feats, batch_labels, loss_type=loss_type).mean()
         else:
-            (loss, updated_model), grads = \
+            def loss_fn(params, images, labels, *args):
+                nnet = eqx.combine(params, nnet_static)
+                feats = extract_features(nnet, images)
+                return updated_loss_model(feats, labels, loss_type=loss_type).mean()
+            
+            key, _key = jr.split(key)
+            loss, grads, opt_state = \
                 noisy_value_and_grad(
                     loss_fn,
-                    opt_state[0],
+                    opt_state,
                     nnet_params,
+                    _key,
                     aug_imgs,
                     batch_labels,
-                    key=keys,
-                    has_aux=True
+                    mc_samples=mc_samples,
                 )
 
             updates, opt_state = optimizer.update(grads, opt_state, nnet_params)
             nnet_params = optax.apply_updates(nnet_params, updates)
 
-        return updated_model, nnet_params, opt_state, loss
+        return updated_loss_model, nnet_params, opt_state, jnp.mean(loss)
 
     # ----------------------------------------------------------------
     # 4)  One training epoch (scan over mini-batches)
@@ -415,7 +420,7 @@ def run_bayesian_training(
 
     if log_to_wandb and not no_wandb:
         # turn DeviceArrays → python scalars so wandb is happy
-        metrics_np = jtu.tree_map(lambda x: onp.asarray(x), metrics_seq)
+        metrics_np = jtu.map(lambda x: onp.asarray(x), metrics_seq)
         for ep in range(num_epochs):
             wandb.log(
                 {
