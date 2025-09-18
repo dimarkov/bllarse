@@ -51,7 +51,7 @@ def main(args, m_config, o_config):
                 batch_size=args.batch_size,
                 num_vb_iters=args.num_update_iters,
                 optimizer=args.optimizer,
-                loss_fn=args.loss_function,
+                loss_fn=args.loss_fn,
                 embed_dim=args.embed_dim,
                 num_blocks=args.num_blocks,
                 pretrained=args.pretrained,
