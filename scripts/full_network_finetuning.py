@@ -24,8 +24,6 @@ from bllarse.losses import MSE, CrossEntropy, IBProbit
 from bllarse.layers import LastLayer
 from bllarse.utils import run_training, run_bayesian_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, evaluate_bayesian_model, MEAN_DICT, STD_DICT
 
-config.update("jax_default_matmul_precision", "highest")
-
 def main(args, m_config, o_config):
     dataset = args.dataset
     seed = args.seed
@@ -106,7 +104,7 @@ def main(args, m_config, o_config):
     # set optimizer
     if 'lion' in o_config:
         optim = optax.lion(**o_config['lion'])
-        mc_samples = ()
+        mc_samples = 1
     elif 'ivon' in o_config:
         lr_conf = o_config['lr']
         lr_conf['decay_steps'] = num_iters
@@ -116,9 +114,9 @@ def main(args, m_config, o_config):
         )
         key, _key = jr.split(key)
         conf = o_config['ivon']
-        conf['num_data'] = num_epochs * datasize
-        optim = ivon(_key, lr_schd, **conf)
-        mc_samples = o_config['ivon']['mc_samples']
+        mc_samples = conf.pop('mc_samples')
+        conf['ess'] = datasize
+        optim = ivon(lr_schd, **conf)
 
     num_update_iters = args.num_update_iters  
     num_params = get_number_of_parameters(pretrained_nnet)
@@ -143,6 +141,7 @@ def main(args, m_config, o_config):
             num_epochs=save_every,
             batch_size=batch_size,
             num_update_iters=num_update_iters,
+            mc_samples=mc_samples
         )
 
         #TODO: save model checkpoint, opt_state, and test metrics
@@ -154,7 +153,7 @@ def main(args, m_config, o_config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="deep MLP training")
     parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion'], default='lion', type=str)
-    parser.add_argument("--loss-function", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='IBProbit', type=str)
+    parser.add_argument("--loss-function", choices=['IBProbit'], default='IBProbit', type=str)
     parser.add_argument('--num-blocks', choices=[6, 12], default=6, type=int, help='Allowed number of blocks/layers')
     parser.add_argument('--embed-dim', choices=[512, 1024], default=512, type=int, help='Allowed embedding dimensions')
     parser.add_argument("--device", nargs='?', default='gpu', type=str)
@@ -166,7 +165,7 @@ if __name__ == '__main__':
     parser.add_argument("-bs", "--batch-size", nargs='?', default=64, type=int)
     parser.add_argument("-ls", "--label-smooth", nargs='?', default=0.0, type=float)
     parser.add_argument("-mc", "--mc-samples", nargs='?', default=1, type=int)
-    parser.add_argument("--num-update-iters", nargs='?', default=32, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
+    parser.add_argument("--num-update-iters", nargs='?', default=16, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k', type=str)
     parser.add_argument("--reinitialize", action="store_true")
     parser.add_argument("--nodataaug", action="store_true")
@@ -195,11 +194,11 @@ if __name__ == '__main__':
         opt_config = {'lion': {'learning_rate': 5e-5, 'weight_decay': 1e-2}}
     if args.optimizer == 'ivon':
         opt_config = {
-            'ivon': {'s0': 1., 'h0': 1., 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
+            'ivon': {'weight_decay': 1e-6, 'hess_init': 1.0, 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
             'lr': {
-                'init_value': 5e-4,
-                'peak_value': 1e-2,
-                'end_value': 5e-5
+                'init_value': 1e-3,
+                'peak_value': 2e-2,
+                'end_value': 1e-4
             }
         }
         

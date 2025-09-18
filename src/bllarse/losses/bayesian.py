@@ -3,7 +3,7 @@ import optax
 import jax.numpy as jnp
 from jax import nn, vmap, random as jr, lax
 from jax.scipy.stats import norm
-from jax.scipy.linalg import lu_factor, lu_solve, solve
+from jax.scipy.linalg import solve
 from jaxtyping import Array, PRNGKeyArray as PRNGKey
 from typing import Optional, Tuple, Callable
 from functools import partial
@@ -55,29 +55,27 @@ class IBProbit(eqx.Module):
         return eqx.tree_at(lambda x: (x.eta, x.Sigma), self, (eta, Sigma))
 
     def update(self, features: Array, y: Array, *, num_iters: int = 32) -> "IBProbit":
-        fts = vmap(self.norm)(lax.stop_gradient(features))
+        fts = vmap(self.norm)(features)
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
 
-        xxT = einsum(fts, fts, 'batch i, batch j -> i j')
-        luf = lu_factor(jnp.eye(fts.shape[-1]) + self.Sigma @ xxT)
-        Sigma_new = lu_solve(luf, self.Sigma)
+        xxT = jnp.matmul(fts.T, fts, precision=lax.Precision.HIGHEST)
+        Sigma_new = solve(jnp.eye(fts.shape[-1]) + jnp.matmul(self.Sigma, xxT, precision=lax.Precision.HIGHEST), self.Sigma)
         y_one_hot = nn.one_hot(y, self.eta.shape[-1])
         
-        x = fts @ Sigma_new
+        x = jnp.matmul(fts, Sigma_new, precision=lax.Precision.HIGHEST)
 
         def step_fn(carry, *args):
             # One step of Coordinate Ascent Variational Inference (CAVI) for the probit model.
             eta = carry
 
-            pred = x @ eta
+            pred = jnp.matmul(x, eta, precision=lax.Precision.HIGHEST)
 
             # Compute E_q[z_ik]
-            phi = norm.pdf(-pred)
             Phi = self.cdf(-pred)
-
+            E_q_z = pred + norm.pdf(-pred) * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
+            
             # Update variational mean
-            E_q_z = pred + phi * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
-            eta = self.eta + einsum(fts, E_q_z, 'batch d, batch k -> d k')
+            eta = self.eta + jnp.matmul(fts.T, E_q_z, precision=lax.Precision.HIGHEST)
             return eta, None
 
         eta_new, _ = lax.scan(step_fn, self.eta, jnp.arange(num_iters))
@@ -86,7 +84,7 @@ class IBProbit(eqx.Module):
     
     @property
     def params(self) -> Tuple[Array, Array]:
-        params = self.Sigma @ self.eta
+        params = jnp.matmul(self.Sigma, self.eta, precision=lax.Precision.HIGHEST)
         return (params[:-1], params[-1]) if self.use_bias else (params, None)
 
     def __call__(self, features: Array, y: Array, *, with_logits: bool = False, loss_type: int = 3) -> Tuple[Array, Optional[Array]]:

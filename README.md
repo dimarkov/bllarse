@@ -38,6 +38,19 @@ source .venv/bin/activate
 python scripts/last_layer_finetuning.py
 ```
 
+## 🔄 Updating Git-based dependencies
+
+Some dependencies in `pyproject.toml` are installed directly from GitHub (e.g. `blrax`, `mlpox`).  
+By default, `uv sync` will use the commit pinned in your `uv.lock` file, so you won’t automatically get the latest changes from `main`.
+
+To update one of these packages to the newest commit on its branch:
+
+```bash
+uv sync --upgrade-package blrax # replace `blrax` with the name of the dependency you want to upgrade.
+```
+
+This updates the lockfile to the latest commit and reinstalls the package in your virtual environment.
+
 ## 📋 SLURM cluster usage
 
 We provide an sbatch wrapper for non-interactive, GPU-accelerated jobs.
