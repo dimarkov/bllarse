@@ -187,13 +187,12 @@ def run_training(
         
         def train_step_scan(carry, xs):
             params, opt_state, key = carry
+            aug_key, grad_eval_key = jr.split(key)
             
             batch_images, batch_labels = xs
-            key, _key = jr.split(key)
-            aug_batch_images = data_augmentation(batch_images, key=_key)
-            key, _key = jr.split(key)
+            aug_batch_images = data_augmentation(batch_images, key=aug_key)
             new_params, new_opt_state, loss_value = train_step(
-                params, opt_state, aug_batch_images, batch_labels, _key
+                params, opt_state, aug_batch_images, batch_labels, grad_eval_key
             )
 
             return (new_params, new_opt_state, key), loss_value
@@ -306,8 +305,10 @@ def run_bayesian_training(
     # 3)  One mini-batch update (CAVI / PG)
     # ----------------------------------------------------------------
     def batch_update(current_loss_model, nnet_params, opt_state, batch_imgs, batch_labels, key):
-        key, _key = jr.split(key)
-        aug_imgs   = data_augmentation(batch_imgs, key=_key)
+
+        # split batch-specific key into a key for data augmentation and a key for gradient evaluation
+        aug_key, grad_eval_key = jr.split(key)
+        aug_imgs   = data_augmentation(batch_imgs, key=aug_key)
 
         nnet = eqx.combine(nnet_params, nnet_static)
         feats = extract_features(nnet, aug_imgs)
@@ -326,13 +327,12 @@ def run_bayesian_training(
                 feats = extract_features(nnet, images)
                 return updated_loss_model(feats, labels, loss_type=loss_type).mean()
             
-            key, _key = jr.split(key)
             loss, grads, opt_state = \
                 noisy_value_and_grad(
                     loss_fn,
                     opt_state,
                     nnet_params,
-                    _key,
+                    grad_eval_key,
                     aug_imgs,
                     batch_labels,
                     mc_samples=mc_samples,
@@ -355,7 +355,7 @@ def run_bayesian_training(
         n_batches       = ds_size // batch_size
 
         # shuffle dataset
-        epoch_key, perm_key, aug_key = jr.split(epoch_key, 3)
+        epoch_key, perm_key, batch_key = jr.split(epoch_key, 3)
         perm        = jr.permutation(perm_key, ds_size)
         shuf_imgs   = train_ds["image"][perm]
         shuf_labels = train_ds["label"][perm]
@@ -368,8 +368,8 @@ def run_bayesian_training(
             n_batches, batch_size
         )
 
-        # mini-batch keys for stochastic augmentation
-        batch_keys = jr.split(aug_key, n_batches)
+        # mini-batch keys for stochastic augmentation and gradient evaluation
+        batch_keys = jr.split(batch_key, n_batches)
 
         # scan over mini-batches
         def batch_body(carry, scans):
