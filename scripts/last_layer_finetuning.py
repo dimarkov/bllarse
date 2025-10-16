@@ -61,7 +61,7 @@ def main(args, m_config, o_config):
                 ivon_weight_decay=args.ivon_weight_decay,
                 ivon_hess_init=args.ivon_hess_init,
                 epochs=args.epochs,
-                nodataaug=not args.nodataaug,
+                nodataaug=args.nodataaug,
             ),
             # Entity / mode / tags can be added here if you use them
             reinit=True,
