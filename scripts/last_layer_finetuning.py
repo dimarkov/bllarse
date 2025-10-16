@@ -59,7 +59,7 @@ def main(args, m_config, o_config):
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 epochs=args.epochs,
-                nodataaug=not args.nodataaug,
+                nodataaug=args.nodataaug,
             ),
             # Entity / mode / tags can be added here if you use them
             reinit=True,
