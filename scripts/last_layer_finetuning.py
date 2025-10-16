@@ -58,6 +58,8 @@ def main(args, m_config, o_config):
                 label_smooth=args.label_smooth,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
+                ivon_weight_decay=args.ivon_weight_decay,
+                ivon_hess_init=args.ivon_hess_init,
                 epochs=args.epochs,
                 nodataaug=not args.nodataaug,
             ),
@@ -242,6 +244,8 @@ def build_argparser():
     parser.add_argument("-lr", "--learning-rate" , nargs='?', default=1e-3, type=float, help='Learning rate for AdamW or Lion optimizers')
     parser.add_argument("-wd", "--weight-decay", nargs='?', default=1e-2, type=float, help='Weight decay for AdamW or Lion optimizers')
     parser.add_argument("-mc", "--mc-samples", nargs='?', default=1, type=int)
+    parser.add_argument("--ivon-weight-decay", nargs='?', default=1e-6, type=float, help='Weight decay for IVON optimizer')
+    parser.add_argument("--ivon-hess-init", nargs='?', default=1.0, type=float, help='Hessian initialisation scale for IVON optimizer')
     parser.add_argument("--num-update-iters", nargs='?', default=16, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
     parser.add_argument("--reinitialize", action="store_true")
@@ -281,7 +285,12 @@ def build_configs(args):
         opt_config = {'adamw': {'learning_rate': args.learning_rate, 'weight_decay': args.weight_decay}}
     if args.optimizer == 'ivon':
         opt_config = {
-            'ivon': {'weight_decay': 1e-6, 'hess_init': 1.0, 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
+            'ivon': {
+                'weight_decay': args.ivon_weight_decay,
+                'hess_init': args.ivon_hess_init,
+                'mc_samples': args.mc_samples,
+                'clip_radius': 1e3
+            },
             'lr': {
                 'init_value': 1e-3,
                 'peak_value': 2e-2,
