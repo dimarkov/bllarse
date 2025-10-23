@@ -1,0 +1,8 @@
+FROM nvidia/cuda:12.5.0-devel-ubuntu20.04
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y ca-certificates git libgl1 libsm6 libxext6 \
+   && rm -rf /var/lib/apt/lists/*
+
+# Let uv manage Python 3.12 (no deadsnakes, no add-apt-repository)
+RUN uv python install 3.12 && uv python pin 3.12
