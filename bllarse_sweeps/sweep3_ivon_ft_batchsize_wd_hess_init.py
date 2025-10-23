@@ -45,8 +45,8 @@ def _mk_cfg(
         batch_size=batch_size,
         seed=seed,
         epochs=_epochs_for(dataset),
-        weight_decay=weight_decay,
-        hess_init=hess_init,
+        ivon_weight_decay=weight_decay,
+        ivon_hess_init=hess_init,
         group_id="sweep1_ivon_batchsize_wd_hessinit",
     )
 
