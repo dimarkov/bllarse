@@ -5,6 +5,7 @@ from bllarse.tools.adapters import run_training_from_config
 
 # -------------------- Smoke sweep axes --------------------
 DATASETS = ["cifar10", "cifar100"]
+DATAAUG = [False]  # Smoke test with no data augmentation
 PRETRAINED = ["in21k", "in21k_cifar"]
 BATCH_SIZES = [512]
 SEEDS = [0]
@@ -23,7 +24,6 @@ BASE: Dict[str, Any] = dict(
     num_blocks=6,
     mc_samples=1,
     learning_rate=5e-4,
-    nodataaug=True,
 )
 
 
@@ -33,6 +33,7 @@ def _epochs_for(dataset: str) -> int:
 
 def _mk_cfg(
     dataset: str,
+    dataaug: bool,
     pretrained: str,
     batch_size: int,
     seed: int,
@@ -42,6 +43,7 @@ def _mk_cfg(
     return dict(
         **BASE,
         dataset=dataset,
+        nodataaug=not dataaug,
         pretrained=pretrained,
         batch_size=batch_size,
         seed=seed,
@@ -54,12 +56,12 @@ def _mk_cfg(
 
 def create_configs() -> List[Dict[str, Any]]:
     configs: List[Dict[str, Any]] = []
-    for (dataset, pretrained, batch_size, seed) in product(
-        DATASETS, PRETRAINED, BATCH_SIZES, SEEDS
+    for (dataset, dataug, pretrained, batch_size, seed) in product(
+        DATASETS, DATAAUG, PRETRAINED, BATCH_SIZES, SEEDS
     ):
         for (weight_decay, hess_init) in product(WEIGHT_DECAYS, HESS_INITS):
             configs.append(
-                _mk_cfg(dataset, pretrained, batch_size, seed, weight_decay, hess_init)
+                _mk_cfg(dataset, dataug, pretrained, batch_size, seed, weight_decay, hess_init)
             )
     return configs
 
