@@ -433,3 +433,29 @@ def run_bayesian_training(
             )
 
     return trained_loss_model, trained_nnet, opt_state, metrics_seq
+
+def save_ivon_checkpoint(path, last_layer, opt_state):
+    """Save only array leaves: params from last_layer + opt_state (PyTrees)."""
+    params = eqx.filter(last_layer, eqx.is_array)  # array-only view of the module
+    ckpt = {"params": params, "opt_state": opt_state}
+    eqx.tree_serialise_leaves(path, ckpt)
+
+def load_ivon_checkpoint(path, last_layer_like, optim):
+    """Load back into a like-structured PyTree and reassemble the module.
+
+    last_layer_like: same structure/hparams as your LastLayer (untrained or current).
+    optim: the Optax/IVON optimizer to reconstruct opt_state shape if needed.
+    """
+    # Prepare skeletons ( the ‘like’ PyTrees) for deserialisation:
+    params_like = eqx.filter(last_layer_like, eqx.is_array)
+    opt_state_like = None if optim is None else optim.init(params_like)
+    like = {"params": params_like, "opt_state": opt_state_like}
+
+    ckpt = eqx.tree_deserialise_leaves(path, like) 
+
+    # Recombine arrays + statics to get a full LastLayer module back.
+    # (params, static) = partition; then combine(restored_params, static)
+    _, static = eqx.partition(last_layer_like, eqx.is_array)
+    restored_last_layer = eqx.combine(ckpt["params"], static)
+    restored_opt_state = ckpt["opt_state"]
+    return restored_last_layer, restored_opt_state
