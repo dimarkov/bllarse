@@ -82,11 +82,11 @@ def main(args, m_config, o_config):
             last_layer = LastLayer(pretrained_nnet.fc)
 
     # specify loss function
-    if args.loss_function == 'MSE':
+    if args.loss_fn == 'MSE':
         loss_fn = MSE(m_config['num_classes'])
-    if args.loss_function == 'CrossEntropy':
+    if args.loss_fn == 'CrossEntropy':
         loss_fn = CrossEntropy(args.label_smooth, m_config['num_classes'])
-    if args.loss_function == 'IBProbit':
+    if args.loss_fn == 'IBProbit':
         key, _key = jr.split(key)
         loss_fn = IBProbit(m_config['embed_dim'], m_config['num_classes'], key=_key)
 
@@ -123,6 +123,7 @@ def main(args, m_config, o_config):
 
     num_update_iters = args.num_update_iters  
     num_params = get_number_of_parameters(pretrained_nnet)
+    print('Loss Function: ', args.loss_fn, 'Optimizer: ', args.optimizer)
     print(f"Number of parameters of {name} is {num_params}.")
 
     # run training
@@ -156,7 +157,7 @@ def main(args, m_config, o_config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="deep MLP training")
     parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', 'adamw'], default='lion', type=str)
-    parser.add_argument("--loss-function", choices=['IBProbit'], default='IBProbit', type=str)
+    parser.add_argument("--loss-fn", choices=['IBProbit'], default='IBProbit', type=str)
     parser.add_argument('--num-blocks', choices=[6, 12], default=6, type=int, help='Allowed number of blocks/layers')
     parser.add_argument('--embed-dim', choices=[512, 1024], default=512, type=int, help='Allowed embedding dimensions')
     parser.add_argument("--device", nargs='?', default='gpu', type=str)
@@ -170,6 +171,8 @@ if __name__ == '__main__':
     parser.add_argument("-lr", "--learning-rate", nargs='?', default=1e-3, type=float, help='Learning rate for AdamW or Lion optimizers')
     parser.add_argument("-wd", "--weight-decay",  nargs='?', default=1e-2, type=float, help='Weight decay for AdamW or Lion optimizers')
     parser.add_argument("-mc", "--mc-samples", nargs='?', default=1, type=int)
+    parser.add_argument("--ivon-weight-decay", nargs='?', default=1e-6, type=float, help='Weight decay for IVON optimizer')
+    parser.add_argument("--ivon-hess-init", nargs='?', default=1.0, type=float, help='Hessian initialisation scale for IVON optimizer')
     parser.add_argument("--num-update-iters", nargs='?', default=16, type=int, help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k', type=str)
     parser.add_argument("--reinitialize", action="store_true")
@@ -201,7 +204,12 @@ if __name__ == '__main__':
         opt_config = {'adamw': {'learning_rate': args.learning_rate, 'weight_decay': args.weight_decay}}
     if args.optimizer == 'ivon':
         opt_config = {
-            'ivon': {'weight_decay': 1e-6, 'hess_init': 1.0, 'mc_samples': args.mc_samples, 'clip_radius': 1e3},
+            'ivon': {
+                'weight_decay': args.ivon_weight_decay,
+                'hess_init': args.ivon_hess_init,
+                'mc_samples': args.mc_samples,
+                'clip_radius': 1e3
+            },
             'lr': {
                 'init_value': 1e-3,
                 'peak_value': 2e-2,
