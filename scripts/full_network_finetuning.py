@@ -27,7 +27,16 @@ from mlpox.load_models import load_model
 
 from bllarse.losses import MSE, CrossEntropy, IBProbit
 from bllarse.layers import LastLayer
-from bllarse.utils import run_bayesian_training, resize_images, augmentdata, get_number_of_parameters, evaluate_model, MEAN_DICT, STD_DICT
+from bllarse.utils import (
+    run_bayesian_training,
+    resize_images,
+    augmentdata,
+    get_number_of_parameters,
+    evaluate_model,
+    MEAN_DICT,
+    STD_DICT,
+    save_checkpoint_bundle,
+)
 
 def main(args, m_config, o_config):
     dataset = args.dataset
@@ -37,6 +46,8 @@ def main(args, m_config, o_config):
     batch_size = args.batch_size
     save_every = args.save_every
     platform = args.device
+    use_ivon = 'ivon' in o_config
+    log_ivon_checkpoints = args.enable_wandb and not no_wandb and use_ivon
 
     if args.enable_wandb and not no_wandb:
         wandb.init(
@@ -193,6 +204,22 @@ def main(args, m_config, o_config):
         else: 
             # only print to console if not logging to wandb
             print(i, [(name, f'{vals[name].item():.3f}') for name in vals])
+        if log_ivon_checkpoints:
+            epoch = (i + 1) * save_every
+            ckpt_name = f"ivon_epoch_{epoch}.eqx"
+            ckpt_path = os.path.join(wandb.run.dir, ckpt_name)
+
+            # Save full backbone + Bayesian head and the optimizer state for the backbone
+            save_checkpoint_bundle(
+                ckpt_path,
+                models={"backbone": trained_nnet, "bayes_head": trained_loss_fn},
+                opt_state=opt_state,
+            )
+
+            # Track the single .eqx file as a W&B artifact
+            artifact = wandb.Artifact(f"{wandb.run.id}-ivon-{epoch}", type="model")
+            artifact.add_file(ckpt_path, name=ckpt_name)
+            wandb.run.log_artifact(artifact)
 
 def build_argparser():
     parser = argparse.ArgumentParser(description="deep MLP training")

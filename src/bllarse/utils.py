@@ -11,6 +11,8 @@ except:
     no_wandb = True
 import numpy as onp
 
+from typing import Mapping, Optional
+
 from blrax.utils import noisy_value_and_grad
 
 import jax.scipy.linalg as linalg
@@ -434,28 +436,78 @@ def run_bayesian_training(
 
     return trained_loss_model, trained_nnet, opt_state, metrics_seq
 
-def save_ivon_checkpoint(path, last_layer, opt_state):
-    """Save only array leaves: params from last_layer + opt_state (PyTrees)."""
-    params = eqx.filter(last_layer, eqx.is_array)  # array-only view of the module
-    ckpt = {"params": params, "opt_state": opt_state}
-    eqx.tree_serialise_leaves(path, ckpt)
+def save_checkpoint_bundle(path, *, models: Mapping[str, eqx.Module], opt_state=None):
+    """Serialise one or more Equinox modules plus an optional optimizer state.
 
-def load_ivon_checkpoint(path, last_layer_like, optim):
-    """Load back into a like-structured PyTree and reassemble the module.
-
-    last_layer_like: same structure/hparams as your LastLayer (untrained or current).
-    optim: the Optax/IVON optimizer to reconstruct opt_state shape if needed.
+    Args:
+        path: Destination filepath.
+        models: Mapping from user-defined names to Equinox modules.
+        opt_state: PyTree optimizer state aligned with one of the models (or None).
     """
-    # Prepare skeletons ( the ‘like’ PyTrees) for deserialisation:
-    params_like = eqx.filter(last_layer_like, eqx.is_array)
-    opt_state_like = None if optim is None else optim.init(params_like)
-    like = {"params": params_like, "opt_state": opt_state_like}
+    if not models:
+        raise ValueError("Expected at least one model to save.")
+    filtered_models = {name: eqx.filter(model, eqx.is_array) for name, model in models.items()}
+    payload = {"models": filtered_models, "opt_state": opt_state}
+    eqx.tree_serialise_leaves(path, payload)
 
-    ckpt = eqx.tree_deserialise_leaves(path, like) 
 
-    # Recombine arrays + statics to get a full LastLayer module back.
-    # (params, static) = partition; then combine(restored_params, static)
-    _, static = eqx.partition(last_layer_like, eqx.is_array)
-    restored_last_layer = eqx.combine(ckpt["params"], static)
-    restored_opt_state = ckpt["opt_state"]
-    return restored_last_layer, restored_opt_state
+def load_checkpoint_bundle(
+    path,
+    *,
+    model_likes: Mapping[str, eqx.Module],
+    optim=None,
+    opt_target: Optional[str] = None,
+):
+    """Deserialise checkpoints written via `save_checkpoint_bundle`.
+
+    Args:
+        path: Path to the checkpoint file.
+        model_likes: Mapping from names used at save-time to like-structured modules.
+        optim: Optional optimizer instance used to rebuild the opt_state tree.
+        opt_target: Name of the model whose parameters were optimised. Required when
+            `optim` is provided and multiple models were saved.
+    Returns:
+        restored_models: dict mapping names → reconstructed Equinox modules.
+        opt_state: Restored optimizer state (or None).
+    """
+    if not model_likes:
+        raise ValueError("Expected at least one model to load.")
+
+    filtered_models = {name: eqx.filter(model, eqx.is_array) for name, model in model_likes.items()}
+
+    opt_state_like = None
+    if optim is not None:
+        target = opt_target
+        if target is None:
+            if len(model_likes) != 1:
+                raise ValueError(
+                    "opt_target must be specified when loading multiple models with an optimizer."
+                )
+            target = next(iter(model_likes))
+        if target not in filtered_models:
+            raise KeyError(f"opt_target '{target}' not present in provided model_likes.")
+        opt_state_like = optim.init(filtered_models[target])
+
+    like = {"models": filtered_models, "opt_state": opt_state_like}
+    ckpt = eqx.tree_deserialise_leaves(path, like)
+
+    restored_models = {}
+    for name, model_like in model_likes.items():
+        params = ckpt["models"][name]
+        _, static = eqx.partition(model_like, eqx.is_array)
+        restored_models[name] = eqx.combine(params, static)
+
+    return restored_models, ckpt["opt_state"]
+
+
+def save_ivon_checkpoint(path, model, opt_state):
+    """Backward-compatible helper for single-model IVON checkpoints."""
+    save_checkpoint_bundle(path, models={"model": model}, opt_state=opt_state)
+
+
+def load_ivon_checkpoint(path, model_like, optim):
+    """Backward-compatible helper for single-model IVON checkpoints."""
+    restored, opt_state = load_checkpoint_bundle(
+        path, model_likes={"model": model_like}, optim=optim, opt_target="model"
+    )
+    return restored["model"], opt_state
