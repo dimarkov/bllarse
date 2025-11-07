@@ -152,7 +152,6 @@ def main(args, m_config, o_config):
         lr_schd = optax.schedules.warmup_cosine_decay_schedule(
             **lr_conf
         )
-        key, _key = jr.split(key)
         conf = o_config['ivon']
         mc_samples = conf.pop('mc_samples')
         conf['ess'] = datasize
