@@ -195,8 +195,7 @@ def main(args, m_config, o_config):
             # only print to console if not logging to wandb
             print(i, [(name, f'{vals[name].item():.3f}') for name in vals])
 
-
-if __name__ == '__main__':
+def build_argparser():
     parser = argparse.ArgumentParser(description="deep MLP training")
     parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', 'adamw'], default='lion', type=str)
     parser.add_argument("--loss-fn", choices=['IBProbit'], default='IBProbit', type=str)
@@ -222,10 +221,9 @@ if __name__ == '__main__':
     parser.add_argument("--enable_wandb", "--enable-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--group-id", type=str, default="full_network_finetuning_test", help="Put all runs of this sweep in the same W&B group")
     parser.add_argument("--uid", type=str, default=None, help="Unique identifier for the W&B run. If not provided, a random one will be generated.")
+    return parser
 
-    args = parser.parse_args()
-    config.update("jax_platform_name", args.device)
-
+def build_configs(args):
     num_classes = 1
     if args.dataset == 'cifar10':
         num_classes = 10
@@ -261,5 +259,14 @@ if __name__ == '__main__':
                 'end_value': 1e-4
             }
         }
-        
-    main(args, model_config, opt_config)
+    
+    return model_config, opt_config
+    
+if __name__ == '__main__':
+    parser = build_argparser()
+    args = parser.parse_args()
+    config.update("jax_platform_name", args.device)
+
+    model_conf, opt_conf = build_configs(args)
+
+    main(args, model_conf, opt_conf)
