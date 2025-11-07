@@ -416,7 +416,7 @@ def run_bayesian_training(
     (updated_loss_params, updated_nnet_params, opt_state), metrics_seq = lax.scan(epoch_body, init, epoch_keys)
 
     trained_loss_model = eqx.combine(updated_loss_params, loss_static)
-    trained_nnet = eqx.combine(nnet_params, nnet_static)
+    trained_nnet = eqx.combine(updated_nnet_params, nnet_static)
 
     if log_to_wandb and not no_wandb:
         # turn DeviceArrays → python scalars so wandb is happy
