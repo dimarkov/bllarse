@@ -25,6 +25,7 @@ BASE = dict(
     ivon_hess_init=0.1,
     ivon_weight_decay=1e-6,
     weight_decay=0.02, # analysis of sweep2a2 indicated no difference between 0.02 and other WD conditions
+    num_update_iters=16, # full network finetuning script defaults to 16 num update iters, just being explicit
 )
 
 def _epochs_for(dataset: str) -> int:
