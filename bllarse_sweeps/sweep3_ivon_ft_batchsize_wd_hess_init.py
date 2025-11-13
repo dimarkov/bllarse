@@ -50,7 +50,7 @@ def _mk_cfg(
         epochs=_epochs_for(dataset),
         ivon_weight_decay=weight_decay,
         ivon_hess_init=hess_init,
-        group_id="sweep3a2_ivon_batchsize_wd_hessinit",
+        group_id="sweep3a3_ivon_batchsize_wd_hessinit",
     )
 
 
