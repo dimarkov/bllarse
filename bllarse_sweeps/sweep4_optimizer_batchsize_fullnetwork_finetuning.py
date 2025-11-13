@@ -21,8 +21,8 @@ BASE = dict(
     num_blocks=12,
     mc_samples=1,
     nodataaug=True,
-    pretrained="ini21k",
-    hess_init=0.1,
+    pretrained="in21k",
+    ivon_hess_init=0.1,
     ivon_weight_decay=1e-6,
     weight_decay=0.02, # analysis of sweep2a2 indicated no difference between 0.02 and other WD conditions
 )
