@@ -31,6 +31,44 @@ from bllarse.utils import run_training, run_bayesian_training, resize_images, au
 
 config.update("jax_default_matmul_precision", "highest")
 
+def _build_wandb_config(args, o_config):
+    """Return shared run metadata plus optimizer-specific hyperparameters."""
+    config_dict = dict(
+        dataset=args.dataset,
+        seed=args.seed,
+        batch_size=args.batch_size,
+        optimizer=args.optimizer,
+        loss_fn=args.loss_fn,
+        embed_dim=args.embed_dim,
+        num_blocks=args.num_blocks,
+        pretrained=args.pretrained,
+        label_smooth=args.label_smooth,
+        epochs=args.epochs,
+        nodataaug=args.nodataaug,
+    )
+
+    if 'ivon' in o_config:
+        config_dict.update(
+            dict(
+                ivon_weight_decay=args.ivon_weight_decay,
+                ivon_hess_init=args.ivon_hess_init,
+                mc_samples=args.mc_samples,
+            )
+        )
+    elif 'cavi' in o_config:
+        config_dict.update(dict(num_vb_iters=args.num_update_iters))
+    else:
+        # Lion and AdamW share the same hyperparameters.
+        config_dict.update(
+            dict(
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+            )
+        )
+
+    return config_dict
+
+
 def main(args, m_config, o_config):
     dataset = args.dataset
     seed = args.seed
@@ -47,24 +85,7 @@ def main(args, m_config, o_config):
             project="bllarse_experiments",
             id=args.uid if args.uid else wandb.util.generate_id(),
             group=args.group_id,      # <-- lets you filter by group_id in the UI
-            config=dict(              # everything you later want to slice on
-                dataset=args.dataset,
-                seed=args.seed,
-                batch_size=args.batch_size,
-                num_vb_iters=args.num_update_iters,
-                optimizer=args.optimizer,
-                loss_fn=args.loss_fn,
-                embed_dim=args.embed_dim,
-                num_blocks=args.num_blocks,
-                pretrained=args.pretrained,
-                label_smooth=args.label_smooth,
-                learning_rate=args.learning_rate,
-                weight_decay=args.weight_decay,
-                ivon_weight_decay=args.ivon_weight_decay,
-                ivon_hess_init=args.ivon_hess_init,
-                epochs=args.epochs,
-                nodataaug=args.nodataaug,
-            ),
+            config=_build_wandb_config(args, o_config),
             # Entity / mode / tags can be added here if you use them
             reinit=True,
       )
