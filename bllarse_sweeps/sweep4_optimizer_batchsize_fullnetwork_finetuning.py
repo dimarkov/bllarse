@@ -51,7 +51,7 @@ def _mk_cfg(
         batch_size=batch_size,
         optimizer=optimizer,
         epochs=_epochs_for(dataset),
-        group_id="sweep4a1_optimizer_batchsize_fullnetwork_training",
+        group_id="sweep4a2_optimizer_batchsize_fullnetwork_finetuning",
         learning_rate=_learning_rate_for(optimizer),
         seed=seed,
     )
