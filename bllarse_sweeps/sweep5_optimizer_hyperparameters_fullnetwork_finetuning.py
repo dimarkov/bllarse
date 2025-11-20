@@ -5,18 +5,17 @@ from bllarse.tools.adapters import run_training_from_config
 
 # -------------------- Sweep axes --------------------
 DATASETS = ["cifar10", "cifar100"]
-BATCH_SIZES = [4096, 8192, 16384, 20480]
-SEEDS = [0, 1, 2, 3]
+SEEDS = [0, 1, 2, 3, 4, 5, 6]
 OPTIMIZERS = ["adamw", "lion", "ivon"]
 
-# Optimizer-specific LR / WD grids (for AdamW & Lion)
+# Optimizer-specific LR / WD grids
 LR_GRID = {
-    "adamw": [3e-4, 1e-3, 3e-3],
-    "lion":  [1e-4, 2e-4, 3e-4],
+    "adamw": [1e-4, 1e-3, 1e-2],
+    "lion":  [1e-5, 2e-5, 1e-4],
 }
 WD_GRID = {
-    "adamw": [1e-3, 1e-2, 2e-2],
-    "lion":  [2e-2, 3e-2, 5e-2],
+    "adamw": [1e-3, 2e-3, 1e-2],
+    "lion":  [1e-4, 1e-3, 1e-2],
 }
 
 # IVON-specific grids
@@ -32,11 +31,11 @@ BASE = dict(
     embed_dim=1024,
     num_blocks=12,
     mc_samples=1,
+    batch_size=12000,
     nodataaug=True,
     pretrained="in21k",
     num_update_iters=16,    # full network finetuning script defaults to 16 num update iters, just being explicit
 )
-
 
 def _epochs_for(dataset: str) -> int:
     return 20 if dataset == "cifar10" else 40
@@ -44,7 +43,6 @@ def _epochs_for(dataset: str) -> int:
 
 def _mk_cfg(
     dataset: str,
-    batch_size: int,
     optimizer: str,
     seed: int,
     *,
@@ -56,7 +54,6 @@ def _mk_cfg(
     cfg: Dict[str, Any] = dict(
         **BASE,
         dataset=dataset,
-        batch_size=batch_size,
         optimizer=optimizer,
         epochs=_epochs_for(dataset),
         group_id="sweep5a1_optimizer_hyperparameters_fullnetwork_finetuning",
@@ -81,36 +78,32 @@ def _mk_cfg(
 def create_configs() -> List[Dict[str, Any]]:
     configs: List[Dict[str, Any]] = []
 
-    for dataset, batch_size, seed in product(DATASETS, BATCH_SIZES, SEEDS):
+    for dataset, seed in product(DATASETS, SEEDS):
         # AdamW & Lion: sweep learning_rate and weight_decay
         for optimizer in ("adamw", "lion"):
-            for lr in LR_GRID[optimizer]:
-                for wd in WD_GRID[optimizer]:
-                    configs.append(
-                        _mk_cfg(
-                            dataset=dataset,
-                            batch_size=batch_size,
-                            optimizer=optimizer,
-                            seed=seed,
-                            learning_rate=lr,
-                            weight_decay=wd,
-                        )
-                    )
-
-        # IVON: sweep ivon_weight_decay and ivon_hess_init
-        optimizer = "ivon"
-        for wd in IVON_WEIGHT_DECAYS:
-            for hess_init in IVON_HESS_INITS:
+            for (lr, wd) in product(LR_GRID[optimizer], WD_GRID[optimizer]):
                 configs.append(
                     _mk_cfg(
                         dataset=dataset,
-                        batch_size=batch_size,
                         optimizer=optimizer,
                         seed=seed,
-                        ivon_weight_decay=wd,
-                        ivon_hess_init=hess_init,
+                        learning_rate=lr,
+                        weight_decay=wd,
                     )
                 )
+
+        # IVON: sweep ivon_weight_decay and ivon_hess_init
+        optimizer = "ivon"
+        for wd, hess_init in product(IVON_WEIGHT_DECAYS, IVON_HESS_INITS):
+            configs.append(
+                _mk_cfg(
+                    dataset=dataset,
+                    optimizer=optimizer,
+                    seed=seed,
+                    ivon_weight_decay=wd,
+                    ivon_hess_init=hess_init,
+                )
+            )
 
     return configs
 
