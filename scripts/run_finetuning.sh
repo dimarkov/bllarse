@@ -2,4 +2,4 @@
 set -e 
 
 source .venv/bin/activate
-python scripts/last_layer_finetuning.py --epochs=10
+python scripts/finetuning.py --epochs=10 --tune-mode last_layer
