@@ -78,7 +78,7 @@ def main(args, m_config, o_config):
     save_every = args.save_every
     platform = args.device
     use_ivon = 'ivon' in o_config
-    log_ivon_checkpoints = args.enable_wandb and not no_wandb and use_ivon
+    log_ivon_checkpoints = args.log_checkpoints and args.enable_wandb and not no_wandb and use_ivon
 
     if args.enable_wandb and not no_wandb:
         wandb.init(
@@ -286,6 +286,7 @@ def build_argparser():
     parser.add_argument("--reinitialize", action="store_true")
     parser.add_argument("--nodataaug", action="store_true")
     parser.add_argument("--enable_wandb", "--enable-wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--log-checkpoints", "--log_checkpoints", action="store_true", help="Log IVON checkpoints to W&B/locally")
     parser.add_argument("--group-id", type=str, default="vb_sweep", help="Put all runs of this sweep in the same W&B group")
     parser.add_argument("--uid", type=str, default=None, help="Unique identifier for the W&B run. If not provided, a random one will be generated.")
     return parser
