@@ -105,6 +105,8 @@ def run_training(
     num_update_iters: int = 32,
     mc_samples: int = 1,
     log_to_wandb=False,
+    sequential_update: bool = False,
+    reset_loss_per_epoch: bool = False,
 ):
     """
     Unified training function that handles both Bayesian and classical losses,
@@ -128,6 +130,8 @@ def run_training(
     num_update_iters : Number of CAVI/PG iterations per batch (Bayesian only)
     mc_samples : MC samples for stochastic gradient estimation
     log_to_wandb : Whether to log to Weights & Biases
+    sequential_update : If True, perform two-pass training per epoch (loss update, then network update)
+    reset_loss_per_epoch : If True, reset loss model parameters at the start of each epoch
 
     Returns
     -------
@@ -142,6 +146,8 @@ def run_training(
     3. Bayesian + full network: CAVI + optimize network
     4. Classical + tune_last_layer_only: Optimize last layer params
     5. Classical + full network: Optimize full network params
+    6. Sequential update: Two passes per epoch (loss update, then network update)
+    7. Reset loss per epoch: Reset loss model at start of each epoch
     """
     
     # Detect loss type
@@ -191,23 +197,32 @@ def run_training(
     
     loss_params, loss_static = eqx.partition(loss_model, eqx.is_array)
     
-    # Batch update function
-    def batch_update(current_loss_params, current_params, opt_state, batch_imgs, batch_labels, key):
+    # Batch update function (standard joint update)
+    def batch_update(current_loss_params, current_params, opt_state, batch_imgs, batch_labels, key, update='both'):
+        if update == 'both':
+            update_loss = True
+            update_net = True
+        elif update == 'loss':
+            update_loss = True
+            update_net = False
+        else:
+            update_loss = False
+            update_net = True
+        
         aug_key, grad_eval_key = jr.split(key)
         aug_imgs = data_augmentation(batch_imgs, key=aug_key)
         
         # Reconstruct models
         current_loss = eqx.combine(current_loss_params, loss_static)
-        if is_bayesian_loss:
+        updated_loss = current_loss
+        updated_loss_params = current_loss_params
+        if is_bayesian_loss and update_loss:
             nnet = get_nnet(current_params)
             features = extract_features(nnet, aug_imgs)
             updated_loss = current_loss.update(features, batch_labels, num_iters=num_update_iters)
             updated_loss_params = eqx.filter(updated_loss, eqx.is_array)
-        else:
-            updated_loss = current_loss
-            updated_loss_params = current_loss_params
             
-        if optimizer is not None:
+        if optimizer is not None and update_net:
             # Compute logits and loss
             def loss_fn(params, images, labels, *args, **kwargs):
                 nnet = get_nnet(params)
@@ -240,7 +255,15 @@ def run_training(
         img_shape = train_ds["image"].shape[1:]
         n_batches = ds_size // batch_size
         
-        epoch_key, perm_key, batch_key = jr.split(epoch_key, 3)
+        epoch_key, perm_key, reset_key, batch_key = jr.split(epoch_key, 4)
+        
+        # Reset loss model if requested
+        if reset_loss_per_epoch and is_bayesian_loss:
+            current_loss = eqx.combine(curr_loss_params, loss_static)
+            reset_loss = current_loss.reset(reset_key)
+            curr_loss_params = eqx.filter(reset_loss, eqx.is_array)
+        
+        # Prepare shuffled batches
         perm = jr.permutation(perm_key, ds_size)
         shuf_imgs = train_ds["image"][perm]
         shuf_labels = train_ds["label"][perm]
@@ -249,18 +272,52 @@ def run_training(
         label_batches = shuf_labels[: n_batches * batch_size].reshape(n_batches, batch_size)
         batch_keys = jr.split(batch_key, n_batches)
         
-        def batch_body(carry, scans):
-            loss_params, params, opt_state = carry
-            imgs, labels, key = scans
-            updated_loss_params, updated_params, opt_state, loss = batch_update(
-                loss_params, params, opt_state, imgs, labels, key
+        if sequential_update:
+            # Pass 1: Update loss model only
+            def batch_body_loss_only(carry, scans):
+                loss_params = carry
+                imgs, labels, key = scans
+                updated_loss_params, *_ = batch_update(
+                    loss_params, curr_params, None, imgs, labels, key, update='loss'
+                )
+                return updated_loss_params, None
+            
+            updated_loss_params, _ = lax.scan(
+                batch_body_loss_only, curr_loss_params, (img_batches, label_batches, batch_keys)
             )
-            return (updated_loss_params, updated_params, opt_state), loss
-        
-        init = (curr_loss_params, curr_params, opt_state)
-        (updated_loss_params, updated_params, opt_state), batch_losses = lax.scan(
-            batch_body, init, (img_batches, label_batches, batch_keys)
-        )
+            
+            # Pass 2: Update network only with fixed loss
+            batch_keys_2 = jr.split(jr.fold_in(batch_key, 1), n_batches)
+            
+            def batch_body_network_only(carry, scans):
+                params, opt_state = carry
+                imgs, labels, key = scans
+                _, updated_params, opt_state, loss = batch_update(
+                    updated_loss_params, params, opt_state, imgs, labels, key, update='network'
+                )
+                return (updated_params, opt_state), loss
+            
+            (updated_params, opt_state), batch_losses_network = lax.scan(
+                batch_body_network_only, (curr_params, opt_state), 
+                (img_batches, label_batches, batch_keys_2)
+            )
+            
+            # Use losses from network update pass for metrics
+            batch_losses = batch_losses_network
+        else:
+            # Standard joint update
+            def batch_body(carry, scans):
+                loss_params, params, opt_state = carry
+                imgs, labels, key = scans
+                updated_loss_params, updated_params, opt_state, loss = batch_update(
+                    loss_params, params, opt_state, imgs, labels, key
+                )
+                return (updated_loss_params, updated_params, opt_state), loss
+            
+            init = (curr_loss_params, curr_params, opt_state)
+            (updated_loss_params, updated_params, opt_state), batch_losses = lax.scan(
+                batch_body, init, (img_batches, label_batches, batch_keys)
+            )
         
         acc, nll, ece = evaluate(updated_loss_params, updated_params, test_ds['image'], test_ds['label'])
         

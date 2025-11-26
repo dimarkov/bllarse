@@ -26,7 +26,7 @@ from mlpox.load_models import load_model
 
 from bllarse.losses import MSE, CrossEntropy, IBProbit
 from bllarse.utils import (
-    run_bayesian_training,
+    run_training,
     resize_images,
     augmentdata,
     get_number_of_parameters,
@@ -55,6 +55,8 @@ def _build_wandb_config(args, o_config):
         epochs=args.epochs,
         nodataaug=args.nodataaug,
         tune_mode=args.tune_mode,
+        sequential_update=args.sequential_update,
+        reset_loss_per_epoch=args.reset_loss_per_epoch,
     )
 
     if args.loss_fn == 'IBProbit':
@@ -90,6 +92,16 @@ def main(args, m_config, o_config):
     tune_last_layer_only = (args.tune_mode == 'last_layer')
     use_ivon = 'ivon' in o_config
     log_ivon_checkpoints = args.log_checkpoints and args.enable_wandb and not no_wandb and use_ivon
+    
+    # Validate arguments
+    if args.sequential_update:
+        if args.loss_fn != 'IBProbit':
+            raise ValueError("--sequential-update requires --loss-fn IBProbit")
+        if args.tune_mode != 'full_network':
+            raise ValueError("--sequential-update requires --tune-mode full_network")
+    
+    if args.reset_loss_per_epoch and args.loss_fn != 'IBProbit':
+        raise ValueError("--reset-loss-per-epoch requires --loss-fn IBProbit")
 
     if args.enable_wandb and not no_wandb:
         wandb.init(
@@ -197,7 +209,7 @@ def main(args, m_config, o_config):
     
     for i in range(num_epochs // save_every):
         key, _key = jr.split(key)
-        trained_loss_fn, trained_model, opt_state, metrics = run_bayesian_training(
+        trained_loss_fn, trained_model, opt_state, metrics = run_training(
             _key,
             trained_model,
             trained_loss_fn,
@@ -213,6 +225,8 @@ def main(args, m_config, o_config):
             num_update_iters=num_update_iters,
             mc_samples=mc_samples,
             log_to_wandb=args.enable_wandb,
+            sequential_update=args.sequential_update,
+            reset_loss_per_epoch=args.reset_loss_per_epoch,
         )
 
         # Save checkpoint
@@ -294,6 +308,10 @@ def build_argparser():
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
     parser.add_argument("--reinitialize", action="store_true")
     parser.add_argument("--nodataaug", action="store_true")
+    parser.add_argument("--sequential-update", action="store_true",
+                       help='Enable two-pass training per epoch: first update loss model, then update network (requires IBProbit + full_network)')
+    parser.add_argument("--reset-loss-per-epoch", action="store_true",
+                       help='Reset loss model parameters at the start of each epoch (requires IBProbit)')
     parser.add_argument("--enable_wandb", "--enable-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--log-checkpoints", "--log_checkpoints", action="store_true", help="Log IVON checkpoints to W&B/locally")
     parser.add_argument("--group-id", type=str, default="full_network_finetuning_test", help="Put all runs of this sweep in the same W&B group")
