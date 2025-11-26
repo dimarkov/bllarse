@@ -7,33 +7,35 @@ from optax import smooth_labels, safe_softmax_cross_entropy, l2_loss
 from jax import vmap, nn
 
 
-class MSE(eqx.Module):
+class Classical(eqx.Module):
     num_classes: int
 
-    def __call__(self, params: eqx.Module, static:eqx.Module, x: Array, y: Array, *, key: Optional[PRNGKey] = None, with_logits: bool = False):
-        model = eqx.combine(params, static)
-        pred = vmap(partial(model, key=key))
+    def update(self, *args, **kwargs):
+        """Classical losses have no learnable parameters, return unchanged."""
+        return self
+
+
+class MSE(Classical):
+
+    def __call__(self, logits: Array, y: Array, *, with_logits: bool = False, loss_type = None):
         _y = nn.one_hot(y, self.num_classes)
+        
         if with_logits:
-            return l2_loss(pred, y).mean(), pred
+            return l2_loss(logits, _y), logits
         else:
-            return l2_loss(pred, y).mean()
+            return l2_loss(logits, _y)
 
-class CrossEntropy(eqx.Module):
+class CrossEntropy(Classical):
     alpha: float
-    num_classes: int
 
     def __init__(self, alpha: float, num_classes: int):
         self.alpha = alpha
-        self.num_classes = num_classes
+        super().__init__(num_classes)
 
-    def __call__(self, model: eqx.Module, x: Array, y: Array, *, key: Optional[PRNGKey] = None, with_logits: bool = False):
-        logits = vmap(partial(model, key=key))(x)
+    def __call__(self, logits: Array, y: Array, *, with_logits: bool = False, loss_type = None):
         _y = smooth_labels(nn.one_hot(y, self.num_classes), alpha=self.alpha)
 
         if with_logits:
-            return safe_softmax_cross_entropy(logits, _y).mean(), logits
+            return safe_softmax_cross_entropy(logits, _y), logits
         else:
-            return safe_softmax_cross_entropy(logits, _y).mean()
-
-
+            return safe_softmax_cross_entropy(logits, _y)
