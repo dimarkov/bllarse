@@ -16,11 +16,11 @@ def _dict_to_argv(d: Dict[str, Any]) -> List[str]:
             argv.extend([flag, str(v)])
     return argv
 
-def _resolve_repo_root() -> Path:
+def _resolve_repo_root(script_name) -> Path:
     """
     Resolve the repo root. Priority:
       1) env var BLLARSE_REPO_ROOT, if set
-      2) walk up from this file until a 'scripts/last_layer_finetuning.py' exists
+      2) walk up from this file until a 'scripts/<script_name>' exists
       3) fallback to current working directory
     """
     env_root = os.environ.get("BLLARSE_REPO_ROOT")
@@ -29,26 +29,31 @@ def _resolve_repo_root() -> Path:
 
     here = Path(__file__).resolve()
     for parent in [here] + list(here.parents):
-        candidate = parent / "scripts" / "last_layer_finetuning.py"
+        candidate = parent / "scripts" / script_name
         if candidate.exists():
             return parent
 
     return Path.cwd().resolve()
 
-def _load_llf_module() -> Any:
-    repo_root = _resolve_repo_root()
-    llf_path = repo_root / "scripts" / "last_layer_finetuning.py"
+def _load_module(script_name) -> Any:
+    repo_root = _resolve_repo_root(script_name)
+    llf_path = repo_root / "scripts" / script_name
     if not llf_path.exists():
         raise FileNotFoundError(f"Could not find {llf_path}. "
                                 "Set BLLARSE_REPO_ROOT or check your repo layout.")
     return get_module_from_source_path(str(llf_path))
 
-def run_training_from_config(config: Dict[str, Any]) -> None:
+def run_training_from_config(config: Dict[str, Any], finetuning_type: str ="last_layer") -> None:
     """
     Adapter: Dict config -> argparse args -> build_configs -> main
-    implemented by dynamically importing scripts/last_layer_finetuning.py.
+    implemented by dynamically importing scripts/last_layer_finetuning.py or scripts/full_network_finetuning.py
     """
-    llf = _load_llf_module()
+    if finetuning_type == "last_layer":
+        script_name = "last_layer_finetuning.py"
+    elif finetuning_type == "full_network":
+        script_name = "full_network_finetuning.py"
+
+    llf = _load_module(script_name)
 
     # fetch required callables from the training script
     build_argparser: Callable[[], Any] = getattr(llf, "build_argparser")
