@@ -281,7 +281,7 @@ def main(args, m_config, o_config):
 
 def build_argparser():
     parser = argparse.ArgumentParser(description="Finetuning script")
-    parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', "adamw"], default='lion', type=str)
+    parser.add_argument("-o", "--optimizer", choices=['ivon', 'lion', "adamw"], default='adamw', type=str)
     parser.add_argument("--loss-fn", choices=['MSE', 'CrossEntropy', 'IBProbit'], default='CrossEntropy', type=str)
     parser.add_argument("--tune-mode", choices=['last_layer', 'full_network'], default='last_layer', type=str,
                        help='Whether to tune only the last layer or the full network')
@@ -299,10 +299,13 @@ def build_argparser():
     parser.add_argument("-wd", "--weight-decay", nargs='?', default=1e-2, type=float, 
                        help='Weight decay for AdamW or Lion optimizers')
     parser.add_argument("-mc", "--mc-samples", nargs='?', default=1, type=int)
+    parser.add_argument("--ivon-peak-lr", nargs='?', default=1e-2, type=float)
     parser.add_argument("--ivon-weight-decay", nargs='?', default=1e-6, type=float, 
                        help='Weight decay for IVON optimizer')
-    parser.add_argument("--ivon-hess-init", nargs='?', default=0.1, type=float, 
+    parser.add_argument("--ivon-hess-init", nargs='?', default=1.0, type=float, 
                        help='Hessian initialisation scale for IVON optimizer')
+    parser.add_argument("--ivon-b2", nargs='?', default=0.999, type=float, 
+                       help='Beta2 parameter for IVON optimizer')
     parser.add_argument("--num-update-iters", nargs='?', default=16, type=int, 
                        help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
@@ -344,12 +347,13 @@ def build_configs(args):
                 'weight_decay': args.ivon_weight_decay,
                 'hess_init': args.ivon_hess_init,
                 'mc_samples': args.mc_samples,
+                'b2': args.ivon_b2,
                 'clip_radius': 1e3
             },
             'lr': {
-                'init_value': 1e-3,
-                'peak_value': 2e-2,
-                'end_value': 1e-4
+                'init_value': args.ivon_peak_lr / 20,
+                'peak_value': args.ivon_peak_lr,
+                'end_value': args.ivon_peak_lr / 10
             }
         }
 
