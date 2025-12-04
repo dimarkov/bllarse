@@ -1,8 +1,7 @@
 import equinox as eqx
 import jax.tree as jtu
-from jax import nn, lax, numpy as jnp, vmap, random as jr
+from jax import lax, numpy as jnp, vmap, random as jr
 from tensorflow_probability.substrates.jax.stats import expected_calibration_error as compute_ece
-from functools import partial
 import optax
 try:
     import wandb
@@ -16,8 +15,6 @@ from typing import Mapping, Optional
 from blrax.utils import noisy_value_and_grad
 from bllarse.losses import Classical
 
-import jax.scipy.linalg as linalg
-from jax.lax.linalg import triangular_solve
 import augmax
 from math import prod
 
