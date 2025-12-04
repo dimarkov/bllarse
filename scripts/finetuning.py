@@ -1,5 +1,6 @@
 import os
 import argparse
+import warnings
 
 # do not preallocate memory
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -102,6 +103,11 @@ def main(args, m_config, o_config):
     
     if args.reset_loss_per_epoch and args.loss_fn != 'IBProbit':
         raise ValueError("--reset-loss-per-epoch requires --loss-fn IBProbit")
+    
+    if args.loss_fn == 'IBProbit' and tune_last_layer_only:
+        warnings.warn(
+            "When using IBProbit with --tune-mode last_layer, the --optimizer argument and relevant hyperparameters will be ignored."
+        )
 
     if args.enable_wandb and not no_wandb:
         wandb.init(
@@ -317,7 +323,7 @@ def build_argparser():
                        help='Reset loss model parameters at the start of each epoch (requires IBProbit)')
     parser.add_argument("--enable_wandb", "--enable-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--log-checkpoints", "--log_checkpoints", action="store_true", help="Log IVON checkpoints to W&B/locally")
-    parser.add_argument("--group-id", type=str, default="full_network_finetuning_test", help="Put all runs of this sweep in the same W&B group")
+    parser.add_argument("--group-id", type=str, default="finetuning_test", help="Put all runs of this sweep in the same W&B group")
     parser.add_argument("--uid", type=str, default=None, help="Unique identifier for the W&B run. If not provided, a random one will be generated.")
     return parser
 
