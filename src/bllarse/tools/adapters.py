@@ -43,22 +43,20 @@ def _load_module(script_name) -> Any:
                                 "Set BLLARSE_REPO_ROOT or check your repo layout.")
     return get_module_from_source_path(str(llf_path))
 
-def run_training_from_config(config: Dict[str, Any], finetuning_type: str ="last_layer") -> None:
+def run_training_from_config(config: Dict[str, Any]) -> None:
     """
     Adapter: Dict config -> argparse args -> build_configs -> main
-    implemented by dynamically importing scripts/last_layer_finetuning.py or scripts/full_network_finetuning.py
+    implemented by importing `scripts/finetuning.py`
     """
-    if finetuning_type == "last_layer":
-        script_name = "last_layer_finetuning.py"
-    elif finetuning_type == "full_network":
-        script_name = "full_network_finetuning.py"
 
-    llf = _load_module(script_name)
+    script_name = "finetuning.py"
+
+    finetuning_module = _load_module(script_name)
 
     # fetch required callables from the training script
-    build_argparser: Callable[[], Any] = getattr(llf, "build_argparser")
-    build_configs: Callable[[Any], Tuple[dict, dict]] = getattr(llf, "build_configs")
-    train_main: Callable[[Any, dict, dict], None] = getattr(llf, "main")
+    build_argparser: Callable[[], Any] = getattr(finetuning_module, "build_argparser")
+    build_configs: Callable[[Any], Tuple[dict, dict]] = getattr(finetuning_module, "build_configs")
+    train_main: Callable[[Any, dict, dict], None] = getattr(finetuning_module, "main")
 
     parser = build_argparser()
     argv = _dict_to_argv(config)
