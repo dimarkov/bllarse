@@ -25,7 +25,7 @@ BASE = dict(
     pretrained="in21k",
     optimizer="adamw",
     num_epochs=20,
-    learning_rate=1e-3,
+    learning_rate=1e-4,
     weight_decay=1e-4,
 )
 
