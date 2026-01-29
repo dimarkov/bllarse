@@ -21,6 +21,7 @@ dependencies = [
     "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
     "blrax @ git+https://github.com/dimarkov/blrax.git@main",
     "wandb>=0.18.3",
+    "mlflow>=3.9.0",
 ]
 
 [build-system]
