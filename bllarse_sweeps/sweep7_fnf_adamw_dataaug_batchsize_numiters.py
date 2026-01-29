@@ -24,7 +24,7 @@ BASE = dict(
     num_blocks=12,
     pretrained="in21k",
     optimizer="adamw",
-    num_epochs=20,
+    epochs=20,
     learning_rate=1e-4,
     weight_decay=1e-4,
 )
@@ -40,7 +40,7 @@ def _mk_cfg(
     cfg: Dict[str, Any] = dict(
         **BASE,
         dataset=dataset,
-        group_id="sweep7_fnf_dataaug_adamw_batchsize_numiters",
+        group_id="sweep7a1_fnf_dataaug_adamw_batchsize_numiters",
         seed=seed,
         batch_size=batch_size,
         nodataaug=not use_data_aug,
