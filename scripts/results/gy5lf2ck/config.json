@@ -1,0 +1,19 @@
+{
+  "batch_size": 16384,
+  "dataset": "cifar100",
+  "embed_dim": 1024,
+  "epochs": 20,
+  "label_smooth": 0,
+  "learning_rate": 0.0001,
+  "loss_fn": "IBProbit",
+  "nodataaug": true,
+  "num_blocks": 12,
+  "num_vb_iters": 32,
+  "optimizer": "adamw",
+  "pretrained": "in21k",
+  "reset_loss_per_epoch": false,
+  "seed": 0,
+  "sequential_update": false,
+  "tune_mode": "full_network",
+  "weight_decay": 0.0001
+}
