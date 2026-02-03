@@ -35,3 +35,8 @@ dev = [
     "matplotlib>=3.10.3",
     "pytest>=8.3.5",
 ]
+alternatives = [
+    "transformers[flax]>=4.35.0",
+    "sentencepiece>=0.2.0",
+]
+
