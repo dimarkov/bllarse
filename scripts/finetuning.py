@@ -9,13 +9,15 @@ os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 import jax.numpy as jnp
 import equinox as eqx
 import optax
-try:
-    import wandb
-    no_wandb = False
-except:
-    print('wandb not installed')
-    no_wandb = True
 import jax.tree_util as jtu
+from contextlib import nullcontext
+
+try:
+    import mlflow
+    no_mlflow = False
+except Exception:
+    mlflow = None
+    no_mlflow = True
 
 from functools import partial
 from datasets import load_dataset
@@ -41,7 +43,7 @@ from bllarse.utils import (
 config.update("jax_default_matmul_precision", "highest")
 
 
-def _build_wandb_config(args, o_config):
+def _build_run_config(args, o_config):
     """Return shared run metadata plus optimizer-specific hyperparameters."""
     config_dict = dict(
         dataset=args.dataset,
@@ -92,7 +94,16 @@ def main(args, m_config, o_config):
     platform = args.device
     tune_last_layer_only = (args.tune_mode == 'last_layer')
     use_ivon = 'ivon' in o_config
-    log_ivon_checkpoints = args.log_checkpoints and args.enable_wandb and not no_wandb and use_ivon
+    enable_mlflow = args.enable_mlflow
+    if args.enable_wandb:
+        enable_mlflow = True
+        print("[bllarse] --enable-wandb is deprecated; enabling MLflow logging instead.")
+
+    if enable_mlflow and no_mlflow:
+        print("[bllarse] MLflow is not installed; disabling MLflow logging.")
+        enable_mlflow = False
+
+    log_ivon_checkpoints = args.log_checkpoints and enable_mlflow and use_ivon
     
     # Validate arguments
     if args.sequential_update:
@@ -109,19 +120,20 @@ def main(args, m_config, o_config):
             "When using IBProbit with --tune-mode last_layer, the --optimizer argument and relevant hyperparameters will be ignored."
         )
 
-    if args.enable_wandb and not no_wandb:
-        wandb.init(
-            project="bllarse_experiments",
-            id=args.uid if args.uid else wandb.util.generate_id(),
-            group=args.group_id,
-            config=_build_wandb_config(args, o_config),
-            reinit=True,
-        )
-        wandb.define_metric("epoch")
-        wandb.define_metric("loss", step_metric="epoch", summary="min")
-        wandb.define_metric("nll", step_metric="epoch", summary="min")
-        wandb.define_metric("acc", step_metric="epoch", summary="max")
-        wandb.define_metric("ece", step_metric="epoch", summary="min")
+    mlflow_context = nullcontext()
+    if enable_mlflow:
+        if args.mlflow_tracking_uri:
+            mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+        if args.mlflow_experiment:
+            mlflow.set_experiment(args.mlflow_experiment)
+
+        mlflow_tags = {
+            "group_id": args.group_id,
+            "optimizer": args.optimizer,
+            "loss_fn": args.loss_fn,
+            "tune_mode": args.tune_mode,
+        }
+        mlflow_context = mlflow.start_run(run_name=args.uid or None, tags=mlflow_tags)
 
     key = jr.PRNGKey(seed)
 
@@ -212,77 +224,89 @@ def main(args, m_config, o_config):
     opt_state = None
     trained_loss_fn = loss_fn
     trained_model = nnet
-    
-    for i in range(num_epochs // save_every):
-        key, _key = jr.split(key)
-        trained_loss_fn, trained_model, opt_state, metrics = run_training(
-            _key,
-            trained_model,
-            trained_loss_fn,
-            _augdata,
-            train_ds,
-            test_ds,
-            optimizer=optim,
-            opt_state=opt_state,
-            tune_last_layer_only=tune_last_layer_only,
-            loss_type=3,
-            num_epochs=save_every,
-            batch_size=batch_size,
-            num_update_iters=num_update_iters,
-            mc_samples=mc_samples,
-            log_to_wandb=args.enable_wandb,
-            sequential_update=args.sequential_update,
-            reset_loss_per_epoch=args.reset_loss_per_epoch,
-        )
 
-        # Save checkpoint
-        is_bayesian = isinstance(trained_loss_fn, IBProbit)
-        if is_bayesian:
-            to_save = {"loss_fn": trained_loss_fn, "nnet": trained_model, "opt_state": opt_state, "metrics": metrics}
-        else:
-            if tune_last_layer_only:
-                to_save = {"last_layer": trained_model, "opt_state": opt_state, "metrics": metrics}
+    with mlflow_context:
+        if enable_mlflow:
+            mlflow.log_params(_build_run_config(args, o_config))
+
+        run_id = None
+        if enable_mlflow:
+            active_run = mlflow.active_run()
+            if active_run is not None:
+                run_id = active_run.info.run_id
+
+        for i in range(num_epochs // save_every):
+            key, _key = jr.split(key)
+            trained_loss_fn, trained_model, opt_state, metrics = run_training(
+                _key,
+                trained_model,
+                trained_loss_fn,
+                _augdata,
+                train_ds,
+                test_ds,
+                optimizer=optim,
+                opt_state=opt_state,
+                tune_last_layer_only=tune_last_layer_only,
+                loss_type=3,
+                num_epochs=save_every,
+                batch_size=batch_size,
+                num_update_iters=num_update_iters,
+                mc_samples=mc_samples,
+                log_to_mlflow=enable_mlflow,
+                epoch_offset=i * save_every,
+                sequential_update=args.sequential_update,
+                reset_loss_per_epoch=args.reset_loss_per_epoch,
+            )
+
+            # Save checkpoint
+            is_bayesian = isinstance(trained_loss_fn, IBProbit)
+            if is_bayesian:
+                to_save = {"loss_fn": trained_loss_fn, "nnet": trained_model, "opt_state": opt_state, "metrics": metrics}
             else:
-                to_save = {"nnet": trained_model, "opt_state": opt_state, "metrics": metrics}
+                if tune_last_layer_only:
+                    to_save = {"last_layer": trained_model, "opt_state": opt_state, "metrics": metrics}
+                else:
+                    to_save = {"nnet": trained_model, "opt_state": opt_state, "metrics": metrics}
 
-        vals = jtu.tree_map(lambda x: x[-1], metrics)
+            vals = jtu.tree_map(lambda x: x[-1], metrics)
 
-        if args.enable_wandb:
-            wandb.log({"epoch": (i + 1) * save_every, **vals})
-        else:
-            # only print to console if not logging to wandb
-            print(i, [(name, f'{vals[name].item():.3f}') for name in vals])
-        
-        if log_ivon_checkpoints:
-            epoch = (i + 1) * save_every
-            ckpt_name = f"ivon_epoch_{epoch}.eqx"
-            ckpt_path = os.path.join(wandb.run.dir, ckpt_name)
+            if not enable_mlflow:
+                # only print to console if not logging to MLflow
+                print(i, [(name, f'{vals[name].item():.3f}') for name in vals])
 
-            if is_bayesian and not tune_last_layer_only:
-                # Full network + Bayesian head
-                save_checkpoint_bundle(
-                    ckpt_path,
-                    models={"backbone": trained_model, "bayes_head": trained_loss_fn},
-                    opt_state=opt_state,
-                )
-            elif tune_last_layer_only and not is_bayesian:
-                # Last layer only (classical)
-                save_ivon_checkpoint(ckpt_path, trained_model, opt_state)
-            elif not tune_last_layer_only and not is_bayesian:
-                # Full network (classical)
-                save_ivon_checkpoint(ckpt_path, trained_model, opt_state)
-            else:
-                # Bayesian + last layer only
-                save_checkpoint_bundle(
-                    ckpt_path,
-                    models={"bayes_head": trained_loss_fn},
-                    opt_state=opt_state,
-                )
+            if log_ivon_checkpoints:
+                epoch = (i + 1) * save_every
+                ckpt_name = f"ivon_epoch_{epoch}.eqx"
+                ckpt_root = os.path.join("checkpoints", run_id or "local")
+                os.makedirs(ckpt_root, exist_ok=True)
+                ckpt_path = os.path.join(ckpt_root, ckpt_name)
 
-            # Track the single .eqx file as a W&B artifact
-            artifact = wandb.Artifact(f"{wandb.run.id}-ivon-{epoch}", type="model")
-            artifact.add_file(ckpt_path, name=ckpt_name)
-            wandb.run.log_artifact(artifact)
+                if is_bayesian and not tune_last_layer_only:
+                    # Full network + Bayesian head
+                    save_checkpoint_bundle(
+                        ckpt_path,
+                        models={"backbone": trained_model, "bayes_head": trained_loss_fn},
+                        opt_state=opt_state,
+                    )
+                elif tune_last_layer_only and not is_bayesian:
+                    # Last layer only (classical)
+                    save_ivon_checkpoint(ckpt_path, trained_model, opt_state)
+                elif not tune_last_layer_only and not is_bayesian:
+                    # Full network (classical)
+                    save_ivon_checkpoint(ckpt_path, trained_model, opt_state)
+                else:
+                    # Bayesian + last layer only
+                    save_checkpoint_bundle(
+                        ckpt_path,
+                        models={"bayes_head": trained_loss_fn},
+                        opt_state=opt_state,
+                    )
+
+                if enable_mlflow:
+                    try:
+                        mlflow.log_artifact(ckpt_path, artifact_path="checkpoints")
+                    except Exception as exc:
+                        print(f"[bllarse] MLflow artifact upload failed for {ckpt_name}: {exc}")
 
 
 def build_argparser():
@@ -321,10 +345,19 @@ def build_argparser():
                        help='Enable two-pass training per epoch: first update loss model, then update network (requires IBProbit + full_network)')
     parser.add_argument("--reset-loss-per-epoch", action="store_true",
                        help='Reset loss model parameters at the start of each epoch (requires IBProbit)')
-    parser.add_argument("--enable_wandb", "--enable-wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--log-checkpoints", "--log_checkpoints", action="store_true", help="Log IVON checkpoints to W&B/locally")
-    parser.add_argument("--group-id", type=str, default="finetuning_test", help="Put all runs of this sweep in the same W&B group")
-    parser.add_argument("--uid", type=str, default=None, help="Unique identifier for the W&B run. If not provided, a random one will be generated.")
+    parser.add_argument("--enable-mlflow", "--enable_mlflow", action="store_true", help="Enable MLflow logging")
+    parser.add_argument("--enable-wandb", "--enable_wandb", action="store_true",
+                        help="Deprecated alias for --enable-mlflow")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default=os.environ.get("MLFLOW_TRACKING_URI", ""),
+                        help="MLflow tracking URI (defaults to env MLFLOW_TRACKING_URI)")
+    parser.add_argument("--mlflow-experiment", type=str, default=os.environ.get("MLFLOW_EXPERIMENT_NAME", "bllarse"),
+                        help="MLflow experiment name")
+    parser.add_argument("--log-checkpoints", "--log_checkpoints", action="store_true",
+                        help="Log IVON checkpoints to MLflow artifacts")
+    parser.add_argument("--group-id", type=str, default="finetuning_test",
+                        help="Tag runs with a shared MLflow group id")
+    parser.add_argument("--uid", type=str, default=None,
+                        help="Optional MLflow run name (auto-generated if omitted)")
     return parser
 
 
