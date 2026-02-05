@@ -178,6 +178,7 @@ cython_debug/
 
 # images
 *.png
+*.pdf
 
 # Weights & Biases
 wandb/
