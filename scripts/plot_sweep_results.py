@@ -1,89 +1,99 @@
 #!/usr/bin/env python3
-"""Fetch W&B sweep results and compute baselines, then plot metrics.
+"""Plot sweep results from local results directory.
 
 This script:
-1. Fetches run data from W&B for the specified sweep group
-2. Computes baseline metrics by loading in21k_cifar pretrained models
-3. Saves all data to a CSV file
-4. Creates publication-ready figures showing acc, ece, nll vs batch_size/num_iters
+1. Loads all run data from scripts/results directory (config.json + parquet files)
+2. Creates pandas DataFrames with experiment data and baselines
+3. Creates publication-ready figures showing acc, ece, nll vs batch_size/num_iters
 
 Usage:
-    python scripts/plot_sweep_results.py --group sweep7a1_fnf_dataaug_adamw_batchsize_numiters
-    python scripts/plot_sweep_results.py --csv-only  # Only fetch/save CSV, skip plotting
-    python scripts/plot_sweep_results.py --plot-only --input results.csv  # Only plot from existing CSV
+    python scripts/plot_sweep_results.py
+    python scripts/plot_sweep_results.py --results-dir scripts/results
+    python scripts/plot_sweep_results.py --output-dir scripts/figures
 """
 
 import os
+import json
 import argparse
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-# Lazy imports for JAX/model loading (only needed for baseline computation)
-_jax_loaded = False
-
-
-def _ensure_jax():
-    """Lazy load JAX and related dependencies."""
-    global _jax_loaded
-    if _jax_loaded:
-        return
-    
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-    
-    import jax
-    jax.config.update("jax_default_matmul_precision", "highest")
-    _jax_loaded = True
-
 
 # --------------------------------------------------------------------------
-# W&B Data Fetching
+# Data Loading
 # --------------------------------------------------------------------------
 
-def fetch_wandb_runs(project: str, group: str) -> pd.DataFrame:
-    """Fetch all runs from a W&B group and return as DataFrame."""
-    import wandb
-    import sys
+def load_run_data(run_dir: Path) -> tuple[dict, pd.DataFrame | None]:
+    """Load config and metrics from a single run directory.
     
-    api = wandb.Api(timeout=60)
-    print(f"  Querying runs with group={group}...")
-    sys.stdout.flush()
+    Returns:
+        Tuple of (config dict, metrics DataFrame or None if no data)
+    """
+    config_path = run_dir / "config.json"
     
-    runs = api.runs(
-        path=project,
-        filters={"group": group},
-    )
+    if not config_path.exists():
+        return {}, None
     
-    # Convert to list to get count (runs is a lazy iterator)
-    print(f"  Fetching run list...")
-    sys.stdout.flush()
-    runs_list = list(runs)
-    total_runs = len(runs_list)
-    print(f"  Found {total_runs} runs, fetching history...")
-    sys.stdout.flush()
+    with open(config_path) as f:
+        config = json.load(f)
+    
+    # Find parquet files (can be multiple shards)
+    parquet_files = list(run_dir.glob("*.parquet"))
+    if not parquet_files:
+        return config, None
+    
+    # Load and concatenate all parquet files
+    dfs = []
+    for pf in parquet_files:
+        try:
+            df = pd.read_parquet(pf)
+            dfs.append(df)
+        except Exception as e:
+            print(f"  Warning: could not read {pf}: {e}")
+    
+    if not dfs:
+        return config, None
+    
+    metrics_df = pd.concat(dfs, ignore_index=True)
+    return config, metrics_df
+
+
+def load_all_results(results_dir: Path) -> pd.DataFrame:
+    """Load all run results from the results directory.
+    
+    Args:
+        results_dir: Path to directory containing run subdirectories
+        
+    Returns:
+        DataFrame with all experiment records
+    """
+    print(f"Loading results from {results_dir}...")
+    
+    run_dirs = [d for d in results_dir.iterdir() if d.is_dir()]
+    total_runs = len(run_dirs)
+    print(f"  Found {total_runs} run directories")
     
     records = []
-    for i, run in enumerate(runs_list):
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Processing run {i + 1}/{total_runs}: {run.name}")
-            sys.stdout.flush()
+    loaded_runs = 0
+    
+    for i, run_dir in enumerate(run_dirs):
         
-        config = run.config
-        try:
-            history = run.history(pandas=True)
-        except Exception as e:
-            print(f"    Warning: could not fetch history for {run.name}: {e}")
+        config, metrics_df = load_run_data(run_dir)
+        
+        if metrics_df is None or metrics_df.empty:
             continue
         
-        if history.empty:
-            continue
+        loaded_runs += 1
+        run_id = run_dir.name
         
-        # Extract run metadata
+        # Base record from config
         base_record = {
-            "run_id": run.id,
-            "run_name": run.name,
+            "run_id": run_id,
+            "run_name": run_id,
             "dataset": config.get("dataset", "unknown"),
             "batch_size": config.get("batch_size", 0),
             "num_update_iters": config.get("num_vb_iters", config.get("num_update_iters", 16)),
@@ -94,10 +104,13 @@ def fetch_wandb_runs(project: str, group: str) -> pd.DataFrame:
             "seed": config.get("seed", 0),
             "sequential_update": config.get("sequential_update", False),
             "reset_loss_per_epoch": config.get("reset_loss_per_epoch", False),
+            "loss_fn": config.get("loss_fn", "CrossEntropy"),
+            "embed_dim": config.get("embed_dim", 1024),
+            "num_blocks": config.get("num_blocks", 12),
         }
         
         # Extract metrics for each epoch
-        for _, row in history.iterrows():
+        for _, row in metrics_df.iterrows():
             epoch = int(row.get("epoch", row.name + 1))
             record = base_record.copy()
             record.update({
@@ -110,85 +123,111 @@ def fetch_wandb_runs(project: str, group: str) -> pd.DataFrame:
             })
             records.append(record)
     
-    print(f"  Done fetching {len(records)} records from {total_runs} runs")
+    print(f"  Loaded {len(records)} records from {loaded_runs} runs")
     return pd.DataFrame(records)
 
 
 # --------------------------------------------------------------------------
-# Baseline Computation
+# Baseline and Linear Probing Data Loading
 # --------------------------------------------------------------------------
 
-def compute_baselines(datasets: list[str]) -> pd.DataFrame:
-    """Load in21k_cifar pretrained models and compute baseline metrics."""
-    _ensure_jax()
+def load_reference_data(
+    csv_path: str = "scripts/results_ibprobit_large_batch.csv",
+    n_samples: int = 16,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Load baseline and linear probing (ibprobit) data from CSV.
     
-    import jax.numpy as jnp
-    import equinox as eqx
-    from jax import random as jr
-    from datasets import load_dataset
-    from functools import partial
+    Args:
+        csv_path: Path to the CSV file with results
+        n_samples: Number of random runs to sample for linear probing averaging
+        seed: Random seed for reproducibility
+        
+    Returns:
+        DataFrame with baseline and linear_probing records per dataset
+    """
+    if not os.path.exists(csv_path):
+        print(f"Warning: CSV not found: {csv_path}")
+        return pd.DataFrame()
     
-    from mlpox.load_models import load_model
-    from bllarse.losses import CrossEntropy
-    from bllarse.utils import (
-        resize_images,
-        augmentdata,
-        evaluate_model,
-        MEAN_DICT,
-        STD_DICT,
-    )
+    print(f"Loading reference data from {csv_path}...")
+    df = pd.read_csv(csv_path)
+    
+    # Filter for matching model architecture (num_blocks=12, embed_dim=1024)
+    df_filtered = df[
+        (df["num_blocks"] == 12) & 
+        (df["embed_dim"] == 1024)
+    ].copy()
+    
+    if df_filtered.empty:
+        print("  No matching data found for num_blocks=12, embed_dim=1024")
+        return pd.DataFrame()
+    
+    np.random.seed(seed)
     
     records = []
     
-    for dataset in datasets:
-        print(f"Computing baseline for {dataset}...")
+    for dataset in df_filtered["dataset"].unique():
+        df_ds = df_filtered[df_filtered["dataset"] == dataset]
         
-        # Load test data
-        ds = load_dataset(dataset).with_format("jax")
-        label_key = 'fine_label' if dataset == 'cifar100' else 'label'
-        test_ds = {
-            'image': ds['test']['img'][:].astype(jnp.float32),
-            'label': ds['test'][label_key][:]
-        }
-        
-        # Resize images
-        test_ds['image'] = resize_images(test_ds['image'], 64)
-        
-        # Setup augmentation (no random aug for eval)
-        mean = MEAN_DICT[dataset]
-        std = STD_DICT[dataset]
-        augdata = partial(augmentdata, mean=mean, std=std)
-        _augdata = lambda img, key=None, **kwargs: augdata(img, key=None, **kwargs)
-        
-        # Load pretrained model
-        # Model naming: B_{num_blocks}-Wi_{embed_dim}_res_64_in21k_{dataset}
-        for num_blocks, embed_dim in [(12, 1024)]:
-            name = f"B_{num_blocks}-Wi_{embed_dim}_res_64_in21k_{dataset}"
-            try:
-                nnet = eqx.nn.inference_mode(load_model(name), True)
-            except Exception as e:
-                print(f"  Could not load {name}: {e}")
-                continue
-            
-            num_classes = 10 if dataset == 'cifar10' else 100
-            loss_fn = CrossEntropy(0.0, num_classes)
-            
-            acc, nll, ece = evaluate_model(
-                _augdata, loss_fn, nnet,
-                test_ds['image'], test_ds['label']
-            )
-            
-            print(f"  {name}: acc={float(acc):.4f}, ece={float(ece):.4f}, nll={float(nll):.4f}")
-            
+        # Load baseline (pretrained model, type="baseline")
+        df_bl = df_ds[df_ds["type"] == "baseline"]
+        if not df_bl.empty:
+            # Take first baseline value (should be unique per dataset)
+            bl_row = df_bl.iloc[0]
             records.append({
                 "dataset": dataset,
-                "num_blocks": num_blocks,
-                "embed_dim": embed_dim,
-                "acc": float(acc),
-                "ece": float(ece),
-                "nll": float(nll),
+                "acc": bl_row["acc"],
+                "ece": bl_row["ece"],
+                "nll": bl_row["nll"],
                 "type": "baseline",
             })
+            print(f"  {dataset} baseline: acc={bl_row['acc']:.4f}, ece={bl_row['ece']:.4f}, nll={bl_row['nll']:.4f}")
+        
+        # Load linear probing (ibprobit, type="ibprobit")
+        # Take best values at largest batch size across all num_iters
+        # Filter for pretrained_source="in21k" and nodataaug (data_aug=False)
+        df_lp = df_ds[
+            (df_ds["type"] == "ibprobit") &
+            (df_ds["pretrained_source"] == "in21k") &
+            (df_ds["data_aug"] == False)
+        ]
+        if not df_lp.empty:
+            # Filter for largest batch size
+            max_batch = df_lp["batch_size"].max()
+            df_lp_max_batch = df_lp[df_lp["batch_size"] == max_batch]
+            
+            # For each num_iters: subsample 16 runs, compute mean of each metric
+            # Then find the num_iters with best mean accuracy
+            best_mean_acc = -1
+            best_metrics = None
+            best_num_iters = None
+            
+            for num_iters in df_lp_max_batch["update_iters"].unique():
+                df_iters = df_lp_max_batch[df_lp_max_batch["update_iters"] == num_iters]
+                
+                # Subsample to 16 runs (or all if fewer)
+                n_to_sample = min(16, len(df_iters))
+                sampled = df_iters.sample(n=n_to_sample, random_state=seed)
+                
+                mean_acc = sampled["acc"].mean()
+                mean_ece = sampled["ece"].mean()
+                mean_nll = sampled["nll"].mean()
+                
+                if mean_acc > best_mean_acc:
+                    best_mean_acc = mean_acc
+                    best_metrics = (mean_acc, mean_ece, mean_nll)
+                    best_num_iters = num_iters
+            
+            if best_metrics is not None:
+                records.append({
+                    "dataset": dataset,
+                    "acc": best_metrics[0],
+                    "ece": best_metrics[1],
+                    "nll": best_metrics[2],
+                    "type": "linear_probing",
+                })
+                print(f"  {dataset} linear probing (in21k, no aug, batch={max_batch}, iters={best_num_iters}): acc={best_metrics[0]:.4f}, ece={best_metrics[1]:.4f}, nll={best_metrics[2]:.4f}")
     
     return pd.DataFrame(records)
 
@@ -208,22 +247,18 @@ def make_figure(
     sequential_update: bool | None = None,
     reset_loss_per_epoch: bool | None = None,
 ):
-    """Create 3x6 figure: rows are datasets (cifar10/cifar100), columns are metrics × data_aug.
+    """Create separate 3x6 figures for with/without data augmentation.
     
-    Layout:
-    - Rows 1-3: cifar10 (acc, ece, nll)
-    - Rows 4-6: cifar100 (acc, ece, nll)
-    - Columns 1-3: No data augmentation (epochs 1, 5, 10)
-    - Columns 4-6: With data augmentation (epochs 1, 5, 10)
+    Layout per figure:
+    - Rows: acc, ece, nll (3 metrics)
+    - Columns 1-3: cifar10 epochs 1, 5, 10
+    - Columns 4-6: cifar100 epochs 1, 5, 10
     
-    Each subplot: x-axis = batch_size, lines = different num_update_iters
-    
-    Args:
-        sequential_update: If not None, filter to runs with this value
-        reset_loss_per_epoch: If not None, filter to runs with this value
+    Y-axis is aligned within each dataset's columns (first 3 cols share y, last 3 cols share y).
     """
     df_exp = df[df["type"] == "experiment"].copy()
     df_bl = df[df["type"] == "baseline"]
+    df_lp = df[df["type"] == "linear_probing"]
     
     # Apply filters
     filter_desc = []
@@ -238,57 +273,66 @@ def make_figure(
     filter_title = " (" + ", ".join(filter_desc) + ")" if filter_desc else ""
     
     datasets = ["cifar10", "cifar100"]
-    dataaug_settings = [True, False]  # nodataaug: False means WITH aug
-    
-    # Figure: 6 rows (3 metrics × 2 datasets), 6 columns (3 epochs × 2 aug settings)
-    n_rows = len(datasets) * len(METRICS)  # 6
-    n_cols = len(EPOCHS_TO_PLOT) * len(dataaug_settings)  # 6
-    
-    fig, axes = plt.subplots(
-        n_rows, n_cols,
-        figsize=(20, 15),
-        squeeze=False,
-        sharex=True,
-        sharey='row'
-    )
     
     # Get unique values for coloring
     update_iters_list = sorted(df_exp["num_update_iters"].dropna().unique())
     batch_sizes = sorted(df_exp["batch_size"].dropna().unique())
     
-    # Color map for num_update_iters
-    cmap = plt.cm.viridis
+    # Color map for num_update_iters - use tab10 for divergent/distinct colors
+    cmap = plt.cm.tab10
     colors = {
-        it: cmap(i / max(len(update_iters_list) - 1, 1))
+        it: cmap(i % 10)
         for i, it in enumerate(update_iters_list)
     }
     
-    for ds_idx, dataset in enumerate(datasets):
-        df_ds = df_exp[df_exp["dataset"] == dataset]
-        df_bl_ds = df_bl[df_bl["dataset"] == dataset]
+    # Create separate figures for each augmentation setting
+    for nodataaug in [True, False]:
+        aug_label = "No Data Augmentation" if nodataaug else "With Data Augmentation"
+        aug_suffix = "_no_aug" if nodataaug else "_with_aug"
         
-        # Get baseline value (assuming embed_dim=1024, num_blocks=12 for main experiments)
-        bl_row = df_bl_ds[(df_bl_ds["num_blocks"] == 12) & (df_bl_ds["embed_dim"] == 1024)]
-        if bl_row.empty:
-            bl_row = df_bl_ds.iloc[:1] if not df_bl_ds.empty else None
+        df_aug = df_exp[df_exp["nodataaug"] == nodataaug]
+        
+        # Figure: 3 rows (metrics) × 6 columns (3 epochs × 2 datasets)
+        n_rows = len(METRICS)  # 3
+        n_cols = len(EPOCHS_TO_PLOT) * len(datasets)  # 6
+        
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(18, 9),
+            squeeze=False,
+            sharex=True,
+        )
         
         for m_idx, metric in enumerate(METRICS):
-            row_idx = ds_idx * len(METRICS) + m_idx
+            # Collect y-limits per dataset for alignment
+            ylims_per_dataset = {ds: [] for ds in datasets}
             
-            for aug_idx, nodataaug in enumerate([True, False]):  # No aug first, then with aug
-                df_aug = df_ds[df_ds["nodataaug"] == nodataaug]
-                aug_label = "No Aug" if nodataaug else "With Aug"
+            for ds_idx, dataset in enumerate(datasets):
+                df_ds = df_aug[df_aug["dataset"] == dataset]
+                df_bl_ds = df_bl[df_bl["dataset"] == dataset]
+                df_lp_ds = df_lp[df_lp["dataset"] == dataset]
+                
+                # Get baseline value
+                bl_row = df_bl_ds.iloc[0] if not df_bl_ds.empty else None
+                
+                # Get linear probing value
+                lp_row = df_lp_ds.iloc[0] if not df_lp_ds.empty else None
                 
                 for ep_idx, epoch in enumerate(EPOCHS_TO_PLOT):
-                    col_idx = aug_idx * len(EPOCHS_TO_PLOT) + ep_idx
-                    ax = axes[row_idx, col_idx]
+                    col_idx = ds_idx * len(EPOCHS_TO_PLOT) + ep_idx
+                    ax = axes[m_idx, col_idx]
                     
-                    df_epoch = df_aug[df_aug["epoch"] == epoch]
+                    df_epoch = df_ds[df_ds["epoch"] == epoch]
                     
-                    # Plot baseline as horizontal dashed line
-                    if bl_row is not None and not bl_row.empty:
-                        bl_val = bl_row[metric].values[0]
+                    # Plot baseline as horizontal grey dashed line
+                    if bl_row is not None:
+                        bl_val = bl_row[metric]
                         ax.axhline(bl_val, color="grey", ls="--", lw=1.5, label="baseline", zorder=1)
+                    
+                    # Plot linear probing as horizontal orange dotted line
+                    if lp_row is not None:
+                        lp_val = lp_row[metric]
+                        ax.axhline(lp_val, color="orange", ls=":", lw=2, label="linear probing", zorder=1)
                     
                     # Plot one line per num_update_iters
                     for ui in update_iters_list:
@@ -319,51 +363,60 @@ def make_figure(
                     ax.tick_params(axis="x", rotation=45)
                     
                     # Titles on top row
-                    if row_idx == 0:
-                        ax.set_title(f"{aug_label}\nEpoch {epoch}", fontsize=10, fontweight="bold")
+                    if m_idx == 0:
+                        ax.set_title(f"{dataset}\nEpoch {epoch}", fontsize=10, fontweight="bold")
                     
                     # X-label on bottom row
-                    if row_idx == n_rows - 1:
+                    if m_idx == n_rows - 1:
                         ax.set_xlabel("Batch Size")
                     
-                    # Y-label on left column
-                    if col_idx == 0:
-                        ax.set_ylabel(f"{dataset}\n{METRIC_LABELS[metric]}", fontsize=9)
-    
-    # Single legend
-    handles, labels = [], []
-    for ax in axes.flat:
-        h, l = ax.get_legend_handles_labels()
-        for hi, li in zip(h, l):
-            if li not in labels:
-                handles.append(hi)
-                labels.append(li)
-    
-    fig.legend(
-        handles, labels,
-        loc="center left",
-        ncol=1,
-        fontsize=10,
-        frameon=True,
-        bbox_to_anchor=(1.01, 0.5),
-    )
-    
-    fig.suptitle(
-        f"Sweep Results: acc/ece/nll vs Batch Size{filter_title}",
-        fontsize=14,
-        y=1.005,
-    )
-    fig.tight_layout()
-    
-    fname = f"{output_dir}/sweep_results{filter_suffix}.pdf"
-    fig.savefig(fname, bbox_inches="tight", dpi=150)
-    print(f"Saved {fname}")
-    
-    fname_png = f"{output_dir}/sweep_results{filter_suffix}.png"
-    fig.savefig(fname_png, bbox_inches="tight", dpi=150)
-    print(f"Saved {fname_png}")
-    
-    plt.close(fig)
+                    # Y-label on left column of each dataset group
+                    if ep_idx == 0:
+                        ax.set_ylabel(METRIC_LABELS[metric], fontsize=9)
+                    
+                    # Collect y-limits for this dataset
+                    ylims_per_dataset[dataset].append(ax.get_ylim())
+            
+            # Align y-axis within each dataset's columns
+            for ds_idx, dataset in enumerate(datasets):
+                ylims = ylims_per_dataset[dataset]
+                if ylims:
+                    ymin = min(yl[0] for yl in ylims)
+                    ymax = max(yl[1] for yl in ylims)
+                    for ep_idx in range(len(EPOCHS_TO_PLOT)):
+                        col_idx = ds_idx * len(EPOCHS_TO_PLOT) + ep_idx
+                        axes[m_idx, col_idx].set_ylim(ymin, ymax)
+        
+        # Single legend
+        handles, labels = [], []
+        for ax in axes.flat:
+            h, l = ax.get_legend_handles_labels()
+            for hi, li in zip(h, l):
+                if li not in labels:
+                    handles.append(hi)
+                    labels.append(li)
+        
+        fig.legend(
+            handles, labels,
+            loc="center left",
+            ncol=1,
+            fontsize=10,
+            frameon=True,
+            bbox_to_anchor=(1.01, 0.5),
+        )
+        
+        fig.suptitle(
+            f"Sweep Results: {aug_label}{filter_title}",
+            fontsize=14,
+            y=1.005,
+        )
+        fig.tight_layout()
+        
+        fname = f"{output_dir}/sweep_results{aug_suffix}{filter_suffix}.pdf"
+        fig.savefig(fname, bbox_inches="tight", dpi=150)
+        print(f"Saved {fname}")
+        
+        plt.close(fig)
 
 
 # --------------------------------------------------------------------------
@@ -373,28 +426,16 @@ def make_figure(
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--project",
+        "--results-dir",
         type=str,
-        default="verses_ai/bllarse_experiments",
-        help="W&B project path",
+        default="scripts/results",
+        help="Directory containing run subdirectories with config.json and parquet files",
     )
     parser.add_argument(
-        "--group",
-        type=str,
-        default="sweep7a1_fnf_dataaug_adamw_batchsize_numiters",
-        help="W&B run group name",
-    )
-    parser.add_argument(
-        "--input",
+        "--output-csv",
         type=str,
         default=None,
-        help="Path to existing CSV (skip W&B fetch if provided)",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="scripts/sweep_results.csv",
-        help="Output CSV path",
+        help="Optional: Save combined data to CSV file",
     )
     parser.add_argument(
         "--output-dir",
@@ -403,19 +444,10 @@ def main():
         help="Directory for output figures",
     )
     parser.add_argument(
-        "--csv-only",
-        action="store_true",
-        help="Only fetch data and save CSV, skip plotting",
-    )
-    parser.add_argument(
-        "--plot-only",
-        action="store_true",
-        help="Only plot from existing CSV (requires --input)",
-    )
-    parser.add_argument(
-        "--skip-baselines",
-        action="store_true",
-        help="Skip computing baseline metrics",
+        "--reference-csv",
+        type=str,
+        default="scripts/results_ibprobit_large_batch.csv",
+        help="Path to CSV with baseline and linear probing results",
     )
     parser.add_argument(
         "--sequential-update",
@@ -439,36 +471,24 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    if args.plot_only:
-        if not args.input:
-            parser.error("--plot-only requires --input")
-        df = pd.read_csv(args.input)
-    else:
-        # Fetch W&B data
-        if args.input and os.path.exists(args.input):
-            print(f"Loading existing data from {args.input}")
-            df = pd.read_csv(args.input)
-        else:
-            print(f"Fetching runs from W&B: {args.project} / {args.group}")
-            df = fetch_wandb_runs(args.project, args.group)
-            print(f"  Found {len(df)} records from {df['run_id'].nunique()} runs")
-        
-        # Compute baselines
-        if not args.skip_baselines:
-            datasets = df[df["type"] == "experiment"]["dataset"].unique().tolist()
-            if not datasets:
-                datasets = ["cifar10", "cifar100"]
-            df_bl = compute_baselines(datasets)
-            df = pd.concat([df, df_bl], ignore_index=True)
-        
-        # Save CSV
-        df.to_csv(args.output, index=False)
-        print(f"Saved {len(df)} records to {args.output}")
+    # Step 1: Load all data from results directory
+    results_dir = Path(args.results_dir)
+    if not results_dir.exists():
+        raise FileNotFoundError(f"Results directory not found: {results_dir}")
     
-    if args.csv_only:
-        return
+    df = load_all_results(results_dir)
     
-    # Plot
+    # Step 2: Load baseline and linear probing reference data from CSV
+    df_ref = load_reference_data(args.reference_csv, n_samples=16)
+    if not df_ref.empty:
+        df = pd.concat([df, df_ref], ignore_index=True)
+    
+    # Step 3: Optionally save to CSV
+    if args.output_csv:
+        df.to_csv(args.output_csv, index=False)
+        print(f"Saved {len(df)} records to {args.output_csv}")
+    
+    # Step 4: Create plots
     make_figure(df, args.output_dir, sequential_update=seq_update, reset_loss_per_epoch=reset_loss)
 
 

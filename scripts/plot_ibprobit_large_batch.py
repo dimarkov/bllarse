@@ -154,7 +154,7 @@ def make_figure(df_dataset, dataset_name, pretrained_sources, output_dir):
     )
     fig.tight_layout()
 
-    fname = f"{output_dir}/ibprobit_{dataset_name}_combined.pdf"
+    fname = f"{output_dir}/linear_probing_ibprobit_{dataset_name}.pdf"
     fig.savefig(fname, bbox_inches="tight", dpi=150)
     print(f"Saved {fname}")
     plt.close(fig)

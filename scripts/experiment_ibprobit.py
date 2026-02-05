@@ -56,7 +56,7 @@ def run_experiment(args):
     update_iters_list = [2, 4, 8, 16, 32, 64]
 
     # Pretrained starting points
-    pretrained_types = ["in21k"]
+    pretrained_types = ["in21k_cifar", "in21k"]
 
     # Model variants: (num_blocks, embed_dim)
     model_variants = [(6, 512), (12, 512), (6, 1024), (12, 1024)]
