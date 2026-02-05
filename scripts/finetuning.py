@@ -122,6 +122,7 @@ def main(args, m_config, o_config):
 
     mlflow_context = nullcontext()
     if enable_mlflow:
+        parent_run_id = os.environ.get("MLFLOW_PARENT_RUN_ID")
         if args.mlflow_tracking_uri:
             mlflow.set_tracking_uri(args.mlflow_tracking_uri)
         if args.mlflow_experiment:
@@ -133,7 +134,12 @@ def main(args, m_config, o_config):
             "loss_fn": args.loss_fn,
             "tune_mode": args.tune_mode,
         }
-        mlflow_context = mlflow.start_run(run_name=args.uid or None, tags=mlflow_tags)
+        mlflow_context = mlflow.start_run(
+            run_name=args.uid or None,
+            tags=mlflow_tags,
+            nested=bool(parent_run_id),
+            parent_run_id=parent_run_id,
+        )
 
     key = jr.PRNGKey(seed)
 

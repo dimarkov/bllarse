@@ -11,6 +11,28 @@ import os
 import subprocess
 from bllarse.tools.module import get_module_from_source_path
 
+def _format_sweep_name(sweep_source: str) -> str:
+    base = os.path.basename(sweep_source)
+    if base.endswith(".py"):
+        base = base[:-3]
+    return base
+
+def _resolve_group_id(configs, sweep_source: str) -> str:
+    group_id = None
+    for cfg in configs:
+        cfg_group = cfg.get("group_id")
+        if not cfg_group:
+            continue
+        if group_id is None:
+            group_id = cfg_group
+        elif cfg_group != group_id:
+            print(
+                "[bllarse] WARNING: Multiple group_id values detected in sweep configs; "
+                f"using '{group_id}' from the first config."
+            )
+            break
+    return group_id or _format_sweep_name(sweep_source)
+
 def run_sweep(sweep_source: str, venv_name: str, max_concurrent: int, job_name: str | None, job_script: str):
     sweep = get_module_from_source_path(sweep_source)
     all_configs = sweep.create_configs()
@@ -21,6 +43,44 @@ def run_sweep(sweep_source: str, venv_name: str, max_concurrent: int, job_name: 
     env["BLLARSE_SWEEP_SOURCE"] = sweep_source
     env["VENV_NAME"] = venv_name
     name = job_name or "bllarse_sweep"
+
+    # If MLflow is enabled in the sweep configs, create a single parent run and
+    # pass its run_id to each array task via env var. Child runs are created in
+    # finetuning.py using nested=True + parent_run_id.
+    enable_mlflow = any(
+        cfg.get("enable_mlflow", False) or cfg.get("enable_wandb", False)
+        for cfg in all_configs
+    )
+    if enable_mlflow:
+        tracking_uri = (
+            all_configs[0].get("mlflow_tracking_uri")
+            or env.get("MLFLOW_TRACKING_URI")
+        )
+        experiment = (
+            all_configs[0].get("mlflow_experiment")
+            or env.get("MLFLOW_EXPERIMENT_NAME")
+            or "bllarse"
+        )
+        sweep_name = _resolve_group_id(all_configs, sweep_source)
+        try:
+            import mlflow
+
+            if tracking_uri:
+                mlflow.set_tracking_uri(tracking_uri)
+            mlflow.set_experiment(experiment)
+
+        parent_tags = {
+            "sweep_source": sweep_source,
+            "sweep_name": sweep_name,
+            "group_id": sweep_name,
+            "is_parent": "true",
+            "sweep_size": str(n),
+        }
+            with mlflow.start_run(run_name=sweep_name, tags=parent_tags) as parent:
+                env["MLFLOW_PARENT_RUN_ID"] = parent.info.run_id
+        except Exception as exc:
+            print(f"[bllarse] WARNING: Failed to create MLflow parent run: {exc}")
+
     subprocess.run(
         [
             "sbatch",
