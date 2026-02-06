@@ -132,9 +132,9 @@ def load_all_results(results_dir: Path) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def load_reference_data(
-    csv_path: str = "scripts/results_ibprobit_large_batch.csv",
-    n_samples: int = 16,
-    seed: int = 42,
+    csv_path: str = "scripts/results_ibprobit_last_layer.csv",
+    n_samples: int = 25,
+    seed: int = 137,
 ) -> pd.DataFrame:
     """Load baseline and linear probing (ibprobit) data from CSV.
     
@@ -197,7 +197,7 @@ def load_reference_data(
             max_batch = df_lp["batch_size"].max()
             df_lp_max_batch = df_lp[df_lp["batch_size"] == max_batch]
             
-            # For each num_iters: subsample 16 runs, compute mean of each metric
+            # For each num_iters: subsample n_samples runs, compute mean of each metric
             # Then find the num_iters with best mean accuracy
             best_mean_acc = -1
             best_metrics = None
@@ -238,7 +238,7 @@ def load_reference_data(
 
 METRICS = ["acc", "ece", "nll"]
 METRIC_LABELS = {"acc": "Accuracy", "ece": "ECE", "nll": "NLL"}
-EPOCHS_TO_PLOT = [1, 5, 10]
+EPOCHS_TO_PLOT = [1, 5]
 
 
 def make_figure(
@@ -251,8 +251,8 @@ def make_figure(
     
     Layout per figure:
     - Rows: acc, ece, nll (3 metrics)
-    - Columns 1-3: cifar10 epochs 1, 5, 10
-    - Columns 4-6: cifar100 epochs 1, 5, 10
+    - Columns 1-3: cifar10 epochs 1, 5,
+    - Columns 4-6: cifar100 epochs 1, 5
     
     Y-axis is aligned within each dataset's columns (first 3 cols share y, last 3 cols share y).
     """
@@ -264,10 +264,10 @@ def make_figure(
     filter_desc = []
     if sequential_update is not None:
         df_exp = df_exp[df_exp["sequential_update"] == sequential_update]
-        filter_desc.append(f"seq_update={sequential_update}")
+        filter_desc.append(f"sequential-update={sequential_update}")
     if reset_loss_per_epoch is not None:
         df_exp = df_exp[df_exp["reset_loss_per_epoch"] == reset_loss_per_epoch]
-        filter_desc.append(f"reset_loss={reset_loss_per_epoch}")
+        filter_desc.append(f"reset-loss={reset_loss_per_epoch}")
     
     filter_suffix = "_" + "_".join(filter_desc) if filter_desc else ""
     filter_title = " (" + ", ".join(filter_desc) + ")" if filter_desc else ""
@@ -279,9 +279,9 @@ def make_figure(
     batch_sizes = sorted(df_exp["batch_size"].dropna().unique())
     
     # Color map for num_update_iters - use tab10 for divergent/distinct colors
-    cmap = plt.cm.tab10
+    cmap = plt.cm.RdYlBu
     colors = {
-        it: cmap(i % 10)
+        it: cmap(i / max(len(update_iters_list) - 1, 1))
         for i, it in enumerate(update_iters_list)
     }
     
@@ -298,7 +298,7 @@ def make_figure(
         
         fig, axes = plt.subplots(
             n_rows, n_cols,
-            figsize=(18, 9),
+            figsize=(12, 8),
             squeeze=False,
             sharex=True,
         )
@@ -406,7 +406,7 @@ def make_figure(
         )
         
         fig.suptitle(
-            f"Sweep Results: {aug_label}{filter_title}",
+            f"{aug_label}{filter_title}",
             fontsize=14,
             y=1.005,
         )

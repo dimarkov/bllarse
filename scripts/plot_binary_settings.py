@@ -101,9 +101,9 @@ def load_all_results(results_dir: Path) -> pd.DataFrame:
 
 
 def load_reference_data(
-    csv_path: str = "scripts/results_ibprobit_large_batch.csv",
-    n_samples: int = 16,
-    seed: int = 42,
+    csv_path: str = "scripts/results_ibprobit_last_layer.csv",
+    n_samples: int = 25,
+    seed: int = 137,
 ) -> pd.DataFrame:
     """Load baseline and linear probing data from CSV."""
     if not os.path.exists(csv_path):
@@ -216,7 +216,11 @@ def make_binary_settings_figure(
         (True, True),
     ]
     cmap = plt.cm.tab10
-    combo_colors = {combo: cmap(i) for i, combo in enumerate(seq_reset_combos)}
+    # combo_colors = {combo: cmap(i) for i, combo in enumerate(seq_reset_combos)}
+    combo_colors = {
+        combo: cmap(i / max(len(seq_reset_combos) - 1, 1))
+        for i, combo in enumerate(seq_reset_combos)
+    }
     
     # Linestyles: solid for Aug (nodataaug=False), dashed for NoAug (nodataaug=True)
     linestyles = {False: "-", True: "--"}  # nodataaug -> linestyle
@@ -272,7 +276,7 @@ def make_binary_settings_figure(
                 color = combo_colors[(seq_update, reset_loss)]
                 ls = linestyles[nodataaug]
                 label = setting_label(*setting)
-                ax.plot(x, y, marker="o", ms=4, color=color, ls=ls, lw=1.5, label=label, zorder=2)
+                ax.plot(x, y, color=color, ls=ls, lw=1.5, label=label, zorder=2)
                 ax.fill_between(x, y - yerr, y + yerr, alpha=0.1, color=color)
             
             # Formatting
@@ -301,14 +305,14 @@ def make_binary_settings_figure(
     )
     
     fig.suptitle(
-        f"Binary Settings Comparison (batch_size={batch_size}, num_iters={num_iters})",
+        f"Binary Settings Comparison (batch-size={batch_size}, num-iters={num_iters})",
         fontsize=14,
         y=1.005,
     )
     fig.tight_layout()
     
     fname = f"{output_dir}/binary_settings_comparison.pdf"
-    fig.savefig(fname, bbox_inches="tight", dpi=150)
+    fig.savefig(fname, bbox_inches="tight", dpi=300)
     print(f"Saved {fname}")
     
     plt.close(fig)
@@ -347,7 +351,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1024,
+        default=16384,
         help="Filter for specific batch_size value",
     )
     args = parser.parse_args()
