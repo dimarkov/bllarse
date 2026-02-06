@@ -3,6 +3,9 @@ import glob
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import mlflow
+from mlflow.tracking import MlflowClient
+
 import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
@@ -45,6 +48,7 @@ def _coerce_value(value: str) -> Any:
 
 
 def _parse_wandb_config(config_path: Path) -> Dict[str, Any]:
+    """Legacy parser for W&B offline config.yaml files."""
     cfg: Dict[str, Any] = {}
     current_key: Optional[str] = None
     with config_path.open("r") as f:
@@ -64,6 +68,73 @@ def _parse_wandb_config(config_path: Path) -> Dict[str, Any]:
                 cfg[current_key] = _coerce_value(value)
                 current_key = None
     return cfg
+
+
+def _get_mlflow_client(tracking_uri: Optional[str]) -> MlflowClient:
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+    return MlflowClient()
+
+
+def _parse_mlflow_params(client: MlflowClient, run_id: str) -> Dict[str, Any]:
+    run = client.get_run(run_id)
+    return {k: _coerce_value(v) for k, v in run.data.params.items()}
+
+
+def _normalize_checkpoint_name(checkpoint: str) -> str:
+    name = checkpoint.strip()
+    if name.endswith(".eqx"):
+        return name
+    if name.startswith("ivon_epoch_"):
+        return f"{name}.eqx"
+    if name.isdigit():
+        return f"ivon_epoch_{name}.eqx"
+    return name
+
+
+def _list_mlflow_checkpoints(client: MlflowClient, run_id: str, artifact_root: str) -> list[str]:
+    infos = client.list_artifacts(run_id, artifact_root)
+    paths = [info.path for info in infos if info.path.endswith(".eqx")]
+    return paths
+
+
+def _select_latest_checkpoint(paths: list[str]) -> str:
+    def _epoch_from_path(path: str) -> int:
+        name = Path(path).name
+        if name.startswith("ivon_epoch_") and name.endswith(".eqx"):
+            suffix = name[len("ivon_epoch_"):-4]
+            try:
+                return int(suffix)
+            except ValueError:
+                return -1
+        return -1
+
+    scored = [(path, _epoch_from_path(path)) for path in paths]
+    scored.sort(key=lambda item: item[1])
+    return scored[-1][0]
+
+
+def _select_mlflow_checkpoint(
+    client: MlflowClient,
+    run_id: str,
+    artifact_root: str,
+    checkpoint: Optional[str],
+) -> str:
+    if checkpoint:
+        name = _normalize_checkpoint_name(checkpoint)
+        if artifact_root:
+            return f"{artifact_root}/{name}" if not name.startswith(f"{artifact_root}/") else name
+        return name
+
+    paths = _list_mlflow_checkpoints(client, run_id, artifact_root)
+    if not paths:
+        raise FileNotFoundError(f"No 'ivon_epoch_*.eqx' checkpoints found in MLflow under '{artifact_root}'.")
+    return _select_latest_checkpoint(paths)
+
+
+def _download_mlflow_checkpoint(run_id: str, artifact_path: str) -> Path:
+    local_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_path)
+    return Path(local_path)
 
 
 def _resolve_run_dir(run_dir: str) -> Path:
@@ -148,17 +219,36 @@ def _rebuild_optimizer(config: Dict[str, Any], dataset: str):
     return ivon(lr_schedule, **ivon_conf)
 
 
-def restore_last_layer_checkpoint(run_dir: str, checkpoint: Optional[str] = None):
-    run_path = _resolve_run_dir(run_dir)
-    cfg_path = run_path / "files" / "config.yaml"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"W&B config file not found at '{cfg_path}'.")
+def restore_last_layer_checkpoint(
+    *,
+    run_id: Optional[str] = None,
+    run_dir: Optional[str] = None,
+    checkpoint: Optional[str] = None,
+    tracking_uri: Optional[str] = None,
+    artifact_root: str = "checkpoints",
+):
+    if run_id:
+        client = _get_mlflow_client(tracking_uri)
+        config = _parse_mlflow_params(client, run_id)
+        backbone, dataset, embed_dim = _build_backbone(config)
+        last_layer_like = _build_last_layer(embed_dim, dataset)
 
-    config = _parse_wandb_config(cfg_path)
-    backbone, dataset, embed_dim = _build_backbone(config)
-    last_layer_like = _build_last_layer(embed_dim, dataset)
+        artifact_path = _select_mlflow_checkpoint(client, run_id, artifact_root, checkpoint)
+        ckpt_path = _download_mlflow_checkpoint(run_id, artifact_path)
+    else:
+        if not run_dir:
+            raise ValueError("Either run_id (MLflow) or run_dir (legacy) must be provided.")
+        run_path = _resolve_run_dir(run_dir)
+        cfg_path = run_path / "files" / "config.yaml"
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"Legacy W&B config file not found at '{cfg_path}'.")
 
-    ckpt_path = _select_checkpoint(run_path, checkpoint)
+        config = _parse_wandb_config(cfg_path)
+        backbone, dataset, embed_dim = _build_backbone(config)
+        last_layer_like = _build_last_layer(embed_dim, dataset)
+
+        ckpt_path = _select_checkpoint(run_path, checkpoint)
+
     optim = _rebuild_optimizer(config, dataset)
 
     restored_last_layer, restored_opt_state = load_ivon_checkpoint(
@@ -179,10 +269,24 @@ def main():
     parser = argparse.ArgumentParser(
         description="Restore a last-layer IVON checkpoint and run a forward pass."
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--run-id",
+        help="MLflow run ID to restore from.",
+    )
+    group.add_argument(
         "--run-dir",
-        required=True,
-        help="Path to the W&B run directory (e.g. 'wandb/run-YYYYMMDD_HHMMSS-uid').",
+        help="Legacy W&B run directory (e.g. 'wandb/run-YYYYMMDD_HHMMSS-uid').",
+    )
+    parser.add_argument(
+        "--tracking-uri",
+        default="",
+        help="Optional MLflow tracking URI (defaults to env MLFLOW_TRACKING_URI).",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        default="checkpoints",
+        help="Artifact subdirectory containing checkpoints in MLflow.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -191,7 +295,13 @@ def main():
     )
     args = parser.parse_args()
 
-    logits, _, ckpt_path = restore_last_layer_checkpoint(args.run_dir, args.checkpoint)
+    logits, _, ckpt_path = restore_last_layer_checkpoint(
+        run_id=args.run_id,
+        run_dir=args.run_dir,
+        checkpoint=args.checkpoint,
+        tracking_uri=args.tracking_uri or None,
+        artifact_root=args.artifact_root,
+    )
     print(f"Loaded checkpoint '{ckpt_path}'.")
     print(f"Forward-pass logits shape: {logits.shape}")
 
