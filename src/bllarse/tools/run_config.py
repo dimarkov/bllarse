@@ -19,14 +19,18 @@ def run_config(sweep_source: str, config_idx: int):
     # If MLflow is enabled, create (or reuse) a parent run for the sweep and
     # pass the parent run id via env var so finetuning.py creates a nested run.
     enable_mlflow = bool(cfg.get("enable_mlflow", False)) or bool(cfg.get("enable_wandb", False))
-    tracking_uri = cfg.get("mlflow_tracking_uri") or os.environ.get("MLFLOW_TRACKING_URI")
-    experiment = cfg.get("mlflow_experiment") or os.environ.get("MLFLOW_EXPERIMENT_NAME") or "bllarse"
     group_id = cfg.get("group_id")
     sweep_name = group_id or _format_sweep_name(sweep_source)
 
     if enable_mlflow:
+        from bllarse.mlflow_utils import load_mlflow_env_defaults
         import mlflow
         from mlflow.tracking import MlflowClient
+
+        load_mlflow_env_defaults()
+
+        tracking_uri = cfg.get("mlflow_tracking_uri") or os.environ.get("MLFLOW_TRACKING_URI")
+        experiment = cfg.get("mlflow_experiment") or os.environ.get("MLFLOW_EXPERIMENT_NAME") or "bllarse"
 
         if tracking_uri:
             mlflow.set_tracking_uri(tracking_uri)

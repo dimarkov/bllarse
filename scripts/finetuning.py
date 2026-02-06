@@ -122,11 +122,16 @@ def main(args, m_config, o_config):
 
     mlflow_context = nullcontext()
     if enable_mlflow:
+        from bllarse.mlflow_utils import load_mlflow_env_defaults
+
+        load_mlflow_env_defaults()
         parent_run_id = os.environ.get("MLFLOW_PARENT_RUN_ID")
-        if args.mlflow_tracking_uri:
-            mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-        if args.mlflow_experiment:
-            mlflow.set_experiment(args.mlflow_experiment)
+        tracking_uri = args.mlflow_tracking_uri or os.environ.get("MLFLOW_TRACKING_URI")
+        experiment = args.mlflow_experiment or os.environ.get("MLFLOW_EXPERIMENT_NAME") or "bllarse"
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+        if experiment:
+            mlflow.set_experiment(experiment)
 
         mlflow_tags = {
             "group_id": args.group_id,

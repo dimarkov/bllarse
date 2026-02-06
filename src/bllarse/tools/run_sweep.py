@@ -52,6 +52,9 @@ def run_sweep(sweep_source: str, venv_name: str, max_concurrent: int, job_name: 
         for cfg in all_configs
     )
     if enable_mlflow:
+        from bllarse.mlflow_utils import load_mlflow_env_defaults
+
+        load_mlflow_env_defaults()
         tracking_uri = (
             all_configs[0].get("mlflow_tracking_uri")
             or env.get("MLFLOW_TRACKING_URI")
@@ -69,13 +72,13 @@ def run_sweep(sweep_source: str, venv_name: str, max_concurrent: int, job_name: 
                 mlflow.set_tracking_uri(tracking_uri)
             mlflow.set_experiment(experiment)
 
-        parent_tags = {
-            "sweep_source": sweep_source,
-            "sweep_name": sweep_name,
-            "group_id": sweep_name,
-            "is_parent": "true",
-            "sweep_size": str(n),
-        }
+            parent_tags = {
+                "sweep_source": sweep_source,
+                "sweep_name": sweep_name,
+                "group_id": sweep_name,
+                "is_parent": "true",
+                "sweep_size": str(n),
+            }
             with mlflow.start_run(run_name=sweep_name, tags=parent_tags) as parent:
                 env["MLFLOW_PARENT_RUN_ID"] = parent.info.run_id
         except Exception as exc:
