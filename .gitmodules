@@ -1,0 +1,3 @@
+[submodule "scripts/vbll_pytorch/scaling_mlps"]
+	path = scripts/vbll_pytorch/scaling_mlps
+	url = https://github.com/gregorbachmann/scaling_mlps
