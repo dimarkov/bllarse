@@ -7,11 +7,12 @@ from tensorflow_probability.substrates.jax.stats import (
 import optax
 
 try:
-    import wandb
+    import mlflow
 
-    no_wandb = False
-except:
-    no_wandb = True
+    no_mlflow = False
+except Exception:
+    mlflow = None
+    no_mlflow = True
 import numpy as onp
 
 from typing import Mapping, Optional
@@ -120,7 +121,8 @@ def run_training(
     batch_size: int = 32,
     num_update_iters: int = 32,
     mc_samples: int = 1,
-    log_to_wandb=False,
+    log_to_mlflow: bool = False,
+    epoch_offset: int = 0,
     sequential_update: bool = False,
     reset_loss_per_epoch: bool = False,
 ):
@@ -145,7 +147,8 @@ def run_training(
     batch_size : Batch size
     num_update_iters : Number of CAVI/PG iterations per batch (Bayesian only)
     mc_samples : MC samples for stochastic gradient estimation
-    log_to_wandb : Whether to log to Weights & Biases
+    log_to_mlflow : Whether to log to MLflow
+    epoch_offset : Epoch offset to keep logging steps aligned across chunks
     sequential_update : If True, perform two-pass training per epoch (loss update, then network update)
     reset_loss_per_epoch : If True, reset loss model parameters at the start of each epoch
 
@@ -391,18 +394,23 @@ def run_training(
         epoch_body, init, epoch_keys
     )
 
-    if log_to_wandb and not no_wandb:
-        metrics_np = jtu.map(lambda x: onp.asarray(x), metrics_seq)
-        for ep in range(num_epochs):
-            wandb.log(
-                {
-                    "epoch": ep + 1,
-                    "loss": float(metrics_np["loss"][ep]),
-                    "nll": float(metrics_np["nll"][ep]),
-                    "acc": float(metrics_np["acc"][ep]),
-                    "ece": float(metrics_np["ece"][ep]),
-                }
-            )
+    if log_to_mlflow and not no_mlflow:
+        try:
+            metrics_np = jtu.map(lambda x: onp.asarray(x), metrics_seq)
+            for ep in range(num_epochs):
+                step = epoch_offset + ep + 1
+                mlflow.log_metrics(
+                    {
+                        "loss": float(metrics_np["loss"][ep]),
+                        "nll": float(metrics_np["nll"][ep]),
+                        "acc": float(metrics_np["acc"][ep]),
+                        "ece": float(metrics_np["ece"][ep]),
+                        "epoch": float(step),
+                    },
+                    step=step,
+                )
+        except Exception as exc:
+            print(f"[bllarse] MLflow logging failed: {exc}")
 
     trained_loss_model = eqx.combine(final_loss_params, loss_static)
     trained_nnet = get_nnet(final_params)
