@@ -33,15 +33,38 @@ def _resolve_group_id(configs, sweep_source: str) -> str:
             break
     return group_id or _format_sweep_name(sweep_source)
 
-def run_sweep(sweep_source: str, venv_name: str, max_concurrent: int, job_name: str | None, job_script: str):
+def run_sweep(
+    sweep_source: str,
+    venv_name: str,
+    max_concurrent: int,
+    job_name: str | None,
+    job_script: str,
+    index_offset: int,
+    num_jobs: int | None,
+):
     sweep = get_module_from_source_path(sweep_source)
     all_configs = sweep.create_configs()
-    n = len(all_configs)
-    if n == 0:
+    total = len(all_configs)
+    if total == 0:
         raise ValueError("create_configs() returned an empty list.")
+    if index_offset < 0:
+        raise ValueError("index_offset must be >= 0")
+    if index_offset >= total:
+        raise ValueError(f"index_offset ({index_offset}) out of range (0..{total-1})")
+    if num_jobs is None:
+        n = total - index_offset
+    else:
+        if num_jobs <= 0:
+            raise ValueError("num_jobs must be > 0")
+        if index_offset + num_jobs > total:
+            raise ValueError(
+                f"index_offset+num_jobs ({index_offset}+{num_jobs}) exceeds total configs ({total})"
+            )
+        n = num_jobs
     env = os.environ.copy()
     env["BLLARSE_SWEEP_SOURCE"] = sweep_source
     env["VENV_NAME"] = venv_name
+    env["INDEX_OFFSET"] = str(index_offset)
     name = job_name or "bllarse_sweep"
 
     # If MLflow is enabled in the sweep configs, create a single parent run and
@@ -77,7 +100,9 @@ def run_sweep(sweep_source: str, venv_name: str, max_concurrent: int, job_name: 
                 "sweep_name": sweep_name,
                 "group_id": sweep_name,
                 "is_parent": "true",
-                "sweep_size": str(n),
+                "sweep_size_total": str(total),
+                "sweep_chunk_size": str(n),
+                "sweep_chunk_offset": str(index_offset),
             }
             with mlflow.start_run(run_name=sweep_name, tags=parent_tags) as parent:
                 env["MLFLOW_PARENT_RUN_ID"] = parent.info.run_id
@@ -102,7 +127,27 @@ def main():
     ap.add_argument("--max-concurrent", type=int, default=7)
     ap.add_argument("--job-name", type=str, default=None)
     ap.add_argument("--job-script", type=str, default="slurm/jobs/slurm_run_config.sh")
+    ap.add_argument(
+        "--index-offset",
+        type=int,
+        default=0,
+        help="Offset into sweep configs (pairs with SLURM array index).",
+    )
+    ap.add_argument(
+        "--num-jobs",
+        type=int,
+        default=None,
+        help="Number of configs to run from index-offset (defaults to all remaining).",
+    )
     args = ap.parse_args()
-    run_sweep(args.sweep_source, args.venv, args.max_concurrent, args.job_name, args.job_script)
+    run_sweep(
+        args.sweep_source,
+        args.venv,
+        args.max_concurrent,
+        args.job_name,
+        args.job_script,
+        args.index_offset,
+        args.num_jobs,
+    )
 if __name__ == "__main__":
     main()
