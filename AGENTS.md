@@ -37,6 +37,7 @@
 
 ## SLURM/login-node workflow (VBLL)
 - Compatible with existing launch flow via `python -m bllarse.tools.run_sweep ... --job-script src/slurm/jobs/slurm_run_config_docker.sh`.
+- Optional CPU pinning for data-loader stability: pass `--cpus-per-task <N>` to `run_sweep.py` (recommended when using `num_workers > 0`).
 - Required prerequisites before submitting:
   - Run from repo root on `experimental_infra_vbll_baseline`.
   - The venv passed in `--venv` (e.g. `.venv_bllarse_new`) already has VBLL deps installed via `uv sync --group vbll`.

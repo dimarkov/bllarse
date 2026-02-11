@@ -41,6 +41,7 @@ def run_sweep(
     job_script: str,
     index_offset: int,
     num_jobs: int | None,
+    cpus_per_task: int | None,
 ):
     sweep = get_module_from_source_path(sweep_source)
     all_configs = sweep.create_configs()
@@ -51,6 +52,8 @@ def run_sweep(
         raise ValueError("index_offset must be >= 0")
     if index_offset >= total:
         raise ValueError(f"index_offset ({index_offset}) out of range (0..{total-1})")
+    if cpus_per_task is not None and cpus_per_task <= 0:
+        raise ValueError("cpus_per_task must be > 0")
     if num_jobs is None:
         n = total - index_offset
     else:
@@ -109,16 +112,16 @@ def run_sweep(
         except Exception as exc:
             print(f"[bllarse] WARNING: Failed to create MLflow parent run: {exc}")
 
-    subprocess.run(
-        [
-            "sbatch",
-            "--array", f"0-{n-1}%{max_concurrent}",
-            "--job-name", name,
-            job_script,
-        ],
-        env=env,
-        check=True,
-    )
+    sbatch_cmd = [
+        "sbatch",
+        "--array", f"0-{n-1}%{max_concurrent}",
+        "--job-name", name,
+    ]
+    if cpus_per_task is not None:
+        sbatch_cmd.extend(["--cpus-per-task", str(cpus_per_task)])
+    sbatch_cmd.append(job_script)
+
+    subprocess.run(sbatch_cmd, env=env, check=True)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -127,6 +130,12 @@ def main():
     ap.add_argument("--max-concurrent", type=int, default=7)
     ap.add_argument("--job-name", type=str, default=None)
     ap.add_argument("--job-script", type=str, default="slurm/jobs/slurm_run_config.sh")
+    ap.add_argument(
+        "--cpus-per-task",
+        type=int,
+        default=None,
+        help="Optional SLURM CPU allocation override passed to sbatch.",
+    )
     ap.add_argument(
         "--index-offset",
         type=int,
@@ -148,6 +157,7 @@ def main():
         args.job_script,
         args.index_offset,
         args.num_jobs,
+        args.cpus_per_task,
     )
 if __name__ == "__main__":
     main()
