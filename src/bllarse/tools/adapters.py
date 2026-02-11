@@ -9,6 +9,8 @@ def _dict_to_argv(d: Dict[str, Any]) -> List[str]:
     argv: List[str] = []
     for k, v in d.items():
         flag = "--" + k.replace("_", "-")
+        if v is None:
+            continue
         if isinstance(v, bool):
             if v:
                 argv.append(flag)
@@ -44,22 +46,33 @@ def _load_module(script_name) -> Any:
     return get_module_from_source_path(str(llf_path))
 
 def run_training_from_config(config: Dict[str, Any]) -> None:
-    """
-    Adapter: Dict config -> argparse args -> build_configs -> main
-    implemented by importing `scripts/finetuning.py`
-    """
+    run_script_from_config("finetuning.py", config)
 
-    script_name = "finetuning.py"
+def run_vbll_training_from_config(config: Dict[str, Any]) -> None:
+    run_script_from_config("vbll_pytorch/finetuning_vbll.py", config)
+
+def run_script_from_config(script_name: str, config: Dict[str, Any]) -> None:
+    """
+    Adapter: Dict config -> argparse args -> main,
+    implemented by importing a training script under `scripts/`.
+    """
 
     finetuning_module = _load_module(script_name)
 
-    # fetch required callables from the training script
+    # Fetch callables from the target script.
     build_argparser: Callable[[], Any] = getattr(finetuning_module, "build_argparser")
-    build_configs: Callable[[Any], Tuple[dict, dict]] = getattr(finetuning_module, "build_configs")
-    train_main: Callable[[Any, dict, dict], None] = getattr(finetuning_module, "main")
-
     parser = build_argparser()
     argv = _dict_to_argv(config)
     args: Namespace = parser.parse_args(argv)
-    m_conf, o_conf = build_configs(args)
-    train_main(args, m_conf, o_conf)
+
+    # JAX finetuning script expects (args, model_cfg, opt_cfg), while other
+    # scripts (e.g. VBLL PyTorch) expect just (args).
+    if hasattr(finetuning_module, "build_configs"):
+        build_configs: Callable[[Any], Tuple[dict, dict]] = getattr(finetuning_module, "build_configs")
+        train_main: Callable[[Any, dict, dict], None] = getattr(finetuning_module, "main")
+        m_conf, o_conf = build_configs(args)
+        train_main(args, m_conf, o_conf)
+        return
+
+    train_main: Callable[[Any], None] = getattr(finetuning_module, "main")
+    train_main(args)
