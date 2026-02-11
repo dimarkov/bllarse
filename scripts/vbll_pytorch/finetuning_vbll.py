@@ -1,13 +1,28 @@
-"""VBLL finetuning script for scaling MLPs.
-
-Similar to scripts/finetuning.py but using PyTorch with VBLL for Bayesian last layers.
-"""
+"""VBLL finetuning script for scaling MLPs."""
 import argparse
+import os
+import sys
+from contextlib import nullcontext
+from pathlib import Path
+
 import torch
-import torch.nn.functional as F
 import vbll
-import mlflow
 from tqdm import tqdm
+
+try:
+    import mlflow
+    no_mlflow = False
+except Exception:
+    mlflow = None
+    no_mlflow = True
+
+# Allow running this script directly from repo root with `python ...`.
+_THIS_DIR = Path(__file__).resolve().parent
+_LOCAL_SRC = _THIS_DIR / "src"
+_REPO_SRC = _THIS_DIR.parent.parent / "src"
+for _path in (_LOCAL_SRC, _REPO_SRC):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 # --- Monkey Patch for VBLL LowRankNormal bug ---
 # Fixes RuntimeError: Expected all tensors to be on the same device ... found cuda:0 and cpu!
@@ -27,7 +42,7 @@ LowRankNormal.logdet_covariance = property(patched_logdet_covariance)
 
 from vbll_experiments.data import get_dataloaders, get_num_classes
 from vbll_experiments.models import create_vbll_model
-from vbll_experiments.training import run_training, evaluate
+from vbll_experiments.training import run_training
 
 
 def build_argparser():
@@ -43,6 +58,8 @@ def build_argparser():
                         help="Number of training epochs")
     parser.add_argument("-bs", "--batch-size", default=64, type=int,
                         help="Batch size")
+    parser.add_argument("--num-workers", default=4, type=int,
+                        help="Number of PyTorch dataloader workers")
     
     # Optimizer
     parser.add_argument("-o", "--optimizer", default="adamw", type=str,
@@ -92,10 +109,20 @@ def build_argparser():
                         help="Compute OOD scores during forward pass")
     
     # MLflow logging
-    parser.add_argument("--enable-mlflow", action="store_true",
+    parser.add_argument("--enable-mlflow", "--enable_mlflow", action="store_true",
                         help="Enable MLflow logging")
-    parser.add_argument("--experiment-name", default="vbll_finetuning", type=str,
+    parser.add_argument("--enable-wandb", "--enable_wandb", action="store_true",
+                        help="Deprecated alias for --enable-mlflow")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default=os.environ.get("MLFLOW_TRACKING_URI", ""),
+                        help="MLflow tracking URI (defaults to env MLFLOW_TRACKING_URI)")
+    parser.add_argument("--mlflow-experiment", type=str, default=os.environ.get("MLFLOW_EXPERIMENT_NAME", "bllarse"),
                         help="MLflow experiment name")
+    parser.add_argument("--experiment-name", default=None, type=str,
+                        help="Deprecated alias for --mlflow-experiment")
+    parser.add_argument("--group-id", type=str, default="vbll_finetuning",
+                        help="Tag runs with a shared MLflow group id")
+    parser.add_argument("--uid", type=str, default=None,
+                        help="Optional MLflow run name (auto-generated if omitted)")
     
     # Device
     parser.add_argument("--device", default="cuda", type=str,
@@ -108,7 +135,67 @@ def build_argparser():
     return parser
 
 
+def _build_run_config(args, regularization_weight: float) -> dict:
+    return {
+        "dataset": args.dataset,
+        "seed": args.seed,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "optimizer": args.optimizer,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "num_blocks": args.num_blocks,
+        "embed_dim": args.embed_dim,
+        "pretrained": args.pretrained,
+        "tune_mode": args.tune_mode,
+        "prior_scale": args.prior_scale,
+        "wishart_scale": args.wishart_scale,
+        "regularization_weight": regularization_weight,
+        "parameterization": args.parameterization,
+        "cov_rank": args.cov_rank,
+        "vbll_type": args.vbll_type,
+        "return_ood": args.return_ood,
+        "nodataaug": args.nodataaug,
+    }
+
+
 def main(args):
+    enable_mlflow = args.enable_mlflow
+    if args.enable_wandb:
+        enable_mlflow = True
+        print("[bllarse] --enable-wandb is deprecated; enabling MLflow logging instead.")
+    if args.experiment_name:
+        print("[bllarse] --experiment-name is deprecated; use --mlflow-experiment.")
+        args.mlflow_experiment = args.experiment_name
+    if enable_mlflow and no_mlflow:
+        print("[bllarse] MLflow is not installed; disabling MLflow logging.")
+        enable_mlflow = False
+
+    mlflow_context = nullcontext()
+    if enable_mlflow:
+        from bllarse.mlflow_utils import load_mlflow_env_defaults
+
+        load_mlflow_env_defaults()
+        parent_run_id = os.environ.get("MLFLOW_PARENT_RUN_ID")
+        tracking_uri = args.mlflow_tracking_uri or os.environ.get("MLFLOW_TRACKING_URI")
+        experiment = args.mlflow_experiment or os.environ.get("MLFLOW_EXPERIMENT_NAME") or "bllarse"
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+        if experiment:
+            mlflow.set_experiment(experiment)
+        mlflow_context = mlflow.start_run(
+            run_name=args.uid or None,
+            tags={
+                "group_id": args.group_id,
+                "optimizer": args.optimizer,
+                "tune_mode": args.tune_mode,
+                "method": "vbll",
+            },
+            nested=bool(parent_run_id),
+            parent_run_id=parent_run_id,
+        )
+
     # Set random seeds
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -141,6 +228,7 @@ def main(args):
         dataset_name=args.dataset,
         batch_size=args.batch_size,
         augment=not args.nodataaug,
+        num_workers=args.num_workers,
     )
     
     # Load original pretrained backbone for baseline evaluation
@@ -281,31 +369,19 @@ def main(args):
         except ImportError:
             raise ImportError("Lion optimizer requires: pip install lion-pytorch")
     
-    # MLflow setup
-    mlflow_run = None
-    if args.enable_mlflow:
-        mlflow.set_experiment(args.experiment_name)
-        mlflow_run = mlflow.start_run()
-        mlflow.log_params({
-            "dataset": args.dataset,
-            "seed": args.seed,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "optimizer": args.optimizer,
-            "learning_rate": args.learning_rate,
-            "weight_decay": args.weight_decay,
-            "num_blocks": args.num_blocks,
-            "embed_dim": args.embed_dim,
-            "pretrained": args.pretrained,
-            "tune_mode": args.tune_mode,
-            "prior_scale": args.prior_scale,
-            "wishart_scale": args.wishart_scale,
-            "nodataaug": args.nodataaug,
-        })
-    
     # Run training
     print(f"\nStarting training for {args.epochs} epochs...")
-    try:
+    with mlflow_context:
+        if enable_mlflow:
+            mlflow.log_params(_build_run_config(args, regularization_weight))
+            if checkpoint != "in21k":
+                mlflow.log_metrics({
+                    "pre_finetune_accuracy": pre_acc,
+                    "pre_finetune_nll": pre_nll,
+                    "pre_finetune_ece": pre_ece,
+                })
+
+        mlflow_run = mlflow.active_run() if enable_mlflow else None
         history = run_training(
             model=model,
             train_loader=train_loader,
@@ -316,9 +392,6 @@ def main(args):
             tune_mode=args.tune_mode,
             mlflow_run=mlflow_run,
         )
-    finally:
-        if mlflow_run:
-            mlflow.end_run()
     
     # Final summary
     print("\n" + "=" * 50)

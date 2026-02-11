@@ -2,25 +2,25 @@
 
 PyTorch-based finetuning experiments using [VBLL](https://github.com/VectorInstitute/vbll) (Variational Bayesian Last Layers) with [scaling_mlps](https://github.com/gregorbachmann/scaling_mlps) pretrained models.
 
-This is an isolated module with its own dependencies, separate from the main JAX-based `bllarse` package.
+This module is integrated with the main `bllarse` MLflow/sweep flow.
 
 ## Setup
 
 ```bash
-cd scripts/vbll_pytorch
-uv sync
+git submodule update --init --recursive scripts/vbll_pytorch/scaling_mlps
+uv pip install -e scripts/vbll_pytorch
 ```
 
 ## Usage
 
 Basic finetuning on CIFAR-10:
 ```bash
-uv run python finetuning_vbll.py --dataset cifar10 --epochs 100
+python scripts/vbll_pytorch/finetuning_vbll.py --dataset cifar10 --epochs 100
 ```
 
 Full network finetuning with MLflow logging:
 ```bash
-uv run python finetuning_vbll.py \
+python scripts/vbll_pytorch/finetuning_vbll.py \
     --dataset cifar10 \
     --tune-mode full_network \
     --optimizer adamw \
@@ -32,7 +32,12 @@ uv run python finetuning_vbll.py \
 Using Lion optimizer:
 ```bash
 uv pip install lion-pytorch
-uv run python finetuning_vbll.py --optimizer lion --learning-rate 1e-4
+python scripts/vbll_pytorch/finetuning_vbll.py --optimizer lion --learning-rate 1e-4
+```
+
+Smoke run using the shared sweep tooling:
+```bash
+python src/bllarse/tools/run_config.py bllarse_sweeps/vbll_smoke_sweep.py 0
 ```
 
 ## Arguments
@@ -44,7 +49,7 @@ uv run python finetuning_vbll.py --optimizer lion --learning-rate 1e-4
 | `--batch-size` | 64 | Batch size |
 | `--optimizer` | adamw | Optimizer (adamw, lion) |
 | `--learning-rate` | 1e-3 | Learning rate |
-| `--weight-decay` | 1e-2 | Weight decay |
+| `--weight-decay` | 1e-4 | Weight decay |
 | `--num-blocks` | 6 | MLP blocks (6, 12) |
 | `--embed-dim` | 512 | Embedding dim (512, 1024) |
 | `--pretrained` | in21k_cifar | Checkpoint (in21k, in21k_cifar) |

@@ -11,6 +11,11 @@ import vbll
 
 # Add vendored scaling_mlps to path
 _SCALING_MLPS_PATH = Path(__file__).parent.parent.parent / "scaling_mlps"
+if not (_SCALING_MLPS_PATH / "models").exists():
+    raise FileNotFoundError(
+        f"Missing scaling_mlps submodule at {_SCALING_MLPS_PATH}. "
+        "Run: git submodule update --init --recursive scripts/vbll_pytorch/scaling_mlps"
+    )
 if str(_SCALING_MLPS_PATH) not in sys.path:
     sys.path.insert(0, str(_SCALING_MLPS_PATH))
 
