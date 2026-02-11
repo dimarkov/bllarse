@@ -1,7 +1,16 @@
 """Data loading utilities for VBLL experiments."""
+from contextlib import contextmanager
+from pathlib import Path
+import os
+
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is unavailable on Windows.
+    fcntl = None
 
 # Normalization constants matching the original JAX script
 MEAN_DICT = {
@@ -74,21 +83,24 @@ def get_dataloaders(
     train_transform, test_transform = get_transforms(dataset_name, augment, img_size)
     
     if dataset_name == "cifar10":
-        train_dataset = datasets.CIFAR10(
-            root=data_root, train=True, download=True, transform=train_transform
-        )
-        test_dataset = datasets.CIFAR10(
-            root=data_root, train=False, download=True, transform=test_transform
-        )
+        dataset_cls = datasets.CIFAR10
     elif dataset_name == "cifar100":
-        train_dataset = datasets.CIFAR100(
-            root=data_root, train=True, download=True, transform=train_transform
-        )
-        test_dataset = datasets.CIFAR100(
-            root=data_root, train=False, download=True, transform=test_transform
-        )
+        dataset_cls = datasets.CIFAR100
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    # Guard first-time download/extract with a file lock so concurrent array
+    # jobs do not race and leave partial/corrupted dataset state.
+    with _dataset_download_lock(data_root, dataset_name):
+        dataset_cls(root=data_root, train=True, download=True)
+        dataset_cls(root=data_root, train=False, download=True)
+
+    train_dataset = dataset_cls(
+        root=data_root, train=True, download=False, transform=train_transform
+    )
+    test_dataset = dataset_cls(
+        root=data_root, train=False, download=False, transform=test_transform
+    )
     
     train_loader = DataLoader(
         train_dataset,
@@ -117,3 +129,21 @@ def get_num_classes(dataset_name: str) -> int:
         return 100
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+@contextmanager
+def _dataset_download_lock(data_root: str, dataset_name: str):
+    """Serialize dataset download/extract across concurrent jobs."""
+    os.makedirs(data_root, exist_ok=True)
+
+    if fcntl is None:
+        yield
+        return
+
+    lock_path = Path(data_root) / f".{dataset_name}.download.lock"
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
