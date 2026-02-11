@@ -109,11 +109,13 @@ def run_sweep(
             }
             with mlflow.start_run(run_name=sweep_name, tags=parent_tags) as parent:
                 env["MLFLOW_PARENT_RUN_ID"] = parent.info.run_id
+                print(f"[bllarse] MLflow parent run id: {parent.info.run_id}")
         except Exception as exc:
             print(f"[bllarse] WARNING: Failed to create MLflow parent run: {exc}")
 
     sbatch_cmd = [
         "sbatch",
+        "--export", "ALL",
         "--array", f"0-{n-1}%{max_concurrent}",
         "--job-name", name,
     ]
