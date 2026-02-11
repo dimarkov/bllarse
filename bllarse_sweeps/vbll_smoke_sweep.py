@@ -6,7 +6,7 @@ from bllarse.tools.adapters import run_vbll_training_from_config
 BASE = dict(
     dataset="cifar10",
     seed=0,
-    epochs=1,
+    epochs=3,
     batch_size=32,
     num_workers=2,
     optimizer="adamw",
