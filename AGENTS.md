@@ -30,7 +30,7 @@
 - Initialize submodule:
   - `git submodule update --init --recursive scripts/vbll_pytorch/scaling_mlps`
 - Install VBLL package/deps into active venv:
-  - `uv pip install -e scripts/vbll_pytorch`
+  - `uv sync --group vbll`
 - Optional for Lion:
   - `uv pip install lion-pytorch`
 

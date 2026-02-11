@@ -31,8 +31,14 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.uv.sources]
+vbll-experiments = { path = "scripts/vbll_pytorch", editable = true }
+
 [dependency-groups]
 dev = [
     "matplotlib>=3.10.3",
     "pytest>=8.3.5",
+]
+vbll = [
+    "vbll-experiments",
 ]

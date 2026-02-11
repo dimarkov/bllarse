@@ -8,7 +8,7 @@ This module is integrated with the main `bllarse` MLflow/sweep flow.
 
 ```bash
 git submodule update --init --recursive scripts/vbll_pytorch/scaling_mlps
-uv pip install -e scripts/vbll_pytorch
+uv sync --group vbll
 ```
 
 ## Usage
