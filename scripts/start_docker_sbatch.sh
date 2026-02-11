@@ -4,11 +4,13 @@ set -euo pipefail
 HOST_USER="${USER:-$(id -un 2>/dev/null || echo user)}"
 HOST_LOGNAME="${LOGNAME:-$HOST_USER}"
 HOST_TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$HOME/.cache/torchinductor}"
+HOST_DOCKER_SHM_SIZE="${BLLARSE_DOCKER_SHM_SIZE:-8g}"
 mkdir -p "$HOST_TORCHINDUCTOR_CACHE_DIR"
 
 docker_args=(
   --rm
   --gpus="device=$SLURM_JOB_GPUS"
+  --shm-size "$HOST_DOCKER_SHM_SIZE"
   -e "HOME=$HOME"
   -e "USER=$HOST_USER"
   -e "LOGNAME=$HOST_LOGNAME"
