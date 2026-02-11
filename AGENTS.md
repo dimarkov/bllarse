@@ -1,8 +1,9 @@
 # Agent Handoff Notes
 
 ## Repo context
-- Active infra branch: `experimental_infra`
-- Primary goal on this branch: run large finetuning/sweep jobs on SLURM and log to MLflow.
+- Active branch for this file/state: `experimental_infra_vbll_baseline`
+- Parent infra branch: `experimental_infra`
+- Primary goal on this branch: run VBLL baseline finetuning/sweeps on SLURM and log to MLflow, while preserving compatibility with the existing infra.
 - Main training script for JAX/IBProbit: `scripts/finetuning.py`
 - Sweep launchers:
   - `python src/bllarse/tools/run_sweep.py <sweep.py> ...` (SLURM array, creates MLflow parent run)
@@ -33,6 +34,18 @@
   - `uv sync --group vbll`
 - Optional for Lion:
   - `uv pip install lion-pytorch`
+
+## SLURM/login-node workflow (VBLL)
+- Compatible with existing launch flow via `python -m bllarse.tools.run_sweep ... --job-script src/slurm/jobs/slurm_run_config_docker.sh`.
+- Required prerequisites before submitting:
+  - Run from repo root on `experimental_infra_vbll_baseline`.
+  - The venv passed in `--venv` (e.g. `.venv_bllarse_new`) already has VBLL deps installed via `uv sync --group vbll`.
+  - `scripts/vbll_pytorch/scaling_mlps` submodule is initialized.
+  - MLflow URI/auth is set via env or `~/.mlflow/credentials`.
+- Notes:
+  - `run_sweep.py` creates a parent MLflow run on the login node and passes `MLFLOW_PARENT_RUN_ID` to array jobs.
+  - `src/slurm/jobs/slurm_run_config_docker.sh` activates `${VENV_NAME}` inside Docker, then runs `src/bllarse/tools/run_config.py`.
+  - If your venv is not located at repo-relative path, pass an absolute path to `--venv`.
 
 ## Quick local smoke command
 - Single VBLL config via shared runner:
