@@ -160,30 +160,6 @@ def _build_run_config(args, regularization_weight: float) -> dict:
     }
 
 
-def _backfill_epoch_metrics_if_missing(mlflow_run, history: dict) -> None:
-    """Ensure per-epoch metrics exist in MLflow even if intermediate logging dropped."""
-    if mlflow_run is None:
-        return
-
-    metric_series = {
-        "train_loss": history.get("train_loss", []),
-        "test_accuracy": history.get("test_accuracy", []),
-        "test_nll": history.get("test_nll", []),
-        "test_ece": history.get("test_ece", []),
-    }
-    try:
-        client = mlflow.tracking.MlflowClient()
-        run_id = mlflow_run.info.run_id
-        for metric_name, values in metric_series.items():
-            existing = client.get_metric_history(run_id, metric_name)
-            existing_steps = {m.step for m in existing}
-            for step, value in enumerate(values, start=1):
-                if step not in existing_steps:
-                    client.log_metric(run_id, metric_name, float(value), step=step)
-    except Exception as exc:
-        print(f"[bllarse] WARNING: failed to backfill epoch metrics in MLflow: {exc}")
-
-
 def main(args):
     enable_mlflow = args.enable_mlflow
     if args.enable_wandb:
@@ -430,7 +406,6 @@ def main(args):
                 )
             except Exception as exc:
                 print(f"[bllarse] WARNING: failed to log final metrics to MLflow: {exc}")
-            _backfill_epoch_metrics_if_missing(mlflow_run, history)
     
     # Final summary
     print("\n" + "=" * 50)
