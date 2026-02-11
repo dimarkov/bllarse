@@ -392,6 +392,20 @@ def main(args):
             tune_mode=args.tune_mode,
             mlflow_run=mlflow_run,
         )
+        if enable_mlflow:
+            try:
+                mlflow.log_metrics(
+                    {
+                        "final_accuracy": history["test_accuracy"][-1],
+                        "best_accuracy": max(history["test_accuracy"]),
+                        "final_nll": history["test_nll"][-1],
+                        "final_ece": history["test_ece"][-1],
+                        "final_train_loss": history["train_loss"][-1],
+                        "epochs_completed": len(history["train_loss"]),
+                    }
+                )
+            except Exception as exc:
+                print(f"[bllarse] WARNING: failed to log final metrics to MLflow: {exc}")
     
     # Final summary
     print("\n" + "=" * 50)

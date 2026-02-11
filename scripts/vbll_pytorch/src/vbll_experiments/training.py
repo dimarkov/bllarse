@@ -181,6 +181,14 @@ def run_training(
         "test_nll": [],
         "test_ece": [],
     }
+
+    mlflow_client = None
+    mlflow_run_id = None
+    if mlflow_run is not None:
+        import mlflow
+
+        mlflow_client = mlflow.tracking.MlflowClient()
+        mlflow_run_id = mlflow_run.info.run_id
     
     for epoch in range(num_epochs):
         # Train
@@ -196,14 +204,15 @@ def run_training(
         history["test_ece"].append(metrics["ece"])
         
         # Log to MLflow if available
-        if mlflow_run is not None:
-            import mlflow
-            mlflow.log_metrics({
-                "train_loss": train_loss,
-                "test_accuracy": metrics["accuracy"],
-                "test_nll": metrics["nll"],
-                "test_ece": metrics["ece"],
-            }, step=epoch)
+        if mlflow_client is not None and mlflow_run_id is not None:
+            step = epoch + 1
+            try:
+                mlflow_client.log_metric(mlflow_run_id, "train_loss", train_loss, step=step)
+                mlflow_client.log_metric(mlflow_run_id, "test_accuracy", metrics["accuracy"], step=step)
+                mlflow_client.log_metric(mlflow_run_id, "test_nll", metrics["nll"], step=step)
+                mlflow_client.log_metric(mlflow_run_id, "test_ece", metrics["ece"], step=step)
+            except Exception as exc:
+                print(f"[bllarse] WARNING: failed to log epoch {step} metrics to MLflow: {exc}")
         
         print(
             f"Epoch {epoch + 1}/{num_epochs} | "
