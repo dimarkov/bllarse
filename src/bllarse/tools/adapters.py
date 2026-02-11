@@ -48,9 +48,6 @@ def _load_module(script_name) -> Any:
 def run_training_from_config(config: Dict[str, Any]) -> None:
     run_script_from_config("finetuning.py", config)
 
-def run_vbll_training_from_config(config: Dict[str, Any]) -> None:
-    run_script_from_config("vbll_pytorch/finetuning_vbll.py", config)
-
 def run_script_from_config(script_name: str, config: Dict[str, Any]) -> None:
     """
     Adapter: Dict config -> argparse args -> main,
