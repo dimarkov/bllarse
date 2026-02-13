@@ -15,9 +15,10 @@ SEEDS = [0]
 # in the same rough regime as IBProbit for each dataset:
 # - cifar10 (C=10): cov_rank=52 -> 552,980 params
 # - cifar100 (C=100): cov_rank=6 -> 819,400 params
+# - cfiar100 (C=100): cov_rank=4 -> 614,600 params
 COV_RANK_BY_DATASET = {
     "cifar10": 52,
-    "cifar100": 6,
+    "cifar100": 4,
 }
 
 # Global defaults for VBLL finetuning
