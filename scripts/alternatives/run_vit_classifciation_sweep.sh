@@ -11,7 +11,7 @@ SEEDS=(137 139 141 143 147 151 153 157 161)
 
 # ── Sweep axes ──
 MODELS=(dinov3_small dinov3_big dinov3_large dinov3_huge deepMLP_big deepMLP_large)
-DATASETS=(cifar10, cifar100, oxford_pets, food101, flowers102, stanford_cars, dtd, imagenet1k)
+DATASETS=(cifar10 cifar100 oxford_pets food101 flowers102 stanford_cars dtd imagenet1k)
 BATCH_SIZES=(512 1024 2048 4096 8192 16384)
 
 # Loss-specific hyperparameters
