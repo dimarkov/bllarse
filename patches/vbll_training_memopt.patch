@@ -1,0 +1,33 @@
+--- a/scripts/vbll_pytorch/src/vbll_experiments/training.py
++++ b/scripts/vbll_pytorch/src/vbll_experiments/training.py
+@@ -133,13 +133,24 @@
+         images = images.to(device)
+         labels = labels.to(device)
+         
+-        optimizer.zero_grad()
++        optimizer.zero_grad(set_to_none=True)
+ 
+-        output = model(images)
+-
+-        # VBLL loss = NLL + KL divergence
+-        # The output object has train_loss_fn() method that computes the ELBO
+-        loss = output.train_loss_fn(labels)
++        # Memory-optimized VBLL training path:
++        # compute ELBO loss directly from backbone features instead of calling
++        # model(images), which also computes predictive samples not needed for
++        # backprop during training.
++        if hasattr(model, "get_features") and hasattr(model, "vbll_head") and hasattr(model.vbll_head, "_get_train_loss_fn"):
++            if tune_mode == "last_layer":
++                with torch.no_grad():
++                    features = model.get_features(images)
++            else:
++                features = model.get_features(images)
++            loss = model.vbll_head._get_train_loss_fn(features)(labels)
++        else:
++            output = model(images)
++            # VBLL loss = NLL + KL divergence
++            # The output object has train_loss_fn() method that computes the ELBO
++            loss = output.train_loss_fn(labels)
+         
+         loss.backward()
+         optimizer.step()

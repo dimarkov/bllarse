@@ -27,6 +27,11 @@ passthrough_vars=(
   MLFLOW_TRACKING_URI
   MLFLOW_EXPERIMENT_NAME
   BLLARSE_REPO_ROOT
+  PYTORCH_ALLOC_CONF
+  PYTORCH_CUDA_ALLOC_CONF
+  CUBLAS_WORKSPACE_CONFIG
+  TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT
+  CUDA_VISIBLE_DEVICES
 )
 for var_name in "${passthrough_vars[@]}"; do
   if [[ -n "${!var_name:-}" ]]; then
