@@ -6,7 +6,12 @@ Usage:
 """
 
 import argparse
+import logging
+import os
+import sys
+
 import mlflow
+from dotenv import load_dotenv
 
 
 def main():
@@ -15,6 +20,12 @@ def main():
     parser.add_argument("--run-name", required=True, help="Name for the parent run")
     args = parser.parse_args()
 
+    load_dotenv()
+
+    # Suppress MLflow's console output so only the run ID goes to stdout
+    logging.getLogger("mlflow").setLevel(logging.WARNING)
+    old_stdout = sys.stdout
+    sys.stdout = sys.stderr
     mlflow.set_experiment(args.experiment_name)
 
     runs = mlflow.search_runs(
@@ -23,12 +34,15 @@ def main():
     )
 
     if runs:
-        print(runs[0].info.run_id)
+        run_id = runs[0].info.run_id
     else:
         run = mlflow.start_run(run_name=args.run_name)
         run_id = run.info.run_id
         mlflow.end_run()
-        print(run_id)
+
+    # Restore stdout and print only the run ID
+    sys.stdout = old_stdout
+    print(run_id)
 
 
 if __name__ == "__main__":
