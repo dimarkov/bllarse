@@ -30,6 +30,7 @@ BASE = dict(
     nodataaug=True,
     parameterization="lowrank",
     vbll_type="discriminative",
+    return_ood=False,
     prior_scale=1.0,
     wishart_scale=0.1,
     device="cuda",

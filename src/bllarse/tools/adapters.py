@@ -14,6 +14,8 @@ def _dict_to_argv(d: Dict[str, Any]) -> List[str]:
         if isinstance(v, bool):
             if v:
                 argv.append(flag)
+            elif k == "return_ood":
+                argv.append("--no-return-ood")
         else:
             argv.extend([flag, str(v)])
     return argv

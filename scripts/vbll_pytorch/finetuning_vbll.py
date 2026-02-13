@@ -105,8 +105,12 @@ def build_argparser():
     parser.add_argument("--vbll-type", default="discriminative", type=str,
                         choices=["discriminative", "generative"],
                         help="VBLL classification type (discriminative or generative)")
-    parser.add_argument("--return-ood", action="store_true", default=True,
-                        help="Compute OOD scores during forward pass")
+    parser.add_argument(
+        "--return-ood",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute OOD scores during forward pass",
+    )
     
     # MLflow logging
     parser.add_argument("--enable-mlflow", "--enable_mlflow", action="store_true",
