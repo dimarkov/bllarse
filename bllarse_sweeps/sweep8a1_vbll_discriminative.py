@@ -7,7 +7,8 @@ from bllarse.tools.adapters import run_vbll_training_from_config
 DATASETS = ["cifar10", "cifar100"]
 PRETRAINED_SOURCES = ["in21k", "in21k_cifar"]
 TUNE_MODES = ["last_layer", "full_network"]
-BATCH_SIZES = [512, 1024, 2048, 4096, 8192, 16384]
+BATCH_SIZES_LAST_LAYER = [512, 1024, 2048, 4096, 8192, 16384]
+BATCH_SIZES_FULL_NETWORK = [512, 1024, 2048, 4096]
 LEARNING_RATES = [1e-4, 1e-3]
 SEEDS = [0]
 
@@ -15,7 +16,7 @@ SEEDS = [0]
 # in the same rough regime as IBProbit for each dataset:
 # - cifar10 (C=10): cov_rank=52 -> 552,980 params
 # - cifar100 (C=100): cov_rank=6 -> 819,400 params
-# - cfiar100 (C=100): cov_rank=4 -> 614,600 params
+# - cifar100 (C=100): cov_rank=4 -> 614,600 params
 COV_RANK_BY_DATASET = {
     "cifar10": 52,
     "cifar100": 4,
@@ -63,34 +64,33 @@ def _mk_cfg(
     return cfg
 
 
+def _batch_sizes_for(dataset: str, tune_mode: str) -> List[int]:
+    if tune_mode == "full_network":
+        return BATCH_SIZES_FULL_NETWORK
+    if dataset == "cifar100":
+        return [bs for bs in BATCH_SIZES_LAST_LAYER if bs <= 8192]
+    return BATCH_SIZES_LAST_LAYER
+
+
 def create_configs() -> List[Dict[str, Any]]:
     configs: List[Dict[str, Any]] = []
 
-    for (
-        dataset,
-        pretrained,
-        tune_mode,
-        batch_size,
-        learning_rate,
-        seed,
-    ) in product(
-        DATASETS,
-        PRETRAINED_SOURCES,
-        TUNE_MODES,
-        BATCH_SIZES,
-        LEARNING_RATES,
-        SEEDS,
-    ):
-        configs.append(
-            _mk_cfg(
-                dataset=dataset,
-                pretrained=pretrained,
-                tune_mode=tune_mode,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                seed=seed,
+    for dataset, pretrained, tune_mode in product(DATASETS, PRETRAINED_SOURCES, TUNE_MODES):
+        for batch_size, learning_rate, seed in product(
+            _batch_sizes_for(dataset, tune_mode),
+            LEARNING_RATES,
+            SEEDS,
+        ):
+            configs.append(
+                _mk_cfg(
+                    dataset=dataset,
+                    pretrained=pretrained,
+                    tune_mode=tune_mode,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    seed=seed,
+                )
             )
-        )
 
     return configs
 
