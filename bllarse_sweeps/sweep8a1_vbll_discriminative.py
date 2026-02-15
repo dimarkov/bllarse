@@ -10,7 +10,7 @@ TUNE_MODES = ["last_layer", "full_network"]
 BATCH_SIZES_LAST_LAYER = [512, 1024, 2048, 4096, 8192, 16384]
 BATCH_SIZES_FULL_NETWORK = [512, 1024, 2048, 4096]
 LEARNING_RATES = [1e-4, 1e-3]
-SEEDS = [0]
+SEEDS = [1, 2, 3, 4]
 
 # For F=1024, these values keep VBLL low-rank head parameter counts
 # in the same rough regime as IBProbit for each dataset:
