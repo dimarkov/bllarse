@@ -47,7 +47,7 @@ def _mk_cfg(
         batch_size=batch_size,
         learning_rate=learning_rate,
         seed=seed,
-        group_id="sweep9_vbll_discriminative_diagonal_fnf_llf_adamw_bs_lr",
+        group_id="sweep9a1_vbll_discriminative_diagonal_fnf_llf_adamw_bs_lr",
     )
     return cfg
 
