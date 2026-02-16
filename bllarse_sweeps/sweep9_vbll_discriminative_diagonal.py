@@ -9,7 +9,7 @@ PRETRAINED_SOURCES = ["in21k", "in21k_cifar"]
 TUNE_MODES = ["last_layer", "full_network"]
 BATCH_SIZES = [512, 1024, 2048, 4096, 8192, 16384]
 LEARNING_RATES = [1e-4, 1e-3]
-SEEDS = [0]
+SEEDS = [0, 1, 2, 3, 4]
 
 # Global defaults for VBLL finetuning
 BASE = dict(
