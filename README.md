@@ -85,7 +85,10 @@ We provide an sbatch wrapper for non-interactive, GPU-accelerated jobs.
 
 ## 🧪 SLURM sweeps (MLflow parent/child runs)
 
-Sweeps are submitted from the **login node** using `run_sweep`, which creates a single MLflow parent run and then launches the SLURM array. Child runs are nested under the parent.
+Sweeps are submitted from the **login node** using `run_sweep`, which launches a SLURM array.
+
+- By default, `run_sweep` creates a single MLflow parent run for that submission and child runs are nested under it.
+- If you pass `--parent-run-id <RUN_ID>`, child runs are attached to that existing parent instead of creating a new one.
 
 ```bash
 source .<venv_name>/bin/activate
@@ -95,8 +98,24 @@ python -m bllarse.tools.run_sweep \
   bllarse_sweeps/llf_demo_sweep.py \
   --venv .<venv_name> \
   --max-concurrent 3 \
+  --cpus-per-task 8 \
   --job-name llf_mlflow_smoke \
   --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
+
+### Attach additional jobs to an existing MLflow parent
+
+Use this when you want multiple sweep submissions (e.g. extra seeds or chunks) grouped under one parent run:
+
+```bash
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/llf_demo_sweep.py \
+  --venv .<venv_name> \
+  --max-concurrent 3 \
+  --cpus-per-task 8 \
+  --job-name llf_mlflow_extra \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh \
+  --parent-run-id <EXISTING_PARENT_RUN_ID>
 ```
 
 ### Large sweeps (>1000 configs)
@@ -107,6 +126,7 @@ Chunk large sweeps with `--index-offset` and `--num-jobs`. This mirrors the `IND
 python -m bllarse.tools.run_sweep bllarse_sweeps/huge_sweep.py \
   --venv .<venv_name> \
   --max-concurrent 50 \
+  --cpus-per-task 8 \
   --job-name huge_part1 \
   --job-script src/slurm/jobs/slurm_run_config_docker.sh \
   --index-offset 0 \
@@ -115,8 +135,18 @@ python -m bllarse.tools.run_sweep bllarse_sweeps/huge_sweep.py \
 python -m bllarse.tools.run_sweep bllarse_sweeps/huge_sweep.py \
   --venv .<venv_name> \
   --max-concurrent 50 \
+  --cpus-per-task 8 \
   --job-name huge_part2 \
   --job-script src/slurm/jobs/slurm_run_config_docker.sh \
   --index-offset 1000 \
   --num-jobs 1000
+```
+
+Tips:
+
+- `--cpus-per-task` is optional, but recommended when data loaders use `num_workers > 0`.
+- Docker shared memory can be tuned with `BLLARSE_DOCKER_SHM_SIZE` (default: `8g`), e.g.:
+
+```bash
+export BLLARSE_DOCKER_SHM_SIZE=16g
 ```
