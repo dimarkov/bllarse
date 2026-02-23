@@ -20,8 +20,10 @@ import os
 import shutil
 import argparse
 import warnings
+
 from itertools import product
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -32,7 +34,11 @@ import optax
 import mlflow
 from huggingface_hub import hf_hub_download, HfApi
 
-from jax import random as jr, config, vmap, image as jimg
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from PIL import Image
+
+from jax import random as jr, config, vmap
 from datasets import load_dataset
 
 try:
@@ -51,14 +57,15 @@ from calibration import evaluate_classification
 
 # Model configurations available in equimo
 EQUIMO_MODELS = {
-    # DINOv2 models (ViT with LayerNorm only)
-    "dinov3_small": {"img_size": 224, "embed_dim": 384},
-    "dinov3_big": {"img_size": 224, "embed_dim": 768},
-    "dinov3_large": {"img_size": 224, "embed_dim": 1024},
-    "dinov3_huge": {"img_size": 224, "embed_dim": 1280},
-    "dinov3_max": {"img_size": 224, "embed_dim": 4096},
-    "deepMLP_big": {"img_size": 64, "embed_dim": 512},
-    "deepMLP_large": {"img_size": 64, "embed_dim": 1024}
+    # DINOv2 models (ViT with LayerNorm only) — expect CHW input
+    "dinov3_small": {"img_size": 224, "embed_dim": 384, "channels_first": True},
+    "dinov3_big": {"img_size": 224, "embed_dim": 768, "channels_first": True},
+    "dinov3_large": {"img_size": 224, "embed_dim": 1024, "channels_first": True},
+    "dinov3_huge": {"img_size": 224, "embed_dim": 1280, "channels_first": True},
+    "dinov3_max": {"img_size": 224, "embed_dim": 4096, "channels_first": True},
+    # DeepMLP models — expect HWC input
+    "deepMLP_big": {"img_size": 64, "embed_dim": 512, "channels_first": False},
+    "deepMLP_large": {"img_size": 64, "embed_dim": 1024, "channels_first": False},
 }
 
 # Dataset configurations
@@ -148,6 +155,8 @@ def get_pretrained_backbone(model_name: str, key):
         return eqx.nn.inference_mode(model, True)
     else:
         model = mlpox_load_model(model_id)
+        # Remove the classification head to get embeddings
+        model = eqx.tree_at(lambda m: m.fc, model, eqx.nn.Identity())
         return eqx.nn.inference_mode(model, True)
 
 
@@ -162,11 +171,24 @@ IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGENET_STD = np.array([0.229, 0.224, 0.225])
 
 
-def iterate_batches(dataset_split, img_key, label_key, batch_size, img_size, mean, std, key=None):
+def _load_and_process(dataset_split, img_key, img_size, idx):
+    """Load, decode, convert and resize a single image by index."""
+    img = dataset_split[int(idx)][img_key]
+    if hasattr(img, "convert"):
+        img = img.convert("RGB")
+    else:
+        img = Image.fromarray(np.asarray(img)).convert("RGB")
+    if img.size != (img_size, img_size):
+        img = img.resize((img_size, img_size), Image.BILINEAR)
+    return np.array(img, dtype=np.float32) / 255.0
+
+
+def iterate_batches(dataset_split, img_key, label_key, batch_size, img_size, mean, std, key=None, channels_first=True, num_workers=8):
     """Yield (images, labels) batches from a HuggingFace dataset split.
 
     If key is provided, shuffles the dataset indices. Otherwise iterates sequentially.
     Images are loaded, converted, resized, and normalized per batch to avoid OOM.
+    Uses a thread pool to parallelize image decode and resize across CPU cores.
     """
     n_samples = len(dataset_split)
 
@@ -176,47 +198,23 @@ def iterate_batches(dataset_split, img_key, label_key, batch_size, img_size, mea
     else:
         indices = np.arange(n_samples)
 
-    for start in range(0, n_samples - batch_size + 1, batch_size):
-        batch_idx = indices[start:start + batch_size]
-        subset = dataset_split.select(batch_idx)
+    worker_fn = partial(_load_and_process, dataset_split, img_key, img_size)
 
-        # Load images
-        images = []
-        for example in subset:
-            img = example[img_key]
-            # Handle PIL images
-            if hasattr(img, "convert"):
-                img = img.convert("RGB")
-                img = jnp.array(img, dtype=np.float32) / 255.0
-            else:
-                img = jnp.array(img, dtype=np.float32)
-                if img.max() > 1.0:
-                    img /= 255.0
-            # Ensure 3 channels (H, W, C)
-            if img.ndim == 2:
-                img = jnp.stack([img] * 3, axis=-1)
-            elif img.shape[-1] == 1:
-                img = jnp.concatenate([img] * 3, axis=-1)
-            elif img.shape[-1] == 4:
-                img = img[..., :3]
-            # Resize to target size (per-image to handle variable sizes)
-            if img.shape[0] != img_size or img.shape[1] != img_size:
-                img = jimg.resize(
-                    jnp.array(img),
-                    (img_size, img_size, 3),
-                    method="bilinear",
-                    antialias=True,
-                )
-            images.append(img)
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        for start in tqdm(range(0, n_samples, batch_size)):
+            batch_idx = indices[start:start + batch_size]
 
-        images = jnp.stack(images)
-        labels = jnp.asarray(subset[label_key])
+            images = list(pool.map(worker_fn, batch_idx))
+            labels = jnp.asarray(dataset_split.select(batch_idx)[label_key])
 
-        # Normalize and convert to channel-first (B, C, H, W)
-        images = (images - mean) / std
-        images = jnp.transpose(images, (0, 3, 1, 2))
+            images = jnp.stack(images)
+            # Normalize
+            images = (images - mean) / std
+            # Convert to channel-first (B, C, H, W) for models that expect it
+            if channels_first:
+                images = jnp.transpose(images, (0, 3, 1, 2))
 
-        yield images, labels
+            yield images, labels
 
 
 def extract_features(model, images, key):
@@ -232,18 +230,33 @@ def extract_features(model, images, key):
     return vmap(single_forward)(images)
 
 
-def precompute_features(model, dataset_split, ds_config, img_size, mean, std, batch_size, key):
+def precompute_features(model, dataset_split, ds_config, img_size, mean, std, batch_size, key, channels_first=True):
     """Extract features for an entire split once; return CPU numpy arrays."""
-    all_features = []
-    all_labels = []
+    n_samples = len(dataset_split)
+    n_full = n_samples
+
+    all_features = None
+    all_labels = None
+    offset = 0
+
     for images, labels in iterate_batches(
         dataset_split, ds_config["img_key"], ds_config["label_key"],
         batch_size=batch_size, img_size=img_size, mean=mean, std=std, key=None,
+        channels_first=channels_first,
     ):
-        features = extract_features(model, images, key)
-        all_features.append(np.asarray(features))
-        all_labels.append(np.asarray(labels))
-    return np.concatenate(all_features), np.concatenate(all_labels)
+        features = np.asarray(extract_features(model, images, key))
+        labels_np = np.asarray(labels)
+
+        if all_features is None:
+            all_features = np.empty((n_full, features.shape[-1]), dtype=features.dtype)
+            all_labels = np.empty(n_full, dtype=labels_np.dtype)
+
+        n = len(features)
+        all_features[offset:offset + n] = features
+        all_labels[offset:offset + n] = labels_np
+        offset += n
+
+    return all_features[:offset], all_labels[:offset]
 
 
 def download_features_from_hf(repo_id, repo_path, local_path):
@@ -275,7 +288,7 @@ def upload_features_to_hf(repo_id, local_path, repo_path):
 
 def load_or_compute_features(
     cache_path, model, dataset_split, ds_config, img_size, mean, std, batch_size, key,
-    hf_repo=None, hf_path=None,
+    hf_repo=None, hf_path=None, channels_first=True,
 ):
     """3-tier feature cache: local file → HF Hub → compute.
 
@@ -296,6 +309,7 @@ def load_or_compute_features(
     # 3. Compute, save locally, upload to HF
     features, labels = precompute_features(
         model, dataset_split, ds_config, img_size, mean, std, batch_size, key,
+        channels_first=channels_first,
     )
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     np.savez(cache_path, features=features, labels=labels)
@@ -310,8 +324,9 @@ def load_or_compute_features(
 def iterate_feature_batches(features, labels, batch_size, key=None):
     """Yield (features, labels) batches from cached CPU numpy arrays."""
     n = len(features)
+    batch_size = min(batch_size, n)
     indices = np.array(jr.permutation(key, n)) if key is not None else np.arange(n)
-    for start in range(0, n - batch_size + 1, batch_size):
+    for start in range(0, n, batch_size):
         batch_idx = indices[start:start + batch_size]
         yield jnp.array(features[batch_idx]), jnp.array(labels[batch_idx])
 
@@ -397,9 +412,10 @@ def main(args):
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
     ds_config = DATASET_CONFIGS[args.dataset]
-    model_config = EQUIMO_MODELS.get(args.model, {"img_size": 224, "embed_dim": 384})
+    model_config = EQUIMO_MODELS.get(args.model, {"img_size": 224, "embed_dim": 384, "channels_first": True})
     img_size = model_config["img_size"]
     embed_dim = model_config["embed_dim"]
+    channels_first = model_config.get("channels_first", True)
     num_classes = ds_config["num_classes"]
 
     key = jr.PRNGKey(args.seed)
@@ -445,11 +461,13 @@ def main(args):
         train_features, train_labels = load_or_compute_features(
             train_cache, backbone, train_split, ds_config, img_size, mean, std,
             max(args.batch_size), feat_key, hf_repo=hf_repo, hf_path=train_hf_path,
+            channels_first=channels_first,
         )
         print("Precomputing test features...")
         test_features, test_labels = load_or_compute_features(
             test_cache, backbone, test_split, ds_config, img_size, mean, std,
             max(args.batch_size), feat_key, hf_repo=hf_repo, hf_path=test_hf_path,
+            channels_first=channels_first,
         )
 
     # --- Build parameter grid ---
@@ -461,6 +479,10 @@ def main(args):
         param_names = ("batch_size", "lr", "weight_decay")
     else:
         raise ValueError(f"Unknown loss function: {args.loss_fn}")
+
+    # Filter out batch sizes larger than the training set
+    n_train = len(train_features)
+    param_grid = [c for c in param_grid if c[0] <= n_train]
 
     n_combos = len(param_grid)
     print(f"\nLoss function: {args.loss_fn}")
