@@ -8,6 +8,7 @@ Usage:
     python scripts/alternatives/precompute_features.py --no-hf-cache  # local-only
 """
 
+import gc
 import os
 import argparse
 from dotenv import load_dotenv
@@ -27,6 +28,7 @@ from vit_classification import (
     IMAGENET_STD,
     get_pretrained_backbone,
     load_or_compute_features,
+    upload_features_to_hf,
 )
 
 
@@ -41,7 +43,7 @@ def main():
         choices=list(DATASET_CONFIGS.keys()), help="Datasets to process (default: all)",
     )
     parser.add_argument("--cache-dir", type=str, default=".cache/features", help="Cache directory")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for feature extraction")
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size for feature extraction")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="gpu", help="Device to use")
     parser.add_argument("--no-cache", action="store_true", help="Force recomputation of all features")
@@ -56,31 +58,31 @@ def main():
     total = len(args.models) * len(args.datasets)
     done = 0
 
-    for model_name in args.models:
-        model_config = EQUIMO_MODELS[model_name]
-        img_size = model_config["img_size"]
+    for dataset_name in args.datasets:
+        ds_config = DATASET_CONFIGS[dataset_name]
 
-        # Load backbone once per model
+        # Determine splits
+        splits = ["train", ds_config["test_split"]]
+        splits = list(dict.fromkeys(splits))
+
+        # Load dataset once per dataset
         print(f"\n{'='*60}")
-        print(f"Loading model: {model_name}")
+        print(f"Loading dataset: {dataset_name}")
         print(f"{'='*60}")
-        key, model_key = jr.split(key)
-        backbone = get_pretrained_backbone(model_name, model_key)
+        ds = load_dataset(ds_config["hf_path"])
+        mean, std = NORM_STATS.get(dataset_name, (IMAGENET_MEAN, IMAGENET_STD))
 
-        for dataset_name in args.datasets:
+        for model_name in args.models:
             done += 1
-            ds_config = DATASET_CONFIGS[dataset_name]
-            print(f"\n[{done}/{total}] {model_name} x {dataset_name}")
+            model_config = EQUIMO_MODELS[model_name]
+            img_size = model_config["img_size"]
+            print(f"\n[{done}/{total}] {dataset_name} x {model_name}")
 
-            # Determine splits
-            splits = ["train", ds_config["test_split"]]
-            splits = list(dict.fromkeys(splits))
+            # Load backbone once per model
+            key, model_key = jr.split(key)
+            backbone = get_pretrained_backbone(model_name, model_key)
 
-            # Load dataset once per dataset
-            print(f"  Loading dataset: {dataset_name}")
-            ds = load_dataset(ds_config["hf_path"])
-            mean, std = NORM_STATS.get(dataset_name, (IMAGENET_MEAN, IMAGENET_STD))
-
+            channels_first = model_config.get("channels_first", True)
             key, feat_key = jr.split(key)
 
             for split in splits:
@@ -92,17 +94,30 @@ def main():
                 if args.no_cache and os.path.exists(cache_path):
                     os.remove(cache_path)
 
-                if os.path.exists(cache_path):
+                if not args.no_cache and os.path.exists(cache_path):
                     data = np.load(cache_path)
                     print(f"  {split}: cached ({data['features'].shape[0]} samples)")
                     continue
 
                 print(f"  {split}: extracting features...")
+                # When forcing recompute, skip HF Hub download but still upload after
+                effective_hf_repo = None if args.no_cache else hf_repo
                 features, labels = load_or_compute_features(
                     cache_path, backbone, ds[split], ds_config, img_size, mean, std,
-                    args.batch_size, feat_key, hf_repo=hf_repo, hf_path=hf_path,
+                    args.batch_size, feat_key,
+                    hf_repo=effective_hf_repo,
+                    hf_path=hf_path,
+                    channels_first=channels_first,
                 )
+                if args.no_cache and hf_repo and hf_path:
+                    upload_features_to_hf(hf_repo, cache_path, hf_path)
                 print(f"  {split}: done ({features.shape[0]} samples, {features.shape[1]}d)")
+
+            del backbone
+            gc.collect()
+
+        del ds
+        gc.collect()
 
     print(f"\nAll done! Features cached in {args.cache_dir}/")
 
