@@ -3,11 +3,10 @@ import optax
 import jax.numpy as jnp
 from jax import nn, vmap, random as jr, lax
 from jax.scipy.stats import norm
-from jax.scipy.linalg import solve
+from jax.scipy.linalg import solve, lu_solve, lu_factor, cho_factor, cho_solve
 from jaxtyping import Array, PRNGKeyArray as PRNGKey
 from typing import Optional, Tuple, Callable
 from functools import partial
-from einops import einsum
 
 const = jnp.sqrt(2 / jnp.pi)
 initializer = nn.initializers.lecun_normal()
@@ -19,13 +18,20 @@ def approx_logcdf(x):
     z = 2 * const * (x + 0.044715 * x ** 3)
     return z - nn.softplus(z)
 
+def mm(a, b, *, preset, dot_dtype):
+    """matmul with explicit cast to dot_dtype and DotAlgorithmPreset."""
+    return jnp.matmul(a.astype(dot_dtype), b.astype(dot_dtype), precision=preset)
+
+mm_outer = partial(mm, preset='F32_F32_F32', dot_dtype=jnp.float32)
+mm_inner = partial(mm, preset='TF32_TF32_F32', dot_dtype=jnp.float32)
+
 class IBProbit(eqx.Module):
     """
     A stateful loss function that implements a Bayesian final layer using
     variational inference for a multinomial probit model.
     """
-    eta: Array  # natural parameter Sigma_inv @ mu
-    Sigma: Array
+    mu: Array
+    L: Array
     use_bias: bool
     cdf: Callable
     logcdf: Callable
@@ -41,8 +47,8 @@ class IBProbit(eqx.Module):
         use_approx_cdf: bool = True
     ):
 
-        self.eta = initializer(key, (input_dim + int(use_bias), num_classes), jnp.float32)
-        self.Sigma = jnp.eye(input_dim + int(use_bias))
+        self.mu = initializer(key, (input_dim + int(use_bias), num_classes), jnp.float32)
+        self.L = jnp.eye(input_dim + int(use_bias), dtype=jnp.float32)
         self.use_bias = use_bias
         self.cdf = approx_cdf if use_approx_cdf else norm.cdf
         self.logcdf = approx_logcdf if use_approx_cdf else norm.logcdf
@@ -50,51 +56,60 @@ class IBProbit(eqx.Module):
 
     def reset(self, key: PRNGKey) -> "IBProbit":
         d, num_classes = self.eta.shape
-        eta = initializer(key, (d, num_classes), jnp.float32)
-        Sigma = jnp.eye(d)
-        return eqx.tree_at(lambda x: (x.eta, x.Sigma), self, (eta, Sigma))
+        mu = initializer(key, (d, num_classes), jnp.float32)
+        L = jnp.eye(d, dtype=jnp.float32)
+        return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu, L))
 
     def update(self, features: Array, y: Array, *, num_iters: int = 32) -> "IBProbit":
-        fts = vmap(self.norm)(features)
+        fts = vmap(self.norm)(features.astype(jnp.float32))
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
 
-        xxT = jnp.matmul(fts.T, fts, precision=lax.Precision.HIGHEST)
-        Sigma_new = solve(jnp.eye(fts.shape[-1]) + jnp.matmul(self.Sigma, xxT, precision=lax.Precision.HIGHEST), self.Sigma)
-        y_one_hot = nn.one_hot(y, self.eta.shape[-1])
+        # it does not work with 'TF32_TF32_F32' with large batches on imagenet1k
+        xxT = mm_outer(fts.T, fts)
+
+        Lambda_old = mm_outer(self.L, self.L.T)
+        eta_old = mm_outer(Lambda_old, self.mu)
+        Lambda_new = Lambda_old + xxT
+
+        L_new, lower = cho_factor(Lambda_new, lower=True)
+        y_one_hot = nn.one_hot(y, self.mu.shape[-1])
         
-        x = jnp.matmul(fts, Sigma_new, precision=lax.Precision.HIGHEST)
+        x = cho_solve((L_new, lower), fts.T).T
 
-        def step_fn(carry, *args):
+        def step_fn(eta_carry, *args):
             # One step of Coordinate Ascent Variational Inference (CAVI) for the probit model.
-            eta = carry
 
-            pred = jnp.matmul(x, eta, precision=lax.Precision.HIGHEST)
+            pred = mm_inner(x, eta_carry)
 
             # Compute E_q[z_ik]
-            Phi = self.cdf(-pred)
-            E_q_z = pred + norm.pdf(-pred) * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
+            Phi = self.cdf(- pred)
+            E_q_z = pred + norm.pdf(- pred) * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
             
             # Update variational mean
-            eta = self.eta + jnp.matmul(fts.T, E_q_z, precision=lax.Precision.HIGHEST)
-            return eta, None
+            eta_carry = eta_old + mm_inner(fts.T, E_q_z)
+            return eta_carry, None
 
-        eta_new, _ = lax.scan(step_fn, self.eta, jnp.arange(num_iters))
+        eta_new, _ = lax.scan(step_fn, eta_old, jnp.arange(num_iters))
 
-        return eqx.tree_at(lambda x: (x.eta, x.Sigma), self, (eta_new, Sigma_new))
+        mu_new = cho_solve((L_new, lower), eta_new)
+
+        return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu_new, L_new))
     
     @property
     def params(self) -> Tuple[Array, Array]:
-        params = jnp.matmul(self.Sigma, self.eta, precision=lax.Precision.HIGHEST)
+        params = self.mu
         return (params[:-1], params[-1]) if self.use_bias else (params, None)
 
     def __call__(self, features: Array, y: Array, *, with_logits: bool = False, loss_type: int = 3) -> Tuple[Array, Optional[Array]]:
         weights, bias = self.params
 
         y_one_hot = nn.one_hot(y, weights.shape[-1])
-        fts = vmap(self.norm)(features)
+        fts = vmap(self.norm)(features.astype(jnp.float32))
 
         # compute loss
-        logits = fts @ weights + bias if self.use_bias else fts @ weights
+        logits = mm_inner(fts, weights)
+        if self.use_bias:
+            logits = logits + bias
 
         # note: computation of loss is relevant for gradients over model parameters
         if loss_type == 0:
