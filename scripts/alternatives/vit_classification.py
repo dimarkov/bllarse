@@ -326,7 +326,7 @@ def iterate_feature_batches(features, labels, batch_size, key=None):
     n = len(features)
     batch_size = min(batch_size, n)
     indices = np.array(jr.permutation(key, n)) if key is not None else np.arange(n)
-    for start in range(0, n, batch_size):
+    for start in tqdm(range(0, n, batch_size)):
         batch_idx = indices[start:start + batch_size]
         yield jnp.array(features[batch_idx]), jnp.array(labels[batch_idx])
 
@@ -488,29 +488,34 @@ def main(args):
     print(f"\nLoss function: {args.loss_fn}")
     print(f"Embedding dim: {embed_dim}, Classes: {num_classes}")
     print(f"Parameter combinations: {n_combos}")
-
-    # --- MLflow experiment setup ---
-    mlflow.set_experiment(args.experiment_name)
+    
+    log_mlfow = args.log_mlflow
+    if log_mlfow:
+        # --- MLflow experiment setup ---
+        mlflow.set_experiment(args.experiment_name)
 
     # --- Sweep over parameter combinations ---
     for combo_idx, combo in enumerate(param_grid):
         params = dict(zip(param_names, combo))
         batch_size = params["batch_size"]
 
-        tags = {}
-        if args.run_id:
-            tags["mlflow.parentRunId"] = args.run_id
 
-        mlflow.start_run(tags=tags)
-        mlflow.log_params({
-            "model": args.model,
-            "dataset": args.dataset,
-            "loss_fn": args.loss_fn,
-            "epochs": args.epochs,
-            "label_smooth": args.label_smooth,
-            "seed": args.seed,
-            **params,
-        })
+
+        if log_mlfow:
+            tags = {}
+            if args.run_id:
+                tags["mlflow.parentRunId"] = args.run_id
+
+            mlflow.start_run(tags=tags)
+            mlflow.log_params({
+                "model": args.model,
+                "dataset": args.dataset,
+                "loss_fn": args.loss_fn,
+                "epochs": args.epochs,
+                "label_smooth": args.label_smooth,
+                "seed": args.seed,
+                **params,
+            })
 
         print(f"\n{'='*60}")
         print(f"[{combo_idx + 1}/{n_combos}] {params}")
@@ -557,22 +562,33 @@ def main(args):
                 optimizer=optimizer,
             )
 
-            acc, ece, nll = evaluate_model(
-                loss_fn, test_features, test_labels, batch_size,
-                loss_type=3, head=head
-            )
+            if args.loss_fn == "IBProbit":
+                for loss_type in [1, 2, 3]:
+                    acc, ece, nll = evaluate_model(
+                        loss_fn, test_features, test_labels, batch_size,
+                        loss_type=loss_type, head=head
+                    )
 
-            print(f"Epoch {epoch + 1}/{args.epochs}: loss={train_loss:.4f}, acc={acc:.4f}, ece={ece:.4f}, nll={nll:.4f}")
+                    print(f"Loss Type {loss_type}: loss={train_loss:.4f}, acc={acc:.4f}, ece={ece:.4f}, nll={nll:.4f}")
+            else:
+                acc, ece, nll = evaluate_model(
+                        loss_fn, test_features, test_labels, batch_size,
+                        loss_type=loss_type, head=head
+                    )
 
-            mlflow.log_metrics({
-                "epoch": epoch + 1,
-                "train_loss": float(train_loss),
-                "test_acc": float(acc),
-                "test_ece": float(ece),
-                "test_nll": float(nll),
-            }, step=epoch + 1)
+                print(f"Epoch {epoch + 1}/{args.epochs}: loss={train_loss:.4f}, acc={acc:.4f}, ece={ece:.4f}, nll={nll:.4f}")
 
-        mlflow.end_run()
+            if log_mlfow:
+                mlflow.log_metrics({
+                    "epoch": epoch + 1,
+                    "train_loss": float(train_loss),
+                    "test_acc": float(acc),
+                    "test_ece": float(ece),
+                    "test_nll": float(nll),
+                }, step=epoch + 1)
+
+        if log_mlfow:
+            mlflow.end_run()
 
     print("\nAll runs complete!")
 
@@ -601,7 +617,7 @@ def build_argparser():
         choices=["IBProbit", "CrossEntropy"],
         help="Loss function"
     )
-    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, nargs="+", default=[64], help="Batch size(s)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num-update-iters", type=int, nargs="+", default=[16], help="CAVI iterations per batch (IBProbit)")
@@ -615,6 +631,7 @@ def build_argparser():
     parser.add_argument("--no-cache", action="store_true", help="Force recomputation of features")
     parser.add_argument("--hf-repo", type=str, default="dimarkov/bllarse-features", help="HF dataset repo for feature cache")
     parser.add_argument("--no-hf-cache", action="store_true", help="Disable HF Hub caching (local-only)")
+    parser.add_argument("--log-mlflow", action="store_true", help="Disable MLFlow logging")
 
     return parser
 

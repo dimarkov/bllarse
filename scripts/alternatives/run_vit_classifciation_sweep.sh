@@ -11,7 +11,7 @@ SEEDS=(137 139 141 143 147)
 
 # ── Sweep axes ──
 MODELS=(dinov3_small dinov3_big dinov3_large dinov3_huge deepMLP_big deepMLP_large)
-DATASETS=(cifar10 cifar100 oxford_pets food101 flowers102 stanford_cars dtd) # imagenet1k
+DATASETS=(cifar10 cifar100 oxford_pets food101 flowers102 stanford_cars dtd imagenet1k)
 BATCH_SIZES=(512 1024 2048 4096 8192 16384)
 
 # Loss-specific hyperparameters
@@ -36,7 +36,8 @@ for seed in "${SEEDS[@]}"; do
             --run-id "$PARENT_RUN_ID" \
             --epochs "$EPOCHS" --seed "$seed" \
             --batch-size "${BATCH_SIZES[@]}" \
-            --num-update-iters "${IBPROBIT_NUM_UPDATE_ITERS[@]}"
+            --num-update-iters "${IBPROBIT_NUM_UPDATE_ITERS[@]}" \
+            --log-mlflow
 
     elif [[ "$LOSS_FN" == "CrossEntropy" ]]; then
         echo "Running: $model / $dataset / seed=$seed (CrossEntropy sweep)"
@@ -46,7 +47,8 @@ for seed in "${SEEDS[@]}"; do
             --epochs "$EPOCHS" --seed "$seed" \
             --batch-size "${BATCH_SIZES[@]}" \
             --lr "${CE_LRS[@]}" \
-            --weight-decay "${CE_WEIGHT_DECAYS[@]}"
+            --weight-decay "${CE_WEIGHT_DECAYS[@]}" \
+            --log-mlflow
 
     else
         echo "Unknown loss function: $LOSS_FN"
