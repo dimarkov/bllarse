@@ -562,21 +562,12 @@ def main(args):
                 optimizer=optimizer,
             )
 
-            if args.loss_fn == "IBProbit":
-                for loss_type in [1, 2, 3]:
-                    acc, ece, nll = evaluate_model(
-                        loss_fn, test_features, test_labels, batch_size,
-                        loss_type=loss_type, head=head
-                    )
+            acc, ece, nll = evaluate_model(
+                    loss_fn, test_features, test_labels, batch_size,
+                    loss_type=3, head=head
+                )
 
-                    print(f"Loss Type {loss_type}: loss={train_loss:.4f}, acc={acc:.4f}, ece={ece:.4f}, nll={nll:.4f}")
-            else:
-                acc, ece, nll = evaluate_model(
-                        loss_fn, test_features, test_labels, batch_size,
-                        loss_type=loss_type, head=head
-                    )
-
-                print(f"Epoch {epoch + 1}/{args.epochs}: loss={train_loss:.4f}, acc={acc:.4f}, ece={ece:.4f}, nll={nll:.4f}")
+            print(f"Epoch {epoch + 1}/{args.epochs}: loss={train_loss:.4f}, acc={acc:.4f}, ece={ece:.4f}, nll={nll:.4f}")
 
             if log_mlfow:
                 mlflow.log_metrics({
