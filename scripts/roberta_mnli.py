@@ -18,12 +18,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import equinox as eqx
 from jax import nn, random as jr
 from tensorflow_probability.substrates.jax.stats import (
     expected_calibration_error as compute_ece,
 )
 
-from bllarse.losses import IBProbit
+from bllarse.losses import CrossEntropy, IBProbit
 
 try:
     import mlflow
@@ -80,13 +81,17 @@ def compute_metrics_from_logits(
     logits: jnp.ndarray,
     labels: jnp.ndarray,
     *,
+    losses: jnp.ndarray | None = None,
     num_bins: int = 20,
 ) -> Dict[str, float]:
     logits = jnp.asarray(logits, dtype=jnp.float32)
     labels = jnp.asarray(labels, dtype=jnp.int32)
     preds = jnp.argmax(logits, axis=-1)
-    one_hot = nn.one_hot(labels, logits.shape[-1])
-    nll = optax.softmax_cross_entropy(logits, one_hot).mean()
+    if losses is None:
+        one_hot = nn.one_hot(labels, logits.shape[-1])
+        nll = optax.softmax_cross_entropy(logits, one_hot).mean()
+    else:
+        nll = jnp.asarray(losses, dtype=jnp.float32).mean()
     acc = jnp.mean(preds == labels)
     ece = compute_ece(
         num_bins,
@@ -398,39 +403,57 @@ def _truncate_samples(
     return out
 
 
-def _linear_logits(
+def _evaluate_linear_head(
     params: Dict[str, jnp.ndarray],
     features: np.ndarray,
+    labels: np.ndarray,
     *,
     batch_size: int,
-) -> jnp.ndarray:
-    logits_chunks = []
-    for start in range(0, features.shape[0], batch_size):
-        end = min(start + batch_size, features.shape[0])
+) -> Dict[str, float]:
+    num_classes = params["b"].shape[0]
+    loss_fn = CrossEntropy(alpha=0.0, num_classes=int(num_classes))
+    logits_chunks: list[jnp.ndarray] = []
+    loss_chunks: list[jnp.ndarray] = []
+
+    for start in range(0, labels.shape[0], batch_size):
+        end = min(start + batch_size, labels.shape[0])
         x = jnp.asarray(features[start:end], dtype=jnp.float32)
-        logits_chunks.append(x @ params["w"] + params["b"])
-    return jnp.concatenate(logits_chunks, axis=0)
+        y = jnp.asarray(labels[start:end], dtype=jnp.int32)
+        logits = x @ params["w"] + params["b"]
+        loss, logits = loss_fn(logits, y, with_logits=True)
+        logits_chunks.append(logits)
+        loss_chunks.append(loss)
+
+    logits_all = jnp.concatenate(logits_chunks, axis=0)
+    losses_all = jnp.concatenate(loss_chunks, axis=0)
+    return compute_metrics_from_logits(logits_all, jnp.asarray(labels), losses=losses_all)
 
 
-def _ibprobit_logits(
+def _evaluate_ibprobit_head(
     model: IBProbit,
     features: np.ndarray,
     labels: np.ndarray,
     *,
     batch_size: int,
-) -> jnp.ndarray:
-    @jax.jit
-    def _predict(m: IBProbit, x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-        _, logits = m(x, y, with_logits=True, loss_type=3)
-        return logits
+) -> Dict[str, float]:
+    @eqx.filter_jit
+    def _eval_batch(m: IBProbit, x: jnp.ndarray, y: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        return m(x, y, with_logits=True, loss_type=3)
 
-    logits_chunks = []
-    for start in range(0, features.shape[0], batch_size):
-        end = min(start + batch_size, features.shape[0])
+    logits_chunks: list[jnp.ndarray] = []
+    loss_chunks: list[jnp.ndarray] = []
+
+    for start in range(0, labels.shape[0], batch_size):
+        end = min(start + batch_size, labels.shape[0])
         x = jnp.asarray(features[start:end], dtype=jnp.float32)
         y = jnp.asarray(labels[start:end], dtype=jnp.int32)
-        logits_chunks.append(_predict(model, x, y))
-    return jnp.concatenate(logits_chunks, axis=0)
+        loss, logits = _eval_batch(model, x, y)
+        logits_chunks.append(logits)
+        loss_chunks.append(loss)
+
+    logits_all = jnp.concatenate(logits_chunks, axis=0)
+    losses_all = jnp.concatenate(loss_chunks, axis=0)
+    return compute_metrics_from_logits(logits_all, jnp.asarray(labels), losses=losses_all)
 
 
 def _train_linear_head(
@@ -438,6 +461,10 @@ def _train_linear_head(
     optimizer_name: str,
     x_train: np.ndarray,
     y_train: np.ndarray,
+    x_val_m: np.ndarray,
+    y_val_m: np.ndarray,
+    x_val_mm: np.ndarray,
+    y_val_mm: np.ndarray,
     batch_size: int,
     epochs: int,
     learning_rate: float,
@@ -481,6 +508,7 @@ def _train_linear_head(
     rng = np.random.default_rng(seed)
     opt_state = optimizer.init(params)
     epoch_losses: list[float] = []
+    history: list[Dict[str, float]] = []
     n = y_train.shape[0]
 
     for _ in range(epochs):
@@ -493,10 +521,36 @@ def _train_linear_head(
             y_batch = jnp.asarray(y_train[idx], dtype=jnp.int32)
             params, opt_state, batch_loss = _step(params, opt_state, x_batch, y_batch)
             batch_losses.append(float(batch_loss))
-        epoch_losses.append(float(np.mean(batch_losses)))
+        epoch_train_loss = float(np.mean(batch_losses))
+        epoch_losses.append(epoch_train_loss)
+
+        metrics_m = _evaluate_linear_head(
+            params,
+            x_val_m,
+            y_val_m,
+            batch_size=batch_size,
+        )
+        metrics_mm = _evaluate_linear_head(
+            params,
+            x_val_mm,
+            y_val_mm,
+            batch_size=batch_size,
+        )
+        history.append(
+            {
+                "loss": epoch_train_loss,
+                "val_matched_acc": metrics_m["acc"],
+                "val_matched_nll": metrics_m["nll"],
+                "val_matched_ece": metrics_m["ece"],
+                "val_mismatched_acc": metrics_mm["acc"],
+                "val_mismatched_nll": metrics_mm["nll"],
+                "val_mismatched_ece": metrics_mm["ece"],
+            }
+        )
 
     training_info = {
         "epoch_losses": epoch_losses,
+        "history": history,
     }
     return params, training_info
 
@@ -505,6 +559,10 @@ def _train_ibprobit_head(
     *,
     x_train: np.ndarray,
     y_train: np.ndarray,
+    x_val_m: np.ndarray,
+    y_val_m: np.ndarray,
+    x_val_mm: np.ndarray,
+    y_val_mm: np.ndarray,
     batch_size: int,
     epochs: int,
     num_update_iters: int,
@@ -520,31 +578,57 @@ def _train_ibprobit_head(
     key, init_key = jr.split(key)
     model = IBProbit(num_features, num_classes, key=init_key)
 
-    @jax.jit
+    @eqx.filter_jit
     def _cavi_step(m: IBProbit, x: jnp.ndarray, y: jnp.ndarray) -> IBProbit:
         return m.update(x, y, num_iters=num_update_iters)
 
     rng = np.random.default_rng(seed)
     n = y_train.shape[0]
     epoch_losses: list[float] = []
+    history: list[Dict[str, float]] = []
 
     for _ in range(epochs):
         perm = rng.permutation(n)
+        batch_losses: list[float] = []
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
             idx = perm[start:end]
             x_batch = jnp.asarray(x_train[idx], dtype=jnp.float32)
             y_batch = jnp.asarray(y_train[idx], dtype=jnp.int32)
             model = _cavi_step(model, x_batch, y_batch)
+            batch_loss = jnp.mean(model(x_batch, y_batch, loss_type=3))
+            batch_losses.append(float(batch_loss))
 
-        probe_idx = perm[: min(batch_size, n)]
-        x_probe = jnp.asarray(x_train[probe_idx], dtype=jnp.float32)
-        y_probe = jnp.asarray(y_train[probe_idx], dtype=jnp.int32)
-        epoch_loss = jnp.mean(model(x_probe, y_probe, loss_type=3))
-        epoch_losses.append(float(epoch_loss))
+        epoch_train_loss = float(np.mean(batch_losses))
+        epoch_losses.append(epoch_train_loss)
+
+        metrics_m = _evaluate_ibprobit_head(
+            model,
+            x_val_m,
+            y_val_m,
+            batch_size=batch_size,
+        )
+        metrics_mm = _evaluate_ibprobit_head(
+            model,
+            x_val_mm,
+            y_val_mm,
+            batch_size=batch_size,
+        )
+        history.append(
+            {
+                "loss": epoch_train_loss,
+                "val_matched_acc": metrics_m["acc"],
+                "val_matched_nll": metrics_m["nll"],
+                "val_matched_ece": metrics_m["ece"],
+                "val_mismatched_acc": metrics_mm["acc"],
+                "val_mismatched_nll": metrics_mm["nll"],
+                "val_mismatched_ece": metrics_mm["ece"],
+            }
+        )
 
     training_info = {
         "epoch_losses": epoch_losses,
+        "history": history,
     }
     return model, training_info
 
@@ -572,40 +656,36 @@ def _train_and_evaluate(
             optimizer_name=optimizer_name,
             x_train=x_train,
             y_train=y_train,
+            x_val_m=x_val_m,
+            y_val_m=y_val_m,
+            x_val_mm=x_val_mm,
+            y_val_mm=y_val_mm,
             batch_size=train_batch_size,
             epochs=epochs,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             seed=seed,
         )
-        logits_m = _linear_logits(params, x_val_m, batch_size=train_batch_size)
-        logits_mm = _linear_logits(params, x_val_mm, batch_size=train_batch_size)
+        metrics_m = _evaluate_linear_head(params, x_val_m, y_val_m, batch_size=train_batch_size)
+        metrics_mm = _evaluate_linear_head(params, x_val_mm, y_val_mm, batch_size=train_batch_size)
     elif optimizer_name == "cavi":
         model, training_info = _train_ibprobit_head(
             x_train=x_train,
             y_train=y_train,
+            x_val_m=x_val_m,
+            y_val_m=y_val_m,
+            x_val_mm=x_val_mm,
+            y_val_mm=y_val_mm,
             batch_size=train_batch_size,
             epochs=epochs,
             num_update_iters=num_update_iters,
             seed=seed,
         )
-        logits_m = _ibprobit_logits(
-            model,
-            x_val_m,
-            y_val_m,
-            batch_size=train_batch_size,
-        )
-        logits_mm = _ibprobit_logits(
-            model,
-            x_val_mm,
-            y_val_mm,
-            batch_size=train_batch_size,
-        )
+        metrics_m = _evaluate_ibprobit_head(model, x_val_m, y_val_m, batch_size=train_batch_size)
+        metrics_mm = _evaluate_ibprobit_head(model, x_val_mm, y_val_mm, batch_size=train_batch_size)
     else:
         raise ValueError(f"Unknown optimizer '{optimizer_name}'.")
 
-    metrics_m = compute_metrics_from_logits(logits_m, jnp.asarray(y_val_m))
-    metrics_mm = compute_metrics_from_logits(logits_mm, jnp.asarray(y_val_mm))
     return {
         "matched": metrics_m,
         "mismatched": metrics_mm,
@@ -872,18 +952,25 @@ def main(args) -> None:
             print(f"[bllarse] cache metadata rows={metadata.get('rows', {})}")
 
         if mlflow_enabled:
-            mlflow.log_metrics(
-                {
-                    "val_matched_acc": metrics_m["acc"],
-                    "val_matched_nll": metrics_m["nll"],
-                    "val_matched_ece": metrics_m["ece"],
-                    "val_mismatched_acc": metrics_mm["acc"],
-                    "val_mismatched_nll": metrics_mm["nll"],
-                    "val_mismatched_ece": metrics_mm["ece"],
-                }
-            )
-            for epoch_idx, epoch_loss in enumerate(results["training"]["epoch_losses"], start=1):
-                mlflow.log_metrics({"train_epoch_loss": float(epoch_loss)}, step=epoch_idx)
+            history = results["training"].get("history", [])
+            for epoch_idx, row in enumerate(history, start=1):
+                mlflow.log_metrics(
+                    {
+                        # Keep canonical keys aligned with finetuning/run_training for primary split.
+                        "loss": float(row["loss"]),
+                        "acc": float(row["val_matched_acc"]),
+                        "nll": float(row["val_matched_nll"]),
+                        "ece": float(row["val_matched_ece"]),
+                        # Also log mismatched split explicitly.
+                        "val_matched_acc": float(row["val_matched_acc"]),
+                        "val_matched_nll": float(row["val_matched_nll"]),
+                        "val_matched_ece": float(row["val_matched_ece"]),
+                        "val_mismatched_acc": float(row["val_mismatched_acc"]),
+                        "val_mismatched_nll": float(row["val_mismatched_nll"]),
+                        "val_mismatched_ece": float(row["val_mismatched_ece"]),
+                    },
+                    step=epoch_idx,
+                )
 
 
 if __name__ == "__main__":
