@@ -3,7 +3,7 @@ import optax
 import jax.numpy as jnp
 from jax import nn, vmap, random as jr, lax
 from jax.scipy.stats import norm
-from jax.scipy.linalg import solve, lu_solve, lu_factor, cho_factor, cho_solve
+from jax.scipy.linalg import solve, lu_solve, lu_factor, cho_factor, cho_solve, solve_triangular
 from jaxtyping import Array, PRNGKeyArray as PRNGKey
 from typing import Optional, Tuple, Callable
 from functools import partial
@@ -145,6 +145,7 @@ class MultinomialPolyaGamma(eqx.Module):
 
     mu: Array
     Sigma: Array
+    L: Array
     use_bias: bool
 
     def __init__(
@@ -161,13 +162,15 @@ class MultinomialPolyaGamma(eqx.Module):
         k = num_classes - 1
         self.mu = jr.normal(key, (d, k)) * 1e-3
         self.Sigma = jnp.eye(d)[None].repeat(k, axis=0)
+        self.L = jnp.eye(d)[None].repeat(k, axis=0)
 
     def reset(self, key: PRNGKey) -> "MultinomialPolyaGamma":
         d, k = self.mu.shape
         mu = jr.normal(key, (d, k)) * 1e-3
         Sigma = jnp.eye(d)[None].repeat(k, axis=0)
+        L = jnp.eye(d)[None].repeat(k, axis=0)
 
-        return eqx.tree_at(lambda x: (x.mu, x.Sigma), self, (mu, Sigma))
+        return eqx.tree_at(lambda x: (x.mu, x.Sigma, x.L), self, (mu, Sigma, L))
 
     def __get_b_ky(self):
         nc = self.mu.shape[-1] + 1
@@ -183,38 +186,46 @@ class MultinomialPolyaGamma(eqx.Module):
     def update(self, features: Array, y: Array, *, num_iters: int = 32) -> "MultinomialPolyaGamma":
 
         x = jnp.pad(lax.stop_gradient(features), [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
-        xxT = jnp.expand_dims(x[..., None, :] * x[..., None], -3)
         b, kappa = self.get_b_kappa(y)
 
-        # get first nat parameter for beta posterior
-        lam = jnp.expand_dims(jnp.sum(x[..., None, :] * kappa[..., None], axis=0), -1)
+        # prior precision Lambda_0 = Sigma^{-1}, and its Cholesky
+        Lambda_0 = solve(self.Sigma, jnp.broadcast_to(jnp.eye(x.shape[-1]), self.Sigma.shape), assume_a='pos')
 
-        def step_fn(carry, _):
+        # first natural parameter for beta posterior
+        lam = jnp.einsum('nd,nk->kd', x, kappa)[..., None]
 
-            mu, Sigma = carry
+        K = self.mu.shape[-1]
+        x_broad = jnp.broadcast_to(x.T, (K, x.shape[-1], x.shape[0]))  # K×D×N
 
-            E_betabetaT = Sigma + mu[..., None, :] * mu[..., None]
-            psi = jnp.sqrt(jnp.sum(E_betabetaT * xxT, axis=(-1, -2)))
+        def step_fn(L, _):
+            v = solve_triangular(L, x_broad, lower=True)       # K×D×N
+            omega = solve_triangular(L, lam, lower=True)        # K×D×1
+
+            xSx = (v * v).sum(-2)                               # K×N
+            xmu = (v * omega).sum(-2)                            # K×N
+            psi = jnp.sqrt(xSx + xmu ** 2).T                    # N×K
 
             rho = 0.5 * b * jnp.tanh(psi / 2) / (psi + 1e-8)
-            F = jnp.sum(rho[..., None, None] * xxT, axis=0)
-            tmp = jnp.eye(x.shape[-1]) + self.Sigma @ F 
-            Sigma_new = lu_solve(lu_factor(tmp), self.Sigma)
-            mu_new = (Sigma_new @ lam).squeeze(-1)
+            F = jnp.einsum('nk,nd,ne->kde', rho, x, x)
+            L_new = jnp.linalg.cholesky(Lambda_0 + F)
+            return L_new, None
 
-            return (mu_new, Sigma_new), None
+        L_init = self.L
+        L_final, _ = lax.scan(step_fn, L_init, jnp.arange(num_iters))
 
-        init = (self.mu.mT, self.Sigma)
-        (mu_trans, Sigma), _ = lax.scan(step_fn, init, jnp.arange(num_iters))
+        # Recover mu and Sigma from final Cholesky factor
+        I_broad = jnp.broadcast_to(jnp.eye(x.shape[-1]), self.Sigma.shape)
+        mu_new = cho_solve((L_final, True), lam).squeeze(-1).T
+        Sigma_new = cho_solve((L_final, True), I_broad)
 
-        return eqx.tree_at(lambda x: (x.mu, x.Sigma), self, (mu_trans.mT, Sigma))
+        return eqx.tree_at(lambda x: (x.mu, x.Sigma, x.L), self, (mu_new, Sigma_new, L_final))
 
     def __call__(self, features: Array, y: Array, *, with_logits: bool = False, loss_type: int = 0):
 
         x = jnp.pad(features, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
         logits = x @ self.mu
         b_ky = self.__get_b_ky().mT
-        
+
         if loss_type == 0:
             logits = jnp.pad(logits, [(0, 0), (0, 1)]) - nn.softplus(logits) @ b_ky
             loss = - jnp.sum(logits * nn.one_hot(y, self.mu.shape[-1] + 1), -1)
@@ -223,11 +234,9 @@ class MultinomialPolyaGamma(eqx.Module):
         elif loss_type == 1:
             params = self.mu.mT
             E_betabetaT = self.Sigma + params[:, None, :] * params[..., None]
-            
-            xxT = jnp.expand_dims(x[..., None, :] * x[..., None], -3)
-            psi = jnp.sqrt(
-                jnp.sum(E_betabetaT * xxT, axis=(-1, -2))
-            )
+
+            temp = jnp.einsum('nd,kde->nke', x, E_betabetaT)
+            psi = jnp.sqrt(jnp.einsum('nke,ne->nk', temp, x))
 
             if with_logits:
                 logits = jnp.pad(logits, [(0, 0), (0, 1)]) + ((psi - logits) / 2  - nn.softplus(psi)) @ b_ky
@@ -243,6 +252,7 @@ class IBPolyaGamma(eqx.Module):
 
     mu: Array
     Sigma: Array
+    L: Array
     use_bias: bool
 
     def __init__(
@@ -258,13 +268,15 @@ class IBPolyaGamma(eqx.Module):
         d = input_dim + int(use_bias)
         self.mu = jr.normal(key, (d, num_classes)) * 1e-3
         self.Sigma = jnp.eye(d)[None].repeat(num_classes, axis=0)
+        self.L = jnp.eye(d)[None].repeat(num_classes, axis=0)
 
     def reset(self, key: PRNGKey) -> "IBPolyaGamma":
         d, k = self.mu.shape
         mu = jr.normal(key, (d, k)) * 1e-3
         Sigma = jnp.eye(d)[None].repeat(k, axis=0)
+        L = jnp.eye(d)[None].repeat(k, axis=0)
 
-        return eqx.tree_at(lambda x: (x.mu, x.Sigma), self, (mu, Sigma))
+        return eqx.tree_at(lambda x: (x.mu, x.Sigma, x.L), self, (mu, Sigma, L))
 
     def get_kappa(self, y: Array):
         return nn.one_hot(y, self.mu.shape[-1]) - 0.5
@@ -272,34 +284,39 @@ class IBPolyaGamma(eqx.Module):
     def update(self, features: Array, y: Array, *, num_iters: int = 32) -> "IBPolyaGamma":
 
         x = jnp.pad(lax.stop_gradient(features), [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
-        xxT = jnp.expand_dims(x[..., None, :] * x[..., None], -3)
-        # b is always 1 for binary case
         kappa = self.get_kappa(y)
 
-        # get first nat parameter for beta posterior
+        # prior precision Lambda_0 = Sigma^{-1}, and its Cholesky
+        Lambda_0 = solve(self.Sigma, jnp.broadcast_to(jnp.eye(x.shape[-1]), self.Sigma.shape), assume_a='pos')
+
+        # first natural parameter: eta_0 + X^T kappa
         eta = solve(self.Sigma, self.mu.T[..., None], assume_a='pos')
-        lam = jnp.expand_dims(jnp.sum(x[..., None, :] * kappa[..., None], axis=0), -1) + eta
+        lam = jnp.einsum('nd,nk->kd', x, kappa)[..., None] + eta
 
-        def step_fn(carry, _):
+        x_broad = jnp.broadcast_to(x.T, (self.mu.shape[-1], x.shape[-1], x.shape[0]))  # K×D×N
 
-            mu, Sigma = carry
+        def step_fn(L, _):
+            v = solve_triangular(L, x_broad, lower=True)       # K×D×N
+            omega = solve_triangular(L, lam, lower=True)        # K×D×1
 
-            E_betabetaT = Sigma + mu[..., None, :] * mu[..., None]
-            psi = jnp.sqrt(jnp.sum(E_betabetaT * xxT, axis=(-1, -2)))
+            xSx = (v * v).sum(-2)                               # K×N
+            xmu = (v * omega).sum(-2)                            # K×N
+            psi = jnp.sqrt(xSx + xmu ** 2).T                    # N×K
 
-            # as b is one always we do not need it here
             rho = 0.5 * jnp.tanh(psi / 2) / (psi + 1e-8)
-            F = jnp.sum(rho[..., None, None] * xxT, axis=0)
-            tmp = jnp.eye(x.shape[-1]) + self.Sigma @ F 
-            Sigma_new = lu_solve(lu_factor(tmp), self.Sigma)
-            mu_new = (Sigma_new @ lam).squeeze(-1)
+            F = jnp.einsum('nk,nd,ne->kde', rho, x, x)
+            L_new = jnp.linalg.cholesky(Lambda_0 + F)
+            return L_new, None
 
-            return (mu_new, Sigma_new), None
+        L_init = self.L
+        L_final, _ = lax.scan(step_fn, L_init, jnp.arange(num_iters))
 
-        init = (self.mu.mT, self.Sigma)
-        (final_mu_trans, final_Sigma), _ = lax.scan(step_fn, init, jnp.arange(num_iters))
+        # Recover mu and Sigma from final Cholesky factor
+        I_broad = jnp.broadcast_to(jnp.eye(x.shape[-1]), self.Sigma.shape)
+        mu_new = cho_solve((L_final, True), lam).squeeze(-1).T
+        Sigma_new = cho_solve((L_final, True), I_broad)
 
-        return eqx.tree_at(lambda x: (x.mu, x.Sigma), self, (final_mu_trans.T, final_Sigma))
+        return eqx.tree_at(lambda x: (x.mu, x.Sigma, x.L), self, (mu_new, Sigma_new, L_final))
 
     @property
     def params(self):

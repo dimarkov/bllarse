@@ -40,7 +40,7 @@ def benchmark_loss_vs_iterations(key):
     key, subkey = jr.split(key)
     mpg = MultinomialPolyaGamma(n_features, n_classes, key=subkey)
 
-    n_iters_range = jnp.arange(1, 128)[::4]
+    n_iters_range = list(range(1, 128, 4))
     losses = {
         "IBProbit_0": [], "IBProbit_1": [], "IBProbit_2": [], "IBProbit_3": [],
         "IBPG_0": [], "IBPG_1": [], "IBPG_2": [], "IBPG_3": [],
@@ -79,7 +79,7 @@ def benchmark_runtimes(key):
     
     # Runtime vs. Data Size
     n_features = 100
-    n_samples_range = jnp.arange(100, 1100, 100)
+    n_samples_range = range(100, 1100, 100)
     runtimes_data = {"IBProbit": [], "IBPG": [], "MPG": []}
 
     ib_probit = IBProbit(n_features, n_classes, key=key)
@@ -93,7 +93,7 @@ def benchmark_runtimes(key):
         func(X, y)
         start_time = time.time()
         for _ in range(n_runs):
-            jax.block_until_ready(func(X, y).eta)
+            jax.block_until_ready(func(X, y).mu)
         runtimes_data["IBProbit"].append( (time.time() - start_time) / n_runs)
 
         func = eqx.filter_jit(ib_pg.update)
@@ -122,7 +122,7 @@ def benchmark_runtimes(key):
 
     # Runtime vs. Feature Size
     n_samples = 1024
-    n_features_range = jnp.arange(100, 800, 100)
+    n_features_range = range(100, 800, 100)
     runtimes_features = {"IBProbit": [], "IBPG": [], "MPG": []}
 
     for n_features in n_features_range:
@@ -136,7 +136,7 @@ def benchmark_runtimes(key):
         func(X, y)
         start_time = time.time()
         for _ in range(n_runs):
-            jax.block_until_ready(func(X, y).eta)
+            jax.block_until_ready(func(X, y).mu)
         runtimes_features["IBProbit"].append((time.time() - start_time) / n_runs)
 
         func = eqx.filter_jit(ib_pg.update)
@@ -165,7 +165,7 @@ def benchmark_runtimes(key):
     # Runtime vs. Number of Classes
     n_samples = 1024
     n_features = 768
-    n_classes_range = jnp.arange(10, 101, 20)
+    n_classes_range = range(10, 101, 20)
     runtimes_classes = {"IBProbit": [], "IBPG": [], "MPG": []}
 
     for n_classes in n_classes_range:
@@ -179,7 +179,7 @@ def benchmark_runtimes(key):
         func(X, y)
         start_time = time.time()
         for _ in range(n_runs):
-            jax.block_until_ready(func(X, y).eta)
+            jax.block_until_ready(func(X, y).mu)
         runtimes_classes["IBProbit"].append((time.time() - start_time) / n_runs)
 
         func = eqx.filter_jit(ib_pg.update)
