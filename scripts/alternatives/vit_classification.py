@@ -68,6 +68,27 @@ EQUIMO_MODELS = {
     "deepMLP_large": {"img_size": 64, "embed_dim": 1024, "channels_first": False},
 }
 
+# Dataset-specific input sizes for DINOv3 models (patch_size=16, so size must be divisible by 16).
+# Chosen based on native dataset resolution; DeepMLP models ignore this table.
+DINOV3_DATASET_IMG_SIZES = {
+    "cifar10":       224,
+    "cifar100":      224,
+    "oxford_pets":   512,
+    "food101":       512,
+    "flowers102":    512,
+    "stanford_cars": 512,
+    "dtd":           512,
+    "imagenet1k":    512,
+}
+
+
+def get_img_size(model_name: str, dataset_name: str) -> int:
+    """Return the appropriate input image size for a model/dataset pair."""
+    if "dinov3" in model_name:
+        default = EQUIMO_MODELS[model_name]["img_size"]  # 224
+        return DINOV3_DATASET_IMG_SIZES.get(dataset_name, default)
+    return EQUIMO_MODELS[model_name]["img_size"]
+
 # Dataset configurations
 DATASET_CONFIGS = {
     "cifar10": {
@@ -413,7 +434,7 @@ def main(args):
 
     ds_config = DATASET_CONFIGS[args.dataset]
     model_config = EQUIMO_MODELS.get(args.model, {"img_size": 224, "embed_dim": 384, "channels_first": True})
-    img_size = model_config["img_size"]
+    img_size = get_img_size(args.model, args.dataset)
     embed_dim = model_config["embed_dim"]
     channels_first = model_config.get("channels_first", True)
     num_classes = ds_config["num_classes"]
@@ -422,12 +443,12 @@ def main(args):
 
     # --- Load/cache features (shared across all param combos) ---
     test_split_name = ds_config["test_split"]
-    train_cache = os.path.join(args.cache_dir, f"{args.model}_{args.dataset}_train.npz")
-    test_cache = os.path.join(args.cache_dir, f"{args.model}_{args.dataset}_{test_split_name}.npz")
+    train_cache = os.path.join(args.cache_dir, f"{args.model}_{args.dataset}_res{img_size}_train.npz")
+    test_cache = os.path.join(args.cache_dir, f"{args.model}_{args.dataset}_res{img_size}_{test_split_name}.npz")
 
     hf_repo = None if args.no_hf_cache else args.hf_repo
-    train_hf_path = f"{args.model}/{args.dataset}_train.npz" if hf_repo else None
-    test_hf_path = f"{args.model}/{args.dataset}_{test_split_name}.npz" if hf_repo else None
+    train_hf_path = f"{args.model}/{args.dataset}_res{img_size}_train.npz" if hf_repo else None
+    test_hf_path = f"{args.model}/{args.dataset}_res{img_size}_{test_split_name}.npz" if hf_repo else None
 
     if args.no_cache:
         for p in (train_cache, test_cache):

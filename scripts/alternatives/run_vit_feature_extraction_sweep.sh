@@ -12,5 +12,4 @@ DATASETS=(cifar10 cifar100 oxford_pets food101 flowers102 stanford_cars dtd imag
 echo "Precomputing features (skipping already cached)..."
 uv run "$SCRIPT_DIR/precompute_features.py" \
     --models "${MODELS[@]}" \
-    --datasets "${DATASETS[@]}" \
-    --no-cache
+    --datasets "${DATASETS[@]}"

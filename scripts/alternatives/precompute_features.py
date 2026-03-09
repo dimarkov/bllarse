@@ -26,6 +26,7 @@ from vit_classification import (
     NORM_STATS,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    get_img_size,
     get_pretrained_backbone,
     load_or_compute_features,
     upload_features_to_hf,
@@ -43,7 +44,7 @@ def main():
         choices=list(DATASET_CONFIGS.keys()), help="Datasets to process (default: all)",
     )
     parser.add_argument("--cache-dir", type=str, default=".cache/features", help="Cache directory")
-    parser.add_argument("--batch-size", type=int, default=256, help="Batch size for feature extraction")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for feature extraction")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="gpu", help="Device to use")
     parser.add_argument("--no-cache", action="store_true", help="Force recomputation of all features")
@@ -75,8 +76,8 @@ def main():
         for model_name in args.models:
             done += 1
             model_config = EQUIMO_MODELS[model_name]
-            img_size = model_config["img_size"]
-            print(f"\n[{done}/{total}] {dataset_name} x {model_name}")
+            img_size = get_img_size(model_name, dataset_name)
+            print(f"\n[{done}/{total}] {dataset_name} x {model_name} @ {img_size}px")
 
             # Load backbone once per model
             key, model_key = jr.split(key)
@@ -87,9 +88,9 @@ def main():
 
             for split in splits:
                 cache_path = os.path.join(
-                    args.cache_dir, f"{model_name}_{dataset_name}_{split}.npz"
+                    args.cache_dir, f"{model_name}_{dataset_name}_res{img_size}_{split}.npz"
                 )
-                hf_path = f"{model_name}/{dataset_name}_{split}.npz" if hf_repo else None
+                hf_path = f"{model_name}/{dataset_name}_res{img_size}_{split}.npz" if hf_repo else None
 
                 if args.no_cache and os.path.exists(cache_path):
                     os.remove(cache_path)
