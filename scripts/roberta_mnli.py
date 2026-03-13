@@ -315,6 +315,12 @@ def _extract_split_features(
     num_rows = len(split)
     hidden_size = int(model.config.hidden_size)
     output_dtype = np.float16 if cache_dtype == "float16" else np.float32
+    pad_token_id = tokenizer.pad_token_id or 0
+
+    @jax.jit
+    def _forward(batch_inputs: Dict[str, jnp.ndarray]) -> jnp.ndarray:
+        outputs = model(**batch_inputs, params=model.params, train=False)
+        return outputs.last_hidden_state[:, 0, :]
 
     features = np.empty((num_rows, hidden_size), dtype=output_dtype)
     labels_out = np.empty((num_rows,), dtype=np.int32)
@@ -345,8 +351,20 @@ def _extract_split_features(
             return_tensors="np",
         )
 
-        outputs = model(**encoded, train=False)
-        cls_features = np.asarray(outputs.last_hidden_state[:, 0, :], dtype=np.float32)
+        actual_n = int(labels.shape[0])
+        if actual_n < batch_size:
+            pad_rows = batch_size - actual_n
+            encoded = {
+                key: np.pad(
+                    value,
+                    ((0, pad_rows), (0, 0)),
+                    constant_values=(pad_token_id if key == "input_ids" else 0),
+                )
+                for key, value in encoded.items()
+            }
+
+        encoded_jax = {key: jnp.asarray(value) for key, value in encoded.items()}
+        cls_features = np.asarray(_forward(encoded_jax), dtype=np.float32)[:actual_n]
         if output_dtype is not np.float32:
             cls_features = cls_features.astype(output_dtype)
 

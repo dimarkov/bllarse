@@ -243,3 +243,48 @@ def test_len512_bs2048_refine_sweep_config():
         assert cfg["max_length"] == 512
         assert cfg["epochs"] == 100
         assert cfg["dropout_rate"] == 0.1
+
+
+def test_roberta_large_len512_extract_sweep_config():
+    repo_root = Path(__file__).resolve().parents[2]
+    sweep_path = (
+        repo_root
+        / "bllarse_sweeps"
+        / "mnli_roberta_large_len512_extract.py"
+    )
+    sweep = _load_module(sweep_path)
+
+    configs = sweep.create_configs()
+    assert len(configs) == 1
+    cfg = configs[0]
+    assert cfg["stage"] == "extract"
+    assert cfg["backbone"] == "FacebookAI/roberta-large"
+    assert cfg["max_length"] == 512
+    assert cfg["hf_sync"] == "pull_push"
+    assert cfg["extract_batch_size"] == 64
+    assert cfg["enable_mlflow"] is False
+
+
+def test_roberta_large_len512_extract_batchsize_benchmark_sweep_config():
+    repo_root = Path(__file__).resolve().parents[2]
+    sweep_path = (
+        repo_root
+        / "bllarse_sweeps"
+        / "mnli_roberta_large_len512_extract_batchsize_benchmark.py"
+    )
+    sweep = _load_module(sweep_path)
+
+    configs = sweep.create_configs()
+    assert len(configs) == 4
+    batch_sizes = {cfg["extract_batch_size"] for cfg in configs}
+    assert batch_sizes == {32, 64, 96, 128}
+
+    for cfg in configs:
+        assert cfg["stage"] == "extract"
+        assert cfg["backbone"] == "FacebookAI/roberta-large"
+        assert cfg["max_length"] == 512
+        assert cfg["hf_sync"] == "none"
+        assert cfg["reuse_cache"] is False
+        assert cfg["enable_mlflow"] is False
+        assert cfg["max_train_samples"] == 32768
+        assert cfg["max_val_samples"] == 2048
