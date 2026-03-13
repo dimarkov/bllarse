@@ -150,3 +150,128 @@ Tips:
 ```bash
 export BLLARSE_DOCKER_SHM_SIZE=16g
 ```
+
+## RoBERTa MNLI Workflow
+
+The RoBERTa/MNLI cached-feature pipeline lives in `scripts/roberta_mnli.py`.
+It has three stages:
+
+- `extract`: precompute frozen CLS features and store them under `data/feature_cache`
+- `train_eval`: reuse cached features and train the last-layer baseline
+- `all`: do extraction first if needed, then train/eval
+
+### Feature extraction
+
+Current canonical extraction config:
+
+- backbone: `FacebookAI/roberta-base`
+- max length: `512`
+- cache dtype: `float16`
+- extract batch size: `256`
+- cluster resources: `1x A100 40GB`, `8 CPUs`, `BLLARSE_DOCKER_SHM_SIZE=16g`
+- MLflow: disabled for extraction jobs by design
+
+The canonical sweep file is:
+
+- `bllarse_sweeps/mnli_roberta_len512_extract.py`
+
+Typical cluster launch from the login node:
+
+```bash
+source .venv_bllarse_new/bin/activate
+export HF_TOKEN="<token>"
+export BLLARSE_DOCKER_SHM_SIZE=16g
+
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/mnli_roberta_len512_extract.py \
+  --venv .venv_bllarse_new \
+  --max-concurrent 1 \
+  --cpus-per-task 8 \
+  --job-name mnli_len512_extract_bs256 \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
+
+Direct one-off extraction also works:
+
+```bash
+python scripts/roberta_mnli.py \
+  --stage extract \
+  --backbone FacebookAI/roberta-base \
+  --reuse-cache \
+  --max-length 512 \
+  --cache-dtype float16 \
+  --extract-batch-size 256 \
+  --hf-sync pull_push \
+  --hf-repo-id dimarkov/bllarse-features \
+  --hf-subdir-prefix roberta_activations/mnli_roberta_cls
+```
+
+Notes:
+
+- The canonical HF destination is:
+  `roberta_activations/mnli_roberta_cls/FacebookAI__roberta_base_len512_float16_5c31d846204b`
+- Cache keys depend on backbone, max length, dtype, and sample caps. They do **not** depend on extraction batch size.
+- Use `hf_sync=none` for throughput benchmarking or smoke runs so you do not push temporary caches.
+
+### Adam / AdamW last-layer training
+
+The deterministic head is a cached-feature linear softmax baseline trained on frozen CLS features.
+Per-epoch `acc`, `nll`, and `ece` are logged to MLflow for `train_eval` jobs.
+
+Quick len256 sanity sweep:
+
+- `bllarse_sweeps/mnli_roberta_len256_linear_probe_baseline.py`
+
+```bash
+python src/bllarse/tools/run_config.py \
+  bllarse_sweeps/mnli_roberta_len256_linear_probe_baseline.py 0
+```
+
+Full len256 multiseed sweep:
+
+- `bllarse_sweeps/mnli_roberta_len256_linear_probe_multiseed.py`
+
+```bash
+source .venv_bllarse_new/bin/activate
+export MLFLOW_TRACKING_URI="https://mlflow.markov.icu"
+export BLLARSE_DOCKER_SHM_SIZE=16g
+
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/mnli_roberta_len256_linear_probe_multiseed.py \
+  --venv .venv_bllarse_new \
+  --max-concurrent 24 \
+  --job-name mnli_len256_multiseed \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
+
+The current len256 multiseed sweep covers:
+
+- optimizers: `adam`, `adamw`
+- learning rates: `2e-5`, `3e-5`
+- batch sizes: `8`, `4`
+- seeds: `2022`, `2023`, `2024`
+- epochs: `120`
+- dropout: `0.1`
+
+Optimizer conventions:
+
+- `adam`: `weight_decay = 0.0`
+- `adamw`: `weight_decay = 1e-2`
+
+Direct single-run training example:
+
+```bash
+python scripts/roberta_mnli.py \
+  --stage train_eval \
+  --backbone FacebookAI/roberta-base \
+  --reuse-cache \
+  --optimizer adam \
+  --learning-rate 2e-5 \
+  --weight-decay 0.0 \
+  --train-batch-size 8 \
+  --epochs 120 \
+  --dropout-rate 0.1 \
+  --seed 2022 \
+  --max-length 256 \
+  --enable-mlflow
+```

@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+"""Feature-cached RoBERTa/MNLI experiments.
+
+Stages:
+- `extract`: build or refresh cached CLS features and optionally push them to HF.
+  Extraction is treated as one-off data preparation and does not log to MLflow.
+- `train_eval`: load cached features and train/evaluate a last-layer baseline.
+- `all`: extract if needed, then train/evaluate in one invocation.
+"""
+
 import argparse
 import json
 import os
 import shutil
+import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from hashlib import sha1
@@ -19,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import equinox as eqx
-from jax import nn, random as jr
+from jax import lax, nn, random as jr
 from tensorflow_probability.substrates.jax.stats import (
     expected_calibration_error as compute_ece,
 )
@@ -35,6 +45,11 @@ except Exception:
     _HAS_MLFLOW = False
 
 _SPLITS = ("train", "validation_matched", "validation_mismatched")
+_FULL_SPLIT_ROWS = {
+    "train": 392702,
+    "validation_matched": 9815,
+    "validation_mismatched": 9832,
+}
 _CACHE_FILES = {
     "X_train": "X_train.npz",
     "y_train": "y_train.npz",
@@ -51,13 +66,24 @@ def make_cache_key(
     max_length: int,
     cache_dtype: str,
     *,
+    max_train_samples: int | None = None,
+    max_val_samples: int | None = None,
     split_schema: str = "train|validation_matched|validation_mismatched",
     version: str = "v2",
 ) -> str:
     payload = f"{version}|{backbone}|{max_length}|{cache_dtype}|{split_schema}"
+    if max_train_samples is not None or max_val_samples is not None:
+        train_tag = "all" if max_train_samples is None else str(max_train_samples)
+        val_tag = "all" if max_val_samples is None else str(max_val_samples)
+        payload = f"{payload}|train{train_tag}|val{val_tag}"
     digest = sha1(payload.encode("utf-8")).hexdigest()[:12]
     safe_backbone = backbone.replace("/", "__").replace("-", "_")
-    return f"{safe_backbone}_len{max_length}_{cache_dtype}_{digest}"
+    key_parts = [f"len{max_length}", cache_dtype]
+    if max_train_samples is not None or max_val_samples is not None:
+        train_tag = "all" if max_train_samples is None else str(max_train_samples)
+        val_tag = "all" if max_val_samples is None else str(max_val_samples)
+        key_parts.extend([f"tr{train_tag}", f"val{val_tag}"])
+    return f"{safe_backbone}_{'_'.join(key_parts)}_{digest}"
 
 
 def build_hf_cache_prefix(hf_subdir_prefix: str, cache_key: str) -> str:
@@ -106,6 +132,62 @@ def compute_metrics_from_logits(
     }
 
 
+@jax.jit
+def _linear_logits_and_losses(
+    params: Dict[str, jnp.ndarray],
+    features: jnp.ndarray,
+    labels: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    x = jnp.asarray(features, dtype=jnp.float32)
+    y = jnp.asarray(labels, dtype=jnp.int32)
+    logits = x @ params["w"] + params["b"]
+    targets = nn.one_hot(y, logits.shape[-1])
+    losses = optax.softmax_cross_entropy(logits, targets)
+    return logits, losses
+
+
+def checkpoint_is_better(
+    candidate: Dict[str, float],
+    best: Dict[str, float] | None,
+) -> bool:
+    if best is None:
+        return True
+
+    cand_acc = float(candidate["acc"])
+    best_acc = float(best["acc"])
+    if cand_acc > best_acc + 1e-12:
+        return True
+    if cand_acc < best_acc - 1e-12:
+        return False
+
+    cand_nll = float(candidate["nll"])
+    best_nll = float(best["nll"])
+    if cand_nll < best_nll - 1e-12:
+        return True
+    if cand_nll > best_nll + 1e-12:
+        return False
+
+    return float(candidate["ece"]) < float(best["ece"]) - 1e-12
+
+
+def _copy_linear_params(params: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    return {name: jnp.array(value) for name, value in params.items()}
+
+
+def _apply_feature_dropout(
+    x: jnp.ndarray,
+    *,
+    key: jax.Array,
+    dropout_rate: float,
+) -> jnp.ndarray:
+    if dropout_rate <= 0.0:
+        return x
+
+    keep_prob = 1.0 - dropout_rate
+    mask = jr.bernoulli(key, p=keep_prob, shape=x.shape)
+    return jnp.where(mask, x / keep_prob, 0.0)
+
+
 def _cache_paths(cache_root: Path) -> Dict[str, Path]:
     return {name: cache_root / filename for name, filename in _CACHE_FILES.items()}
 
@@ -113,6 +195,48 @@ def _cache_paths(cache_root: Path) -> Dict[str, Path]:
 def _cache_complete(cache_root: Path) -> bool:
     paths = _cache_paths(cache_root)
     return all(path.exists() for path in paths.values())
+
+
+def _requested_row_counts(
+    *,
+    max_train_samples: int | None,
+    max_val_samples: int | None,
+) -> Dict[str, int]:
+    requested = {
+        "train": _FULL_SPLIT_ROWS["train"],
+        "validation_matched": _FULL_SPLIT_ROWS["validation_matched"],
+        "validation_mismatched": _FULL_SPLIT_ROWS["validation_mismatched"],
+    }
+    if max_train_samples is not None:
+        requested["train"] = min(max_train_samples, requested["train"])
+    if max_val_samples is not None:
+        requested["validation_matched"] = min(
+            max_val_samples,
+            requested["validation_matched"],
+        )
+        requested["validation_mismatched"] = min(
+            max_val_samples,
+            requested["validation_mismatched"],
+        )
+    return requested
+
+
+def _cache_satisfies_request(
+    cache_root: Path,
+    *,
+    max_train_samples: int | None,
+    max_val_samples: int | None,
+) -> bool:
+    if not _cache_complete(cache_root):
+        return False
+
+    metadata = _load_metadata(cache_root)
+    rows = metadata.get("rows", {})
+    requested = _requested_row_counts(
+        max_train_samples=max_train_samples,
+        max_val_samples=max_val_samples,
+    )
+    return all(int(rows.get(split_name, -1)) >= required for split_name, required in requested.items())
 
 
 def _load_metadata(cache_root: Path) -> Dict[str, Any]:
@@ -410,23 +534,15 @@ def _evaluate_linear_head(
     *,
     batch_size: int,
 ) -> Dict[str, float]:
-    num_classes = params["b"].shape[0]
-    loss_fn = CrossEntropy(alpha=0.0, num_classes=int(num_classes))
-    logits_chunks: list[jnp.ndarray] = []
-    loss_chunks: list[jnp.ndarray] = []
+    del batch_size
 
-    for start in range(0, labels.shape[0], batch_size):
-        end = min(start + batch_size, labels.shape[0])
-        x = jnp.asarray(features[start:end], dtype=jnp.float32)
-        y = jnp.asarray(labels[start:end], dtype=jnp.int32)
-        logits = x @ params["w"] + params["b"]
-        loss, logits = loss_fn(logits, y, with_logits=True)
-        logits_chunks.append(logits)
-        loss_chunks.append(loss)
-
-    logits_all = jnp.concatenate(logits_chunks, axis=0)
-    losses_all = jnp.concatenate(loss_chunks, axis=0)
-    return compute_metrics_from_logits(logits_all, jnp.asarray(labels), losses=losses_all)
+    labels_jnp = jnp.asarray(labels, dtype=jnp.int32)
+    logits_all, losses_all = _linear_logits_and_losses(
+        params,
+        jnp.asarray(features),
+        labels_jnp,
+    )
+    return compute_metrics_from_logits(logits_all, labels_jnp, losses=losses_all)
 
 
 def _evaluate_ibprobit_head(
@@ -469,10 +585,14 @@ def _train_linear_head(
     epochs: int,
     learning_rate: float,
     weight_decay: float,
+    dropout_rate: float,
     seed: int,
 ) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
     num_features = x_train.shape[1]
     num_classes = int(y_train.max()) + 1
+    n = int(y_train.shape[0])
+    n_batches = (n + batch_size - 1) // batch_size
+    pad = n_batches * batch_size - n
 
     key = jr.PRNGKey(seed)
     key, w_key = jr.split(key)
@@ -481,10 +601,21 @@ def _train_linear_head(
         "b": jnp.zeros((num_classes,), dtype=jnp.float32),
     }
 
-    if optimizer_name == "adamw":
-        optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
+    weight_decay_mask = {"w": True, "b": False}
+    if optimizer_name == "adam":
+        optimizer = optax.adam(learning_rate=learning_rate)
+    elif optimizer_name == "adamw":
+        optimizer = optax.adamw(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            mask=weight_decay_mask,
+        )
     elif optimizer_name == "lion":
-        optimizer = optax.lion(learning_rate=learning_rate, weight_decay=weight_decay)
+        optimizer = optax.lion(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            mask=weight_decay_mask,
+        )
     else:
         raise ValueError(f"Unsupported optimizer '{optimizer_name}' for linear head.")
 
@@ -494,9 +625,11 @@ def _train_linear_head(
         opt_state: optax.OptState,
         x: jnp.ndarray,
         y: jnp.ndarray,
+        dropout_key: jax.Array,
     ) -> Tuple[Dict[str, jnp.ndarray], optax.OptState, jnp.ndarray]:
         def _loss_fn(pp: Dict[str, jnp.ndarray]) -> jnp.ndarray:
-            logits = x @ pp["w"] + pp["b"]
+            x_in = _apply_feature_dropout(x, key=dropout_key, dropout_rate=dropout_rate)
+            logits = x_in @ pp["w"] + pp["b"]
             targets = nn.one_hot(y, num_classes)
             return optax.softmax_cross_entropy(logits, targets).mean()
 
@@ -505,40 +638,89 @@ def _train_linear_head(
         next_params = optax.apply_updates(p, updates)
         return next_params, next_opt_state, loss
 
-    rng = np.random.default_rng(seed)
+    @jax.jit
+    def _run_epoch(
+        p: Dict[str, jnp.ndarray],
+        opt_state: optax.OptState,
+        x_data: jnp.ndarray,
+        y_data: jnp.ndarray,
+        epoch_key: jax.Array,
+    ) -> Tuple[Dict[str, jnp.ndarray], optax.OptState, jnp.ndarray]:
+        perm_key, batch_key = jr.split(epoch_key)
+        perm = jr.permutation(perm_key, n)
+        if pad > 0:
+            perm = jnp.concatenate([perm, perm[:pad]], axis=0)
+        batch_indices = perm.reshape((n_batches, batch_size))
+        batch_keys = jr.split(batch_key, n_batches)
+
+        def _batch_body(
+            carry: Tuple[Dict[str, jnp.ndarray], optax.OptState],
+            scans: Tuple[jnp.ndarray, jax.Array],
+        ) -> Tuple[Tuple[Dict[str, jnp.ndarray], optax.OptState], jnp.ndarray]:
+            params, state = carry
+            idx, dropout_key = scans
+            x_batch = jnp.asarray(x_data[idx], dtype=jnp.float32)
+            y_batch = y_data[idx]
+            next_params, next_state, batch_loss = _step(
+                params,
+                state,
+                x_batch,
+                y_batch,
+                dropout_key,
+            )
+            return (next_params, next_state), batch_loss
+
+        (next_params, next_opt_state), batch_losses = lax.scan(
+            _batch_body,
+            (p, opt_state),
+            (batch_indices, batch_keys),
+        )
+        return next_params, next_opt_state, jnp.mean(batch_losses)
+
+    x_train_device = jax.device_put(jnp.asarray(x_train))
+    y_train_device = jax.device_put(jnp.asarray(y_train, dtype=jnp.int32))
+    x_val_m_device = jax.device_put(jnp.asarray(x_val_m))
+    y_val_m_device = jax.device_put(jnp.asarray(y_val_m, dtype=jnp.int32))
+    x_val_mm_device = jax.device_put(jnp.asarray(x_val_mm))
+    y_val_mm_device = jax.device_put(jnp.asarray(y_val_mm, dtype=jnp.int32))
+
     opt_state = optimizer.init(params)
     epoch_losses: list[float] = []
     history: list[Dict[str, float]] = []
-    n = y_train.shape[0]
+    best_params: Dict[str, jnp.ndarray] | None = None
+    best_epoch = 0
+    best_metrics_m: Dict[str, float] | None = None
 
-    for _ in range(epochs):
-        perm = rng.permutation(n)
-        batch_losses: list[float] = []
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            idx = perm[start:end]
-            x_batch = jnp.asarray(x_train[idx], dtype=jnp.float32)
-            y_batch = jnp.asarray(y_train[idx], dtype=jnp.int32)
-            params, opt_state, batch_loss = _step(params, opt_state, x_batch, y_batch)
-            batch_losses.append(float(batch_loss))
-        epoch_train_loss = float(np.mean(batch_losses))
+    for epoch_idx in range(epochs):
+        epoch_start = time.perf_counter()
+        key, epoch_key = jr.split(key)
+        params, opt_state, epoch_loss = _run_epoch(
+            params,
+            opt_state,
+            x_train_device,
+            y_train_device,
+            epoch_key,
+        )
+        epoch_train_loss = float(epoch_loss)
         epoch_losses.append(epoch_train_loss)
 
         metrics_m = _evaluate_linear_head(
             params,
-            x_val_m,
-            y_val_m,
+            x_val_m_device,
+            y_val_m_device,
             batch_size=batch_size,
         )
         metrics_mm = _evaluate_linear_head(
             params,
-            x_val_mm,
-            y_val_mm,
+            x_val_mm_device,
+            y_val_mm_device,
             batch_size=batch_size,
         )
+        epoch_seconds = float(time.perf_counter() - epoch_start)
         history.append(
             {
                 "loss": epoch_train_loss,
+                "epoch_seconds": epoch_seconds,
                 "val_matched_acc": metrics_m["acc"],
                 "val_matched_nll": metrics_m["nll"],
                 "val_matched_ece": metrics_m["ece"],
@@ -547,12 +729,33 @@ def _train_linear_head(
                 "val_mismatched_ece": metrics_mm["ece"],
             }
         )
+        print(
+            "[bllarse] "
+            f"epoch={epoch_idx + 1}/{epochs} "
+            f"epoch_seconds={epoch_seconds:.2f} "
+            f"train_loss={epoch_train_loss:.4f} "
+            f"val_matched_acc={metrics_m['acc']:.4f} "
+            f"val_matched_nll={metrics_m['nll']:.4f} "
+            f"val_matched_ece={metrics_m['ece']:.4f} "
+            f"val_mismatched_acc={metrics_mm['acc']:.4f} "
+            f"val_mismatched_nll={metrics_mm['nll']:.4f} "
+            f"val_mismatched_ece={metrics_mm['ece']:.4f}"
+        )
+
+        if checkpoint_is_better(metrics_m, best_metrics_m):
+            best_params = _copy_linear_params(params)
+            best_epoch = epoch_idx + 1
+            best_metrics_m = dict(metrics_m)
 
     training_info = {
         "epoch_losses": epoch_losses,
         "history": history,
+        "best_epoch": best_epoch,
+        "selected_split": "validation_matched",
     }
-    return params, training_info
+    if best_params is None:
+        raise RuntimeError("Linear-head training did not produce a checkpoint.")
+    return best_params, training_info
 
 
 def _train_ibprobit_head(
@@ -586,8 +789,12 @@ def _train_ibprobit_head(
     n = y_train.shape[0]
     epoch_losses: list[float] = []
     history: list[Dict[str, float]] = []
+    best_model: IBProbit | None = None
+    best_epoch = 0
+    best_metrics_m: Dict[str, float] | None = None
 
-    for _ in range(epochs):
+    for epoch_idx in range(epochs):
+        epoch_start = time.perf_counter()
         perm = rng.permutation(n)
         batch_losses: list[float] = []
         for start in range(0, n, batch_size):
@@ -614,9 +821,11 @@ def _train_ibprobit_head(
             y_val_mm,
             batch_size=batch_size,
         )
+        epoch_seconds = float(time.perf_counter() - epoch_start)
         history.append(
             {
                 "loss": epoch_train_loss,
+                "epoch_seconds": epoch_seconds,
                 "val_matched_acc": metrics_m["acc"],
                 "val_matched_nll": metrics_m["nll"],
                 "val_matched_ece": metrics_m["ece"],
@@ -625,12 +834,33 @@ def _train_ibprobit_head(
                 "val_mismatched_ece": metrics_mm["ece"],
             }
         )
+        print(
+            "[bllarse] "
+            f"epoch={epoch_idx + 1}/{epochs} "
+            f"epoch_seconds={epoch_seconds:.2f} "
+            f"train_loss={epoch_train_loss:.4f} "
+            f"val_matched_acc={metrics_m['acc']:.4f} "
+            f"val_matched_nll={metrics_m['nll']:.4f} "
+            f"val_matched_ece={metrics_m['ece']:.4f} "
+            f"val_mismatched_acc={metrics_mm['acc']:.4f} "
+            f"val_mismatched_nll={metrics_mm['nll']:.4f} "
+            f"val_mismatched_ece={metrics_mm['ece']:.4f}"
+        )
+
+        if checkpoint_is_better(metrics_m, best_metrics_m):
+            best_model = model
+            best_epoch = epoch_idx + 1
+            best_metrics_m = dict(metrics_m)
 
     training_info = {
         "epoch_losses": epoch_losses,
         "history": history,
+        "best_epoch": best_epoch,
+        "selected_split": "validation_matched",
     }
-    return model, training_info
+    if best_model is None:
+        raise RuntimeError("IBProbit training did not produce a checkpoint.")
+    return best_model, training_info
 
 
 def _train_and_evaluate(
@@ -642,6 +872,7 @@ def _train_and_evaluate(
     num_update_iters: int,
     learning_rate: float,
     weight_decay: float,
+    dropout_rate: float,
     seed: int,
 ) -> Dict[str, Any]:
     x_train = np.asarray(arrays["X_train"])
@@ -651,7 +882,7 @@ def _train_and_evaluate(
     x_val_mm = np.asarray(arrays["X_val_mm"])
     y_val_mm = np.asarray(arrays["y_val_mm"])
 
-    if optimizer_name in {"adamw", "lion"}:
+    if optimizer_name in {"adam", "adamw", "lion"}:
         params, training_info = _train_linear_head(
             optimizer_name=optimizer_name,
             x_train=x_train,
@@ -664,6 +895,7 @@ def _train_and_evaluate(
             epochs=epochs,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
+            dropout_rate=dropout_rate,
             seed=seed,
         )
         metrics_m = _evaluate_linear_head(params, x_val_m, y_val_m, batch_size=train_batch_size)
@@ -694,6 +926,9 @@ def _train_and_evaluate(
 
 
 def _setup_mlflow(args) -> Any:
+    if args.stage == "extract":
+        return nullcontext(), False
+
     if not args.enable_mlflow:
         return nullcontext(), False
 
@@ -731,22 +966,39 @@ def _setup_mlflow(args) -> Any:
 
 
 def _resolve_cache_root(args) -> Path:
-    cache_key = make_cache_key(args.backbone, args.max_length, args.cache_dtype)
+    cache_key = make_cache_key(
+        args.backbone,
+        args.max_length,
+        args.cache_dtype,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
+    )
     cache_root = Path(args.cache_dir).expanduser().resolve() / args.hf_subdir_prefix / cache_key
     return cache_root
 
 
-def _ensure_cache(args, cache_root: Path) -> Dict[str, Any]:
+def _ensure_cache(args, cache_root: Path) -> Tuple[Dict[str, Any], bool]:
     pull_enabled, push_enabled = hf_sync_flags(args.hf_sync)
     token = os.environ.get("HF_TOKEN", "").strip() or None
-    cache_key = make_cache_key(args.backbone, args.max_length, args.cache_dtype)
+    cache_key = make_cache_key(
+        args.backbone,
+        args.max_length,
+        args.cache_dtype,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
+    )
     prefix = build_hf_cache_prefix(args.hf_subdir_prefix, cache_key)
 
     metadata: Dict[str, Any] = {}
     extracted = False
 
     if args.stage in {"extract", "all"}:
-        if args.reuse_cache and _cache_complete(cache_root):
+        cache_ready = _cache_satisfies_request(
+            cache_root,
+            max_train_samples=args.max_train_samples,
+            max_val_samples=args.max_val_samples,
+        )
+        if args.reuse_cache and cache_ready:
             print(f"[bllarse] Reusing existing local cache at {cache_root}")
         else:
             if args.reuse_cache and pull_enabled:
@@ -762,7 +1014,16 @@ def _ensure_cache(args, cache_root: Path) -> Dict[str, Any]:
                 except Exception as exc:
                     print(f"[bllarse] HF pull failed before extraction: {exc}")
 
-            if not _cache_complete(cache_root):
+            if not _cache_satisfies_request(
+                cache_root,
+                max_train_samples=args.max_train_samples,
+                max_val_samples=args.max_val_samples,
+            ):
+                if _cache_complete(cache_root):
+                    print(
+                        "[bllarse] Existing cache does not satisfy the requested sample "
+                        "counts; extracting a matching cache."
+                    )
                 print("[bllarse] Extracting RoBERTa features for MNLI...")
                 metadata = _extract_features_to_cache(
                     cache_root=cache_root,
@@ -777,7 +1038,11 @@ def _ensure_cache(args, cache_root: Path) -> Dict[str, Any]:
                 )
                 extracted = True
                 print(f"[bllarse] Saved feature cache to {cache_root}")
-        if push_enabled and _cache_complete(cache_root):
+        if push_enabled and _cache_satisfies_request(
+            cache_root,
+            max_train_samples=args.max_train_samples,
+            max_val_samples=args.max_val_samples,
+        ):
             _push_cache_to_hf(
                 repo_id=args.hf_repo_id,
                 prefix=prefix,
@@ -787,7 +1052,11 @@ def _ensure_cache(args, cache_root: Path) -> Dict[str, Any]:
             )
             print(f"[bllarse] Uploaded cache to HF dataset {args.hf_repo_id}:{prefix}")
 
-    if args.stage in {"train_eval", "all"} and not _cache_complete(cache_root):
+    if args.stage in {"train_eval", "all"} and not _cache_satisfies_request(
+        cache_root,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
+    ):
         if pull_enabled:
             try:
                 downloaded = _pull_cache_from_hf(
@@ -804,17 +1073,23 @@ def _ensure_cache(args, cache_root: Path) -> Dict[str, Any]:
     if _cache_complete(cache_root):
         metadata = _load_metadata(cache_root)
 
-    return metadata
+    return metadata, extracted
 
 
 def _validate_args(args) -> None:
     if args.stage == "extract":
         return
-    if args.optimizer in {"adamw", "lion"} and args.num_update_iters != 0:
+    if args.optimizer in {"adam", "adamw", "lion"} and args.num_update_iters != 0:
         print(
             "[bllarse] Ignoring --num-update-iters for non-CAVI optimizer "
             f"({args.optimizer}); expected 0."
         )
+    if args.optimizer != "cavi" and not 0.0 <= args.dropout_rate < 1.0:
+        raise ValueError("--dropout-rate must be in [0, 1) for linear-head training.")
+    if args.optimizer == "cavi" and args.dropout_rate != 0.0:
+        print("[bllarse] Ignoring --dropout-rate for optimizer cavi.")
+    if args.stage != "extract" and args.epochs <= 0:
+        raise ValueError("--epochs must be > 0 for training.")
     if args.optimizer == "cavi" and args.num_update_iters <= 0:
         raise ValueError("--num-update-iters must be > 0 when --optimizer cavi.")
 
@@ -833,12 +1108,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=str, default="data/feature_cache")
     parser.add_argument("--reuse-cache", action="store_true")
 
-    parser.add_argument("--optimizer", choices=["adamw", "lion", "cavi"], default="cavi")
+    parser.add_argument("--optimizer", choices=["adam", "adamw", "lion", "cavi"], default="cavi")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--train-batch-size", type=int, default=1024)
     parser.add_argument("--num-update-iters", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--enable-mlflow", "--enable_mlflow", action="store_true")
@@ -879,7 +1155,13 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(args) -> None:
     _validate_args(args)
 
-    cache_key = make_cache_key(args.backbone, args.max_length, args.cache_dtype)
+    cache_key = make_cache_key(
+        args.backbone,
+        args.max_length,
+        args.cache_dtype,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
+    )
     cache_root = _resolve_cache_root(args)
     mlflow_context, mlflow_enabled = _setup_mlflow(args)
 
@@ -898,6 +1180,7 @@ def main(args) -> None:
                     "num_update_iters": args.num_update_iters,
                     "learning_rate": args.learning_rate,
                     "weight_decay": args.weight_decay,
+                    "dropout_rate": args.dropout_rate,
                     "seed": args.seed,
                     "hf_repo_id": args.hf_repo_id,
                     "hf_subdir_prefix": args.hf_subdir_prefix,
@@ -908,14 +1191,38 @@ def main(args) -> None:
                 }
             )
 
-        metadata = _ensure_cache(args, cache_root)
+        cache_started = time.perf_counter()
+        metadata, extracted = _ensure_cache(args, cache_root)
+        cache_seconds = time.perf_counter() - cache_started
         if args.stage == "extract":
+            rows = metadata.get("rows", {}) if metadata else {}
+            total_rows = int(sum(int(v) for v in rows.values())) if rows else 0
+            print(
+                "[bllarse] extraction "
+                f"cache_seconds={cache_seconds:.2f} "
+                f"cache_extracted={int(extracted)} "
+                f"cache_total_rows={total_rows}"
+            )
+            if mlflow_enabled:
+                mlflow.log_metric("cache_seconds", cache_seconds)
+                mlflow.log_metric("cache_extracted", int(extracted))
+                if total_rows > 0:
+                    mlflow.log_metric("cache_total_rows", total_rows)
+                    if extracted and cache_seconds > 0.0:
+                        mlflow.log_metric(
+                            "extract_rows_per_second",
+                            total_rows / cache_seconds,
+                        )
             print("[bllarse] Extraction stage complete.")
             return
 
-        if not _cache_complete(cache_root):
+        if not _cache_satisfies_request(
+            cache_root,
+            max_train_samples=args.max_train_samples,
+            max_val_samples=args.max_val_samples,
+        ):
             raise FileNotFoundError(
-                "Feature cache is missing required files after sync/extract. "
+                "Feature cache is missing required files or sufficient rows after sync/extract. "
                 f"Expected cache root: {cache_root}"
             )
 
@@ -934,6 +1241,7 @@ def main(args) -> None:
             num_update_iters=args.num_update_iters,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
+            dropout_rate=args.dropout_rate,
             seed=args.seed,
         )
 
@@ -952,6 +1260,9 @@ def main(args) -> None:
             print(f"[bllarse] cache metadata rows={metadata.get('rows', {})}")
 
         if mlflow_enabled:
+            best_epoch = int(results["training"].get("best_epoch", 0))
+            if best_epoch > 0:
+                mlflow.log_metric("best_epoch", best_epoch)
             history = results["training"].get("history", [])
             for epoch_idx, row in enumerate(history, start=1):
                 mlflow.log_metrics(
