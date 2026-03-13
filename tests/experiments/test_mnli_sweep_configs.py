@@ -213,3 +213,33 @@ def test_len512_largebatch_adam_long_sweep_config():
         assert cfg["epochs"] == 120
         assert cfg["dropout_rate"] == 0.1
         assert cfg["seed"] == 2022
+
+
+def test_len512_bs2048_refine_sweep_config():
+    repo_root = Path(__file__).resolve().parents[2]
+    sweep_path = (
+        repo_root
+        / "bllarse_sweeps"
+        / "mnli_roberta_len512_linear_probe_bs2048_refine.py"
+    )
+    sweep = _load_module(sweep_path)
+
+    configs = sweep.create_configs()
+    assert len(configs) == 15
+
+    batch_sizes = {cfg["train_batch_size"] for cfg in configs}
+    assert batch_sizes == {2048}
+
+    learning_rates = {cfg["learning_rate"] for cfg in configs}
+    assert learning_rates == {7e-4, 1e-3, 1.3e-3}
+
+    seeds = {cfg["seed"] for cfg in configs}
+    assert seeds == {2022, 2023, 2024, 2025, 2026}
+
+    for cfg in configs:
+        assert cfg["stage"] == "train_eval"
+        assert cfg["optimizer"] == "adam"
+        assert cfg["weight_decay"] == 0.0
+        assert cfg["max_length"] == 512
+        assert cfg["epochs"] == 100
+        assert cfg["dropout_rate"] == 0.1
