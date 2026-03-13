@@ -160,6 +160,15 @@ It has three stages:
 - `train_eval`: reuse cached features and train the last-layer baseline
 - `all`: do extraction first if needed, then train/eval
 
+Before launching new cluster sweeps from the login node, sync the checkout to the
+latest branch state:
+
+```bash
+cd /home/conor.heins/bayesian_last_layer/bllarse
+git pull --rebase origin bayesian_finetuning_roberta
+source .venv_bllarse_new/bin/activate
+```
+
 ### Feature extraction
 
 Current canonical extraction config:
@@ -170,6 +179,8 @@ Current canonical extraction config:
 - extract batch size: `256`
 - cluster resources: `1x A100 40GB`, `8 CPUs`, `BLLARSE_DOCKER_SHM_SIZE=16g`
 - MLflow: disabled for extraction jobs by design
+- extraction implementation: `FlaxAutoModel` with a jitted fixed-shape batch
+  forward pass
 
 The canonical sweep file is:
 
@@ -212,11 +223,61 @@ Notes:
   `roberta_activations/mnli_roberta_cls/FacebookAI__roberta_base_len512_float16_5c31d846204b`
 - Cache keys depend on backbone, max length, dtype, and sample caps. They do **not** depend on extraction batch size.
 - Use `hf_sync=none` for throughput benchmarking or smoke runs so you do not push temporary caches.
+- If `hf_sync` includes `push`, you must export `HF_TOKEN` before launching the
+  SLURM sweep so the token is passed through the sbatch Docker wrapper.
+- Extraction timing from the benchmark sweeps refers to the sample-capped
+  benchmark jobs, not the full MNLI cache build.
+
+### RoBERTa-large extraction
+
+Current canonical `roberta-large` extraction config:
+
+- backbone: `FacebookAI/roberta-large`
+- max length: `512`
+- cache dtype: `float16`
+- extract batch size: `64`
+- cluster resources: `1x A100 40GB`, `8 CPUs`, `BLLARSE_DOCKER_SHM_SIZE=16g`
+- MLflow: disabled for extraction jobs
+
+Sweep files:
+
+- `bllarse_sweeps/mnli_roberta_large_len512_extract.py`
+- `bllarse_sweeps/mnli_roberta_large_len512_extract_batchsize_benchmark.py`
+
+Batch-size benchmark results on the cluster, using the sample-capped benchmark
+cache (`32768` train, `2048` matched, `2048` mismatched):
+
+- `bs=32`: `394.30s`
+- `bs=64`: `313.88s`
+- `bs=96`: `332.52s`
+- `bs=128`: `325.81s`
+
+Canonical launch:
+
+```bash
+source .venv_bllarse_new/bin/activate
+export HF_TOKEN="<token>"
+export BLLARSE_DOCKER_SHM_SIZE=16g
+
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/mnli_roberta_large_len512_extract.py \
+  --venv .venv_bllarse_new \
+  --max-concurrent 1 \
+  --cpus-per-task 8 \
+  --job-name mnli_roberta_large_len512_extract \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
+
+The canonical HF destination is:
+
+`roberta_activations/mnli_roberta_cls/FacebookAI__roberta_large_len512_float16_abf7f41285e1`
 
 ### Adam / AdamW last-layer training
 
 The deterministic head is a cached-feature linear softmax baseline trained on frozen CLS features.
 Per-epoch `acc`, `nll`, and `ece` are logged to MLflow for `train_eval` jobs.
+The deterministic linear-head trainer keeps cached arrays on device and runs the
+minibatch loop with `lax.scan`.
 
 Quick len256 sanity sweep:
 
@@ -257,6 +318,39 @@ Optimizer conventions:
 
 - `adam`: `weight_decay = 0.0`
 - `adamw`: `weight_decay = 1e-2`
+
+### Len512 large-batch deterministic sweeps
+
+For the current large-batch deterministic baseline work on the cached len512
+features:
+
+- `bllarse_sweeps/mnli_roberta_len512_linear_probe_largebatch_adam.py`
+- `bllarse_sweeps/mnli_roberta_len512_linear_probe_largebatch_adam_long.py`
+- `bllarse_sweeps/mnli_roberta_len512_linear_probe_bs2048_refine.py`
+
+The current best `bs=2048` seeded refinement sweep uses:
+
+- optimizer: `adam`
+- batch size: `2048`
+- epochs: `100`
+- learning rates: `7e-4`, `1e-3`, `1.3e-3`
+- seeds: `2022`, `2023`, `2024`, `2025`, `2026`
+
+Canonical launch:
+
+```bash
+source .venv_bllarse_new/bin/activate
+export MLFLOW_TRACKING_URI="https://mlflow.markov.icu"
+export BLLARSE_DOCKER_SHM_SIZE=16g
+
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/mnli_roberta_len512_linear_probe_bs2048_refine.py \
+  --venv .venv_bllarse_new \
+  --max-concurrent 8 \
+  --cpus-per-task 8 \
+  --job-name mnli_len512_bs2048_refine \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
 
 Direct single-run training example:
 

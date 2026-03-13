@@ -7,6 +7,12 @@ Stages:
   Extraction is treated as one-off data preparation and does not log to MLflow.
 - `train_eval`: load cached features and train/evaluate a last-layer baseline.
 - `all`: extract if needed, then train/evaluate in one invocation.
+
+Implementation notes:
+- feature extraction uses `FlaxAutoModel` and a jitted fixed-shape forward pass
+  for each tokenized batch
+- deterministic last-layer training keeps cached arrays on device and runs the
+  minibatch epoch loop through `lax.scan`
 """
 
 import argparse

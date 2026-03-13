@@ -152,6 +152,14 @@ Until then, the current local path should be described as a **faithful head-only
 
 ## 8) Current cluster recipe in this repo
 
+Before submitting new cluster sweeps from the login node, sync the checkout:
+
+```bash
+cd /home/conor.heins/bayesian_last_layer/bllarse
+git pull --rebase origin bayesian_finetuning_roberta
+source .venv_bllarse_new/bin/activate
+```
+
 ### Canonical feature extraction
 
 For the current local pipeline, the recommended extraction job is:
@@ -163,6 +171,8 @@ For the current local pipeline, the recommended extraction job is:
 - resources: `1x A100 40GB`, `8 CPUs`, `BLLARSE_DOCKER_SHM_SIZE=16g`
 - HF sync: `pull_push`
 - MLflow: disabled for extraction jobs
+- extractor implementation: `FlaxAutoModel` with a jitted fixed-shape batch
+  forward pass
 
 The canonical sweep file is:
 
@@ -195,6 +205,57 @@ Important operational detail:
 - the canonical cache key does **not** encode extraction batch size
 - only backbone / max length / dtype / sample caps affect the cache key
 - so benchmarking different batch sizes should use sample-capped jobs with `hf_sync=none`
+- if `hf_sync` includes `push`, you must export `HF_TOKEN` before launching the
+  sweep so the token is passed through the sbatch Docker wrapper
+
+### Canonical RoBERTa-large feature extraction
+
+For the current `roberta-large` cache build, the recommended extraction job is:
+
+- backbone: `FacebookAI/roberta-large`
+- max length: `512`
+- cache dtype: `float16`
+- extract batch size: `64`
+- resources: `1x A100 40GB`, `8 CPUs`, `BLLARSE_DOCKER_SHM_SIZE=16g`
+- HF sync: `pull_push`
+- MLflow: disabled for extraction jobs
+
+Sweep files:
+
+- `bllarse_sweeps/mnli_roberta_large_len512_extract.py`
+- `bllarse_sweeps/mnli_roberta_large_len512_extract_batchsize_benchmark.py`
+
+The sample-capped extraction benchmark results were:
+
+- `bs=32`: `394.30s`
+- `bs=64`: `313.88s`
+- `bs=96`: `332.52s`
+- `bs=128`: `325.81s`
+
+Those timings are for the benchmark subset only
+(`32768` train + `2048` matched + `2048` mismatched), not the full MNLI cache.
+
+Launch:
+
+```bash
+source .venv_bllarse_new/bin/activate
+export HF_TOKEN="<token>"
+export BLLARSE_DOCKER_SHM_SIZE=16g
+
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/mnli_roberta_large_len512_extract.py \
+  --venv .venv_bllarse_new \
+  --max-concurrent 1 \
+  --cpus-per-task 8 \
+  --job-name mnli_roberta_large_len512_extract \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
+
+The expected HF destination is:
+
+```text
+roberta_activations/mnli_roberta_cls/FacebookAI__roberta_large_len512_float16_abf7f41285e1
+```
 
 ### Len256 Adam / AdamW baseline training
 
@@ -238,3 +299,35 @@ That sweep currently uses:
 - `weight_decay = 1e-2` for `adamw`
 
 Per-epoch `acc`, `nll`, and `ece` are logged to MLflow for these `train_eval` jobs.
+
+### Current len512 large-batch deterministic baseline
+
+For the current len512 cached-feature large-batch baseline work, the sweep files are:
+
+- `bllarse_sweeps/mnli_roberta_len512_linear_probe_largebatch_adam.py`
+- `bllarse_sweeps/mnli_roberta_len512_linear_probe_largebatch_adam_long.py`
+- `bllarse_sweeps/mnli_roberta_len512_linear_probe_bs2048_refine.py`
+
+The current preferred refinement sweep is:
+
+- optimizer: `adam`
+- batch size: `2048`
+- epochs: `100`
+- learning rates: `7e-4`, `1e-3`, `1.3e-3`
+- seeds: `2022`, `2023`, `2024`, `2025`, `2026`
+
+Launch:
+
+```bash
+source .venv_bllarse_new/bin/activate
+export MLFLOW_TRACKING_URI="https://mlflow.markov.icu"
+export BLLARSE_DOCKER_SHM_SIZE=16g
+
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/mnli_roberta_len512_linear_probe_bs2048_refine.py \
+  --venv .venv_bllarse_new \
+  --max-concurrent 8 \
+  --cpus-per-task 8 \
+  --job-name mnli_len512_bs2048_refine \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
