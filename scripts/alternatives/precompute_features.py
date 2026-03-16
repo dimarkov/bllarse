@@ -44,7 +44,7 @@ def main():
         choices=list(DATASET_CONFIGS.keys()), help="Datasets to process (default: all)",
     )
     parser.add_argument("--cache-dir", type=str, default=".cache/features", help="Cache directory")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for feature extraction")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for feature extraction")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="gpu", help="Device to use")
     parser.add_argument("--no-cache", action="store_true", help="Force recomputation of all features")

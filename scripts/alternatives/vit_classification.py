@@ -17,6 +17,10 @@ Example usage:
 """
 
 import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
 import shutil
 import argparse
 import warnings
@@ -34,6 +38,8 @@ import optax
 import mlflow
 from huggingface_hub import hf_hub_download, HfApi
 
+from queue import Queue
+from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from PIL import Image
@@ -212,6 +218,7 @@ def iterate_batches(dataset_split, img_key, label_key, batch_size, img_size, mea
     Uses a thread pool to parallelize image decode and resize across CPU cores.
     """
     n_samples = len(dataset_split)
+    all_labels = np.array(dataset_split[label_key])
 
     if key is not None:
         indices = jr.permutation(key, n_samples)
@@ -226,7 +233,7 @@ def iterate_batches(dataset_split, img_key, label_key, batch_size, img_size, mea
             batch_idx = indices[start:start + batch_size]
 
             images = list(pool.map(worker_fn, batch_idx))
-            labels = jnp.asarray(dataset_split.select(batch_idx)[label_key])
+            labels = jnp.asarray(all_labels[batch_idx])
 
             images = jnp.stack(images)
             # Normalize
@@ -238,6 +245,7 @@ def iterate_batches(dataset_split, img_key, label_key, batch_size, img_size, mea
             yield images, labels
 
 
+@eqx.filter_jit
 def extract_features(model, images, key):
     """Extract features from ViT model (CLS token or global average)."""
     def single_forward(x):
@@ -251,33 +259,79 @@ def extract_features(model, images, key):
     return vmap(single_forward)(images)
 
 
-def precompute_features(model, dataset_split, ds_config, img_size, mean, std, batch_size, key, channels_first=True):
-    """Extract features for an entire split once; return CPU numpy arrays."""
-    n_samples = len(dataset_split)
-    n_full = n_samples
+def prefetch_iterator(iterator, n_prefetch=2):
+    """Wrap an iterator to prefetch items in a background thread."""
+    q = Queue(maxsize=n_prefetch)
+    sentinel = object()
 
+    def fill():
+        for item in iterator:
+            q.put(item)
+        q.put(sentinel)
+
+    t = Thread(target=fill, daemon=True)
+    t.start()
+    while True:
+        item = q.get()
+        if item is sentinel:
+            break
+        yield item
+
+
+def precompute_features(model, dataset_split, ds_config, img_size, mean, std, batch_size, key, channels_first=True):
+    """Extract features for an entire split once; return CPU numpy arrays.
+
+    Uses memory-mapped temporary files to avoid holding all features in RAM.
+    """
+    import tempfile
+
+    n_samples = len(dataset_split)
     all_features = None
     all_labels = None
+    feat_tmp = None
+    label_tmp = None
     offset = 0
 
-    for images, labels in iterate_batches(
+    batches = iterate_batches(
         dataset_split, ds_config["img_key"], ds_config["label_key"],
         batch_size=batch_size, img_size=img_size, mean=mean, std=std, key=None,
         channels_first=channels_first,
-    ):
-        features = np.asarray(extract_features(model, images, key))
-        labels_np = np.asarray(labels)
+    )
+    try:
+        for images, labels in prefetch_iterator(batches, n_prefetch=2):
+            features = np.asarray(extract_features(model, images, key))
+            labels_np = np.asarray(labels)
 
-        if all_features is None:
-            all_features = np.empty((n_full, features.shape[-1]), dtype=features.dtype)
-            all_labels = np.empty(n_full, dtype=labels_np.dtype)
+            if all_features is None:
+                feat_tmp = tempfile.NamedTemporaryFile(suffix=".dat", delete=False)
+                label_tmp = tempfile.NamedTemporaryFile(suffix=".dat", delete=False)
+                all_features = np.memmap(
+                    feat_tmp.name, dtype=features.dtype, mode="w+",
+                    shape=(n_samples, features.shape[-1]),
+                )
+                all_labels = np.memmap(
+                    label_tmp.name, dtype=labels_np.dtype, mode="w+",
+                    shape=(n_samples,),
+                )
 
-        n = len(features)
-        all_features[offset:offset + n] = features
-        all_labels[offset:offset + n] = labels_np
-        offset += n
+            n = len(features)
+            all_features[offset:offset + n] = features
+            all_labels[offset:offset + n] = labels_np
+            offset += n
 
-    return all_features[:offset], all_labels[:offset]
+        # Copy to regular arrays for return (will be saved to npz immediately)
+        result_features = np.array(all_features[:offset])
+        result_labels = np.array(all_labels[:offset])
+    finally:
+        # Clean up temp files
+        if feat_tmp is not None:
+            del all_features
+            os.unlink(feat_tmp.name)
+        if label_tmp is not None:
+            del all_labels
+            os.unlink(label_tmp.name)
+
+    return result_features, result_labels
 
 
 def download_features_from_hf(repo_id, repo_path, local_path):
