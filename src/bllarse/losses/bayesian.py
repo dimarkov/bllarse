@@ -22,8 +22,8 @@ def mm(a, b, *, preset, dot_dtype):
     """matmul with explicit cast to dot_dtype and DotAlgorithmPreset."""
     return jnp.matmul(a.astype(dot_dtype), b.astype(dot_dtype), precision=preset)
 
-mm_outer = partial(mm, preset='F32_F32_F32', dot_dtype=jnp.float32)
-mm_inner = partial(mm, preset='TF32_TF32_F32', dot_dtype=jnp.float32)
+mm_update = partial(mm, preset='F32_F32_F32', dot_dtype=jnp.float32)
+mm_loss = partial(mm, preset='TF32_TF32_F32', dot_dtype=jnp.float32)
 
 class IBProbit(eqx.Module):
     """
@@ -64,36 +64,35 @@ class IBProbit(eqx.Module):
         fts = vmap(self.norm)(features.astype(jnp.float32))
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
 
-        # it does not work with 'TF32_TF32_F32' with large batches on imagenet1k
-        xxT = mm_outer(fts.T, fts)
+        xxT = mm_update(fts.T, fts)
 
-        Lambda_old = mm_outer(self.L, self.L.T)
-        eta_old = mm_outer(Lambda_old, self.mu)
+        Lambda_old = mm_update(self.L, self.L.T)
+        eta_old = mm_update(Lambda_old, self.mu)
         Lambda_new = Lambda_old + xxT
 
         L_new, lower = cho_factor(Lambda_new, lower=True)
         y_one_hot = nn.one_hot(y, self.mu.shape[-1])
-        
+
         x = cho_solve((L_new, lower), fts.T).T
 
         def step_fn(eta_carry, *args):
-            # One step of Coordinate Ascent Variational Inference (CAVI) for the probit model.
+            pred = mm_update(x, eta_carry)
 
-            pred = mm_inner(x, eta_carry)
+            # Compute E_q[z_ik] via log-space Mills ratios
+            log_pdf = norm.logpdf(pred)
+            mills_pos = jnp.exp(log_pdf - norm.logcdf(pred))
+            mills_neg = jnp.exp(log_pdf - norm.logcdf(-pred))
+            correction = jnp.where(y_one_hot, mills_pos, -mills_neg)
+            E_q_z = pred + correction
 
-            # Compute E_q[z_ik]
-            Phi = self.cdf(- pred)
-            E_q_z = pred + norm.pdf(- pred) * (y_one_hot + Phi - 1) / (Phi * (1 - Phi) + 1e-5)
-            
-            # Update variational mean
-            eta_carry = eta_old + mm_inner(fts.T, E_q_z)
+            eta_carry = eta_old + mm_update(fts.T, E_q_z)
             return eta_carry, None
 
         eta_new, _ = lax.scan(step_fn, eta_old, jnp.arange(num_iters))
 
         mu_new = cho_solve((L_new, lower), eta_new)
 
-        return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu_new, L_new))
+        return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu_new, jnp.tril(L_new)))
     
     @property
     def params(self) -> Tuple[Array, Array]:
@@ -107,7 +106,7 @@ class IBProbit(eqx.Module):
         fts = vmap(self.norm)(features.astype(jnp.float32))
 
         # compute loss
-        logits = mm_inner(fts, weights)
+        logits = mm_loss(fts, weights)
         if self.use_bias:
             logits = logits + bias
 
