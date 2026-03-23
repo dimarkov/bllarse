@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Callable
 from functools import partial
 
 const = jnp.sqrt(2 / jnp.pi)
-initializer = nn.initializers.lecun_normal()
+initializer = nn.initializers.glorot_normal()
 
 def approx_cdf(x):
     return nn.sigmoid(2 * const * (x + 0.044715 * x ** 3) )
