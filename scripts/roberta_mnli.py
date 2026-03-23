@@ -35,12 +35,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import equinox as eqx
-from jax import lax, nn, random as jr
+from jax import config, lax, nn, random as jr
 from tensorflow_probability.substrates.jax.stats import (
     expected_calibration_error as compute_ece,
 )
 
 from bllarse.losses import CrossEntropy, IBProbit
+
+config.update("jax_default_matmul_precision", "highest")
 
 try:
     import mlflow
@@ -793,6 +795,7 @@ def _train_ibprobit_head(
     batch_size: int,
     epochs: int,
     num_update_iters: int,
+    reset_loss_per_epoch: bool,
     seed: int,
 ) -> Tuple[IBProbit, Dict[str, Any]]:
     if num_update_iters <= 0:
@@ -800,17 +803,48 @@ def _train_ibprobit_head(
 
     num_features = x_train.shape[1]
     num_classes = int(y_train.max()) + 1
+    n = int(y_train.shape[0])
+    n_batches = n // batch_size
+    if n_batches <= 0:
+        raise ValueError(
+            "IBProbit training requires train_batch_size <= number of training samples "
+            f"(got batch_size={batch_size}, n_train={n})."
+        )
 
     key = jr.PRNGKey(seed)
     key, init_key = jr.split(key)
     model = IBProbit(num_features, num_classes, key=init_key)
+    loss_params, loss_static = eqx.partition(model, eqx.is_array)
 
     @eqx.filter_jit
-    def _cavi_step(m: IBProbit, x: jnp.ndarray, y: jnp.ndarray) -> IBProbit:
-        return m.update(x, y, num_iters=num_update_iters)
+    def _run_epoch(
+        curr_loss_params,
+        x_data: jnp.ndarray,
+        y_data: jnp.ndarray,
+        batch_indices: jnp.ndarray,
+    ):
+        def _batch_body(loss_params, idx):
+            current_loss = eqx.combine(loss_params, loss_static)
+            x_batch = jnp.asarray(x_data[idx], dtype=jnp.float32)
+            y_batch = y_data[idx]
+            updated_loss = current_loss.update(
+                x_batch,
+                y_batch,
+                num_iters=num_update_iters,
+            )
+            updated_loss_params = eqx.filter(updated_loss, eqx.is_array)
+            batch_loss = updated_loss(x_batch, y_batch, loss_type=3).mean()
+            return updated_loss_params, batch_loss
+
+        return lax.scan(_batch_body, curr_loss_params, batch_indices)
 
     rng = np.random.default_rng(seed)
-    n = y_train.shape[0]
+    x_train_device = jax.device_put(jnp.asarray(x_train))
+    y_train_device = jax.device_put(jnp.asarray(y_train, dtype=jnp.int32))
+    x_val_m_device = jax.device_put(jnp.asarray(x_val_m))
+    y_val_m_device = jax.device_put(jnp.asarray(y_val_m, dtype=jnp.int32))
+    x_val_mm_device = jax.device_put(jnp.asarray(x_val_mm))
+    y_val_mm_device = jax.device_put(jnp.asarray(y_val_mm, dtype=jnp.int32))
     epoch_losses: list[float] = []
     history: list[Dict[str, float]] = []
     best_model: IBProbit | None = None
@@ -819,30 +853,34 @@ def _train_ibprobit_head(
 
     for epoch_idx in range(epochs):
         epoch_start = time.perf_counter()
-        perm = rng.permutation(n)
-        batch_losses: list[float] = []
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            idx = perm[start:end]
-            x_batch = jnp.asarray(x_train[idx], dtype=jnp.float32)
-            y_batch = jnp.asarray(y_train[idx], dtype=jnp.int32)
-            model = _cavi_step(model, x_batch, y_batch)
-            batch_loss = jnp.mean(model(x_batch, y_batch, loss_type=3))
-            batch_losses.append(float(batch_loss))
+        key, epoch_key = jr.split(key)
+        if reset_loss_per_epoch:
+            current_model = eqx.combine(loss_params, loss_static)
+            reset_model = current_model.reset(epoch_key)
+            loss_params = eqx.filter(reset_model, eqx.is_array)
 
-        epoch_train_loss = float(np.mean(batch_losses))
+        perm = rng.permutation(n)
+        batch_indices = perm[: n_batches * batch_size].reshape(n_batches, batch_size)
+        loss_params, batch_losses = _run_epoch(
+            loss_params,
+            x_train_device,
+            y_train_device,
+            jax.device_put(jnp.asarray(batch_indices, dtype=jnp.int32)),
+        )
+        model = eqx.combine(loss_params, loss_static)
+        epoch_train_loss = float(jnp.mean(batch_losses))
         epoch_losses.append(epoch_train_loss)
 
         metrics_m = _evaluate_ibprobit_head(
             model,
-            x_val_m,
-            y_val_m,
+            x_val_m_device,
+            y_val_m_device,
             batch_size=batch_size,
         )
         metrics_mm = _evaluate_ibprobit_head(
             model,
-            x_val_mm,
-            y_val_mm,
+            x_val_mm_device,
+            y_val_mm_device,
             batch_size=batch_size,
         )
         epoch_seconds = float(time.perf_counter() - epoch_start)
@@ -872,9 +910,30 @@ def _train_ibprobit_head(
         )
 
         if checkpoint_is_better(metrics_m, best_metrics_m):
-            best_model = model
+            best_model = eqx.combine(
+                jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), loss_params),
+                loss_static,
+            )
             best_epoch = epoch_idx + 1
             best_metrics_m = dict(metrics_m)
+
+        epoch_is_finite = np.isfinite(epoch_train_loss) and all(
+            np.isfinite(v)
+            for v in (
+                metrics_m["acc"],
+                metrics_m["nll"],
+                metrics_m["ece"],
+                metrics_mm["acc"],
+                metrics_mm["nll"],
+                metrics_mm["ece"],
+            )
+        )
+        if not epoch_is_finite:
+            print(
+                "[bllarse] Non-finite IBProbit metrics detected; "
+                "stopping early and keeping the best finite checkpoint."
+            )
+            break
 
     training_info = {
         "epoch_losses": epoch_losses,
@@ -897,6 +956,7 @@ def _train_and_evaluate(
     learning_rate: float,
     weight_decay: float,
     dropout_rate: float,
+    reset_loss_per_epoch: bool,
     seed: int,
 ) -> Dict[str, Any]:
     x_train = np.asarray(arrays["X_train"])
@@ -935,6 +995,7 @@ def _train_and_evaluate(
             batch_size=train_batch_size,
             epochs=epochs,
             num_update_iters=num_update_iters,
+            reset_loss_per_epoch=reset_loss_per_epoch,
             seed=seed,
         )
         metrics_m = _evaluate_ibprobit_head(model, x_val_m, y_val_m, batch_size=train_batch_size)
@@ -1136,6 +1197,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--train-batch-size", type=int, default=1024)
     parser.add_argument("--num-update-iters", type=int, default=16)
+    parser.add_argument("--reset-loss-per-epoch", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
@@ -1202,6 +1264,7 @@ def main(args) -> None:
                     "epochs": args.epochs,
                     "train_batch_size": args.train_batch_size,
                     "num_update_iters": args.num_update_iters,
+                    "reset_loss_per_epoch": int(args.reset_loss_per_epoch),
                     "learning_rate": args.learning_rate,
                     "weight_decay": args.weight_decay,
                     "dropout_rate": args.dropout_rate,
@@ -1266,6 +1329,7 @@ def main(args) -> None:
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             dropout_rate=args.dropout_rate,
+            reset_loss_per_epoch=args.reset_loss_per_epoch,
             seed=args.seed,
         )
 
