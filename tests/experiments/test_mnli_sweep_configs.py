@@ -491,3 +491,36 @@ def test_roberta_large_len512_ibprobit_singlepass_multiseed_sweep_config():
         assert cfg["epochs"] == 1
         assert cfg["dropout_rate"] == 0.0
         assert cfg["reset_loss_per_epoch"] is False
+
+
+def test_roberta_large_len512_ibprobit_singlepass_multiseed_expanded_sweep_config():
+    repo_root = Path(__file__).resolve().parents[2]
+    sweep_path = (
+        repo_root
+        / "bllarse_sweeps"
+        / "mnli_roberta_large_len512_ibprobit_singlepass_multiseed_expanded.py"
+    )
+    sweep = _load_module(sweep_path)
+
+    configs = sweep.create_configs()
+    assert len(configs) == 280
+
+    backbones = {cfg["backbone"] for cfg in configs}
+    assert backbones == {"FacebookAI/roberta-large"}
+
+    batch_sizes = {cfg["train_batch_size"] for cfg in configs}
+    assert batch_sizes == {128, 256, 512, 1024, 2048, 4096, 8192, 16384}
+
+    num_iters = {cfg["num_update_iters"] for cfg in configs}
+    assert num_iters == {1, 4, 8, 16, 32, 64, 128}
+
+    seeds = {cfg["seed"] for cfg in configs}
+    assert seeds == {2022, 2023, 2024, 2025, 2026}
+
+    for cfg in configs:
+        assert cfg["stage"] == "train_eval"
+        assert cfg["optimizer"] == "cavi"
+        assert cfg["max_length"] == 512
+        assert cfg["epochs"] == 1
+        assert cfg["dropout_rate"] == 0.0
+        assert cfg["reset_loss_per_epoch"] is False
