@@ -321,3 +321,38 @@ def test_roberta_large_len512_bs2048_refine_sweep_config():
         assert cfg["max_length"] == 512
         assert cfg["epochs"] == 100
         assert cfg["dropout_rate"] == 0.1
+
+
+def test_roberta_large_len512_regime_search_sweep_config():
+    repo_root = Path(__file__).resolve().parents[2]
+    sweep_path = (
+        repo_root
+        / "bllarse_sweeps"
+        / "mnli_roberta_large_len512_linear_probe_regime_search.py"
+    )
+    sweep = _load_module(sweep_path)
+
+    configs = sweep.create_configs()
+    assert len(configs) == 24
+
+    backbones = {cfg["backbone"] for cfg in configs}
+    assert backbones == {"FacebookAI/roberta-large"}
+
+    batch_sizes = {cfg["train_batch_size"] for cfg in configs}
+    assert batch_sizes == {256, 512, 1024, 2048}
+
+    learning_rates = {cfg["learning_rate"] for cfg in configs}
+    assert learning_rates == {3e-4, 7e-4, 1e-3}
+
+    dropout_rates = {cfg["dropout_rate"] for cfg in configs}
+    assert dropout_rates == {0.0, 0.1}
+
+    seeds = {cfg["seed"] for cfg in configs}
+    assert seeds == {2022}
+
+    for cfg in configs:
+        assert cfg["stage"] == "train_eval"
+        assert cfg["optimizer"] == "adam"
+        assert cfg["weight_decay"] == 0.0
+        assert cfg["max_length"] == 512
+        assert cfg["epochs"] == 120
