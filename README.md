@@ -327,6 +327,7 @@ features:
 - `bllarse_sweeps/mnli_roberta_len512_linear_probe_largebatch_adam.py`
 - `bllarse_sweeps/mnli_roberta_len512_linear_probe_largebatch_adam_long.py`
 - `bllarse_sweeps/mnli_roberta_len512_linear_probe_bs2048_refine.py`
+- `bllarse_sweeps/mnli_roberta_large_len512_linear_probe_bs2048_refine.py`
 
 The current best `bs=2048` seeded refinement sweep uses:
 
@@ -349,6 +350,28 @@ python -m bllarse.tools.run_sweep \
   --max-concurrent 8 \
   --cpus-per-task 8 \
   --job-name mnli_len512_bs2048_refine \
+  --job-script src/slurm/jobs/slurm_run_config_docker.sh
+```
+
+Analogous `roberta-large` seeded sweep:
+
+- optimizer: `adam`
+- batch size: `2048`
+- epochs: `100`
+- learning rates: `7e-4`, `1e-3`, `1.3e-3`
+- seeds: `2022`, `2023`, `2024`, `2025`, `2026`
+
+```bash
+source .venv_bllarse_new/bin/activate
+export MLFLOW_TRACKING_URI="https://mlflow.markov.icu"
+export BLLARSE_DOCKER_SHM_SIZE=16g
+
+python -m bllarse.tools.run_sweep \
+  bllarse_sweeps/mnli_roberta_large_len512_linear_probe_bs2048_refine.py \
+  --venv .venv_bllarse_new \
+  --max-concurrent 8 \
+  --cpus-per-task 8 \
+  --job-name mnli_roberta_large_len512_bs2048_refine \
   --job-script src/slurm/jobs/slurm_run_config_docker.sh
 ```
 
