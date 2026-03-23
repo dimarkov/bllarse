@@ -15,14 +15,14 @@ from bllarse.mlflow_utils import load_mlflow_env_defaults
 
 METRIC_SPECS = {
     "matched": {
-        "acc": ("acc", "Matched Accuracy", "viridis"),
-        "nll": ("nll", "Matched NLL", "magma_r"),
-        "ece": ("ece", "Matched ECE", "magma_r"),
+        "acc": ("acc", "Matched Accuracy"),
+        "nll": ("nll", "Matched NLL"),
+        "ece": ("ece", "Matched ECE"),
     },
     "mismatched": {
-        "acc": ("val_mismatched_acc", "Mismatched Accuracy", "viridis"),
-        "nll": ("val_mismatched_nll", "Mismatched NLL", "magma_r"),
-        "ece": ("val_mismatched_ece", "Mismatched ECE", "magma_r"),
+        "acc": ("val_mismatched_acc", "Mismatched Accuracy"),
+        "nll": ("val_mismatched_nll", "Mismatched NLL"),
+        "ece": ("val_mismatched_ece", "Mismatched ECE"),
     },
 }
 
@@ -37,7 +37,7 @@ def _int_param(run, key: str) -> int:
 
 def _group_runs(
     runs: Iterable,
-    metric_keys: Dict[str, Tuple[str, str, str]],
+    metric_keys: Dict[str, Tuple[str, str]],
 ) -> Tuple[List[int], List[int], Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Dict[str, int]]]:
     run_list = list(runs)
     batch_sizes = sorted({_int_param(run_list[i], "train_batch_size") for i in range(len(run_list))})
@@ -53,7 +53,7 @@ def _group_runs(
     for run in run_list:
         batch_size = _int_param(run, "train_batch_size")
         num_update_iters = _int_param(run, "num_update_iters")
-        for metric_name, (metric_key, _, _) in metric_keys.items():
+        for metric_name, (metric_key, _) in metric_keys.items():
             value = run.data.metrics.get(metric_key)
             if value is None or not np.isfinite(value):
                 continue
@@ -88,6 +88,7 @@ def _plot_metric(
     cmap: str,
     batch_sizes: List[int],
     num_iters: List[int],
+    annotate: bool,
 ) -> None:
     masked = np.ma.masked_invalid(values)
     image = ax.imshow(masked, cmap=cmap, aspect="auto")
@@ -99,23 +100,24 @@ def _plot_metric(
     ax.set_yticks(np.arange(len(batch_sizes)))
     ax.set_yticklabels([str(x) for x in batch_sizes])
 
-    for row in range(values.shape[0]):
-        for col in range(values.shape[1]):
-            value = values[row, col]
-            std = stds[row, col]
-            if not np.isfinite(value):
-                label = "NA"
-            else:
-                label = f"{value:.4f}\n±{std:.4f}"
-            ax.text(
-                col,
-                row,
-                label,
-                ha="center",
-                va="center",
-                fontsize=8,
-                color="white" if np.isfinite(value) and image.norm(value) > 0.55 else "black",
-            )
+    if annotate:
+        for row in range(values.shape[0]):
+            for col in range(values.shape[1]):
+                value = values[row, col]
+                std = stds[row, col]
+                if not np.isfinite(value):
+                    label = "NA"
+                else:
+                    label = f"{value:.4f}\n±{std:.4f}"
+                ax.text(
+                    col,
+                    row,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white" if np.isfinite(value) and image.norm(value) > 0.55 else "black",
+                )
 
     plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
 
@@ -159,6 +161,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--parent-run-id", type=str, required=True)
     parser.add_argument("--split", choices=["matched", "mismatched"], default="matched")
     parser.add_argument("--output-prefix", type=str, required=True)
+    parser.add_argument("--cmap", type=str, default="viridis")
+    parser.add_argument("--annotate", action="store_true")
     parser.add_argument(
         "--title",
         type=str,
@@ -188,15 +192,16 @@ def main(args: argparse.Namespace) -> None:
     fig.suptitle(args.title, fontsize=14)
 
     for ax, metric_name in zip(axes, ["acc", "nll", "ece"]):
-        _, title, cmap = metric_keys[metric_name]
+        _, title = metric_keys[metric_name]
         _plot_metric(
             ax,
             means[metric_name],
             stds[metric_name],
             title=title,
-            cmap=cmap,
+            cmap=args.cmap,
             batch_sizes=batch_sizes,
             num_iters=num_iters,
+            annotate=args.annotate,
         )
 
     png_path = output_prefix.with_suffix(".png")
