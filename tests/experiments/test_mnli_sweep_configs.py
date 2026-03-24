@@ -428,6 +428,43 @@ def test_roberta_large_len512_bs128_confirm_sweep_config():
         assert cfg["epochs"] == 140
 
 
+def test_roberta_large_len512_largebatch_adam_adamw_sweep_config():
+    repo_root = Path(__file__).resolve().parents[2]
+    sweep_path = (
+        repo_root
+        / "bllarse_sweeps"
+        / "mnli_roberta_large_len512_linear_probe_largebatch_adam_adamw.py"
+    )
+    sweep = _load_module(sweep_path)
+
+    configs = sweep.create_configs()
+    assert len(configs) == 60
+
+    backbones = {cfg["backbone"] for cfg in configs}
+    assert backbones == {"FacebookAI/roberta-large"}
+
+    batch_sizes = {cfg["train_batch_size"] for cfg in configs}
+    assert batch_sizes == {512, 1024, 2048, 4096, 8192, 16384}
+
+    optimizers = {cfg["optimizer"] for cfg in configs}
+    assert optimizers == {"adam", "adamw"}
+
+    seeds = {cfg["seed"] for cfg in configs}
+    assert seeds == {2022, 2023, 2024, 2025, 2026}
+
+    for cfg in configs:
+        assert cfg["stage"] == "train_eval"
+        assert cfg["max_length"] == 512
+        assert cfg["epochs"] == 140
+        assert cfg["learning_rate"] == 1.2e-3
+        assert cfg["dropout_rate"] == 0.0
+        assert cfg["num_update_iters"] == 0
+        if cfg["optimizer"] == "adam":
+            assert cfg["weight_decay"] == 0.0
+        else:
+            assert cfg["weight_decay"] == 1e-2
+
+
 def test_roberta_large_len512_ibprobit_initial_sweep_config():
     repo_root = Path(__file__).resolve().parents[2]
     sweep_path = (
