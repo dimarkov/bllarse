@@ -55,7 +55,7 @@ class IBProbit(eqx.Module):
         self.norm = eqx.nn.LayerNorm(input_dim, use_weight=False, use_bias=False)
 
     def reset(self, key: PRNGKey) -> "IBProbit":
-        d, num_classes = self.eta.shape
+        d, num_classes = self.mu.shape
         mu = initializer(key, (d, num_classes), jnp.float32)
         L = jnp.eye(d, dtype=jnp.float32)
         return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu, L))

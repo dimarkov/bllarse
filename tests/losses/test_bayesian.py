@@ -32,6 +32,19 @@ def test_independent_binary_probit_loss():
     acc = jnp.mean(logits.argmax(-1) == y)
     print('acc = ', acc)
 
+
+def test_ibprobit_reset_preserves_parameter_shapes():
+    key = jr.PRNGKey(0)
+    model = IBProbit(input_dim=10, num_classes=3, key=key, use_bias=True)
+    key, reset_key = jr.split(key)
+    reset_model = model.reset(reset_key)
+
+    assert reset_model.mu.shape == model.mu.shape
+    assert reset_model.L.shape == model.L.shape
+    assert jnp.isfinite(reset_model.mu).all()
+    assert jnp.isfinite(reset_model.L).all()
+
+
 def test_independent_binary_polyagamma_loss():
     key = jr.PRNGKey(0)
     D, C, N = 10, 5, 1_000
