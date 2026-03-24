@@ -838,7 +838,6 @@ def _train_ibprobit_head(
 
         return lax.scan(_batch_body, curr_loss_params, batch_indices)
 
-    rng = np.random.default_rng(seed)
     x_train_device = jax.device_put(jnp.asarray(x_train))
     y_train_device = jax.device_put(jnp.asarray(y_train, dtype=jnp.int32))
     x_val_m_device = jax.device_put(jnp.asarray(x_val_m))
@@ -854,12 +853,13 @@ def _train_ibprobit_head(
     for epoch_idx in range(epochs):
         epoch_start = time.perf_counter()
         key, epoch_key = jr.split(key)
+        reset_key, perm_key = jr.split(epoch_key)
         if reset_loss_per_epoch:
             current_model = eqx.combine(loss_params, loss_static)
-            reset_model = current_model.reset(epoch_key)
+            reset_model = current_model.reset(reset_key)
             loss_params = eqx.filter(reset_model, eqx.is_array)
 
-        perm = rng.permutation(n)
+        perm = jr.permutation(perm_key, n)
         batch_indices = perm[: n_batches * batch_size].reshape(n_batches, batch_size)
         loss_params, batch_losses = _run_epoch(
             loss_params,
