@@ -43,6 +43,7 @@ def run_sweep(
     num_jobs: int | None,
     cpus_per_task: int | None,
     parent_run_id: str | None,
+    exclude_nodes: str | None,
 ):
     sweep = get_module_from_source_path(sweep_source)
     all_configs = sweep.create_configs()
@@ -127,6 +128,8 @@ def run_sweep(
     ]
     if cpus_per_task is not None:
         sbatch_cmd.extend(["--cpus-per-task", str(cpus_per_task)])
+    if exclude_nodes:
+        sbatch_cmd.extend(["--exclude", exclude_nodes])
     sbatch_cmd.append(job_script)
 
     subprocess.run(sbatch_cmd, env=env, check=True)
@@ -162,6 +165,12 @@ def main():
         default=None,
         help="Optional existing MLflow parent run id to attach all child runs to.",
     )
+    ap.add_argument(
+        "--exclude-nodes",
+        type=str,
+        default=None,
+        help="Optional comma-separated SLURM node list to exclude from the sweep.",
+    )
     args = ap.parse_args()
     run_sweep(
         args.sweep_source,
@@ -173,6 +182,7 @@ def main():
         args.num_jobs,
         args.cpus_per_task,
         args.parent_run_id,
+        args.exclude_nodes,
     )
 if __name__ == "__main__":
     main()
