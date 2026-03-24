@@ -80,6 +80,7 @@ def _group_runs(
     dict[str, dict[str, np.ndarray]],
     dict[str, dict[str, np.ndarray]],
     dict[str, dict[str, np.ndarray]],
+    dict[str, dict[str, list[list[list[float]]]]],
 ]:
     run_list = [
         run for run in runs if _int_param(run, "train_batch_size") >= min_batch_size
@@ -111,6 +112,13 @@ def _group_runs(
         }
         for split, _ in SPLIT_LAYOUT
     }
+    samples: dict[str, dict[str, list[list[list[float]]]]] = {
+        split: {
+            metric: [[[] for _ in batch_sizes] for _ in optimizers]
+            for metric, _ in METRIC_LAYOUT
+        }
+        for split, _ in SPLIT_LAYOUT
+    }
 
     grouped: dict[tuple[str, int], list] = defaultdict(list)
     for run in run_list:
@@ -135,8 +143,44 @@ def _group_runs(
                     low, high = _spread_bounds(values, "minmax")
                     lowers[split][metric][row, col] = low
                     uppers[split][metric][row, col] = high
+                    samples[split][metric][row][col] = sorted(values)
 
-    return batch_sizes, optimizers, grids, lowers, uppers
+    return batch_sizes, optimizers, grids, lowers, uppers, samples
+
+
+def _scatter_seed_points(
+    ax,
+    *,
+    batch_sizes: list[int],
+    series_idx: int,
+    num_series: int,
+    sample_rows: list[list[float]],
+    color,
+    alpha: float,
+    size: float,
+    jitter_width: float,
+) -> None:
+    if num_series <= 1:
+        series_center = 0.0
+    else:
+        series_center = np.linspace(-jitter_width, jitter_width, num_series)[series_idx]
+
+    for batch_idx, batch_size in enumerate(batch_sizes):
+        values = sample_rows[batch_idx]
+        if not values:
+            continue
+        seed_offsets = np.linspace(-jitter_width * 0.35, jitter_width * 0.35, len(values))
+        offsets = series_center + seed_offsets
+        x = batch_size * np.power(2.0, offsets)
+        ax.scatter(
+            x,
+            values,
+            s=size,
+            color=color,
+            alpha=alpha,
+            edgecolors="none",
+            zorder=3,
+        )
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -153,6 +197,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-stat", choices=["mean", "iqm"], default="mean")
     parser.add_argument("--spread", choices=["none", "minmax"], default="none")
     parser.add_argument("--spread-alpha", type=float, default=0.18)
+    parser.add_argument("--show-seed-points", action="store_true")
+    parser.add_argument("--point-alpha", type=float, default=0.55)
+    parser.add_argument("--point-size", type=float, default=18.0)
+    parser.add_argument("--point-jitter-width", type=float, default=0.12)
     return parser
 
 
@@ -167,7 +215,7 @@ def main(args: argparse.Namespace) -> None:
     if not runs:
         raise ValueError("No MLflow child runs matched the requested parent run.")
 
-    batch_sizes, optimizers, grids, lowers, uppers = _group_runs(
+    batch_sizes, optimizers, grids, lowers, uppers, samples = _group_runs(
         runs,
         min_batch_size=args.min_batch_size,
         summary_stat=args.summary_stat,
@@ -197,6 +245,7 @@ def main(args: argparse.Namespace) -> None:
             values = grids[split][metric]
             lower_values = lowers[split][metric]
             upper_values = uppers[split][metric]
+            sample_values = samples[split][metric]
             for opt_idx, optimizer in enumerate(optimizers):
                 y = values[opt_idx]
                 lower = lower_values[opt_idx]
@@ -212,6 +261,18 @@ def main(args: argparse.Namespace) -> None:
                             alpha=args.spread_alpha,
                             linewidth=0,
                         )
+                if args.show_seed_points:
+                    _scatter_seed_points(
+                        ax,
+                        batch_sizes=batch_sizes,
+                        series_idx=opt_idx,
+                        num_series=len(optimizers),
+                        sample_rows=sample_values[opt_idx],
+                        color=colors[optimizer],
+                        alpha=args.point_alpha,
+                        size=args.point_size,
+                        jitter_width=args.point_jitter_width,
+                    )
                 handle = ax.plot(
                     batch_sizes,
                     y,
