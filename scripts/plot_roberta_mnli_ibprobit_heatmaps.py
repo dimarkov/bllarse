@@ -38,8 +38,16 @@ def _int_param(run, key: str) -> int:
 def _group_runs(
     runs: Iterable,
     metric_keys: Dict[str, Tuple[str, str]],
+    *,
+    min_batch_size: int | None,
 ) -> Tuple[List[int], List[int], Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Dict[str, int]]]:
     run_list = list(runs)
+    if min_batch_size is not None:
+        run_list = [
+            run for run in run_list if _int_param(run, "train_batch_size") >= min_batch_size
+        ]
+    if not run_list:
+        raise ValueError("No MLflow runs remain after applying the batch-size filter.")
     batch_sizes = sorted({_int_param(run_list[i], "train_batch_size") for i in range(len(run_list))})
     num_iters = sorted({_int_param(run_list[i], "num_update_iters") for i in range(len(run_list))})
     batch_index = {value: idx for idx, value in enumerate(batch_sizes)}
@@ -131,10 +139,12 @@ def _build_summary(
     counts: Dict[str, Dict[str, int]],
     split: str,
     parent_run_id: str,
+    min_batch_size: int | None,
 ) -> Dict[str, object]:
     summary: Dict[str, object] = {
         "parent_run_id": parent_run_id,
         "split": split,
+        "min_batch_size": min_batch_size,
         "batch_sizes": batch_sizes,
         "num_update_iters": num_iters,
         "metrics": {},
@@ -163,6 +173,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output-prefix", type=str, required=True)
     parser.add_argument("--cmap", type=str, default="viridis")
     parser.add_argument("--annotate", action="store_true")
+    parser.add_argument("--min-batch-size", type=int, default=None)
     parser.add_argument(
         "--title",
         type=str,
@@ -183,7 +194,11 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("No MLflow child runs matched the requested parent run.")
 
     metric_keys = METRIC_SPECS[args.split]
-    batch_sizes, num_iters, means, stds, counts = _group_runs(runs, metric_keys)
+    batch_sizes, num_iters, means, stds, counts = _group_runs(
+        runs,
+        metric_keys,
+        min_batch_size=args.min_batch_size,
+    )
 
     output_prefix = Path(args.output_prefix)
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +233,7 @@ def main(args: argparse.Namespace) -> None:
         counts=counts,
         split=args.split,
         parent_run_id=args.parent_run_id,
+        min_batch_size=args.min_batch_size,
     )
     json_path = output_prefix.with_suffix(".json")
     json_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
