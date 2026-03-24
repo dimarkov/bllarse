@@ -41,10 +41,26 @@ def _int_param(run, key: str) -> int:
     return int(run.data.params[key])
 
 
+def _summary_stat(values: list[float], stat: str) -> float:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return float("nan")
+    if stat == "mean":
+        return float(np.mean(arr))
+    if stat == "iqm":
+        arr = np.sort(arr)
+        trim = int(arr.size * 0.25)
+        if trim > 0 and arr.size - 2 * trim > 0:
+            arr = arr[trim:-trim]
+        return float(np.mean(arr))
+    raise ValueError(f"Unknown summary stat '{stat}'.")
+
+
 def _group_runs(
     runs: Iterable,
     *,
     min_batch_size: int,
+    summary_stat: str,
 ) -> tuple[list[int], list[int], dict[str, dict[str, np.ndarray]]]:
     run_list = [
         run for run in runs if _int_param(run, "train_batch_size") >= min_batch_size
@@ -82,7 +98,7 @@ def _group_runs(
                     if key in run.data.metrics and np.isfinite(run.data.metrics[key])
                 ]
                 if values:
-                    grids[split][metric][row, col] = float(np.mean(values))
+                    grids[split][metric][row, col] = _summary_stat(values, summary_stat)
 
     return batch_sizes, num_iters, grids
 
@@ -99,6 +115,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--legend-title", type=str, default="num_update_iters")
     parser.add_argument("--log-nll", action="store_true")
     parser.add_argument("--share-y-by-row", action="store_true")
+    parser.add_argument("--summary-stat", choices=["mean", "iqm"], default="mean")
     return parser
 
 
@@ -116,6 +133,7 @@ def main(args: argparse.Namespace) -> None:
     batch_sizes, num_iters, grids = _group_runs(
         runs,
         min_batch_size=args.min_batch_size,
+        summary_stat=args.summary_stat,
     )
 
     output_prefix = Path(args.output_prefix)
