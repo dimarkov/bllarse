@@ -60,12 +60,27 @@ def _summary_stat(values: list[float], stat: str) -> float:
     raise ValueError(f"Unknown summary stat '{stat}'.")
 
 
+def _spread_bounds(values: list[float], spread: str) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0 or spread == "none":
+        return float("nan"), float("nan")
+    if spread == "minmax":
+        return float(np.min(arr)), float(np.max(arr))
+    raise ValueError(f"Unknown spread mode '{spread}'.")
+
+
 def _group_runs(
     runs: Iterable,
     *,
     min_batch_size: int,
     summary_stat: str,
-) -> tuple[list[int], list[str], dict[str, dict[str, np.ndarray]]]:
+) -> tuple[
+    list[int],
+    list[str],
+    dict[str, dict[str, np.ndarray]],
+    dict[str, dict[str, np.ndarray]],
+    dict[str, dict[str, np.ndarray]],
+]:
     run_list = [
         run for run in runs if _int_param(run, "train_batch_size") >= min_batch_size
     ]
@@ -76,6 +91,20 @@ def _group_runs(
     optimizers = sorted({_str_param(run, "optimizer") for run in run_list})
 
     grids: dict[str, dict[str, np.ndarray]] = {
+        split: {
+            metric: np.full((len(optimizers), len(batch_sizes)), np.nan, dtype=np.float64)
+            for metric, _ in METRIC_LAYOUT
+        }
+        for split, _ in SPLIT_LAYOUT
+    }
+    lowers: dict[str, dict[str, np.ndarray]] = {
+        split: {
+            metric: np.full((len(optimizers), len(batch_sizes)), np.nan, dtype=np.float64)
+            for metric, _ in METRIC_LAYOUT
+        }
+        for split, _ in SPLIT_LAYOUT
+    }
+    uppers: dict[str, dict[str, np.ndarray]] = {
         split: {
             metric: np.full((len(optimizers), len(batch_sizes)), np.nan, dtype=np.float64)
             for metric, _ in METRIC_LAYOUT
@@ -103,8 +132,11 @@ def _group_runs(
                 ]
                 if values:
                     grids[split][metric][row, col] = _summary_stat(values, summary_stat)
+                    low, high = _spread_bounds(values, "minmax")
+                    lowers[split][metric][row, col] = low
+                    uppers[split][metric][row, col] = high
 
-    return batch_sizes, optimizers, grids
+    return batch_sizes, optimizers, grids, lowers, uppers
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -119,6 +151,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--legend-title", type=str, default="optimizer")
     parser.add_argument("--share-y-by-row", action="store_true")
     parser.add_argument("--summary-stat", choices=["mean", "iqm"], default="mean")
+    parser.add_argument("--spread", choices=["none", "minmax"], default="none")
+    parser.add_argument("--spread-alpha", type=float, default=0.18)
     return parser
 
 
@@ -133,7 +167,7 @@ def main(args: argparse.Namespace) -> None:
     if not runs:
         raise ValueError("No MLflow child runs matched the requested parent run.")
 
-    batch_sizes, optimizers, grids = _group_runs(
+    batch_sizes, optimizers, grids, lowers, uppers = _group_runs(
         runs,
         min_batch_size=args.min_batch_size,
         summary_stat=args.summary_stat,
@@ -161,8 +195,23 @@ def main(args: argparse.Namespace) -> None:
         for col_idx, (split, split_label) in enumerate(SPLIT_LAYOUT):
             ax = axes[row_idx, col_idx]
             values = grids[split][metric]
+            lower_values = lowers[split][metric]
+            upper_values = uppers[split][metric]
             for opt_idx, optimizer in enumerate(optimizers):
                 y = values[opt_idx]
+                lower = lower_values[opt_idx]
+                upper = upper_values[opt_idx]
+                if args.spread != "none":
+                    finite_mask = np.isfinite(lower) & np.isfinite(upper)
+                    if np.any(finite_mask):
+                        ax.fill_between(
+                            np.asarray(batch_sizes)[finite_mask],
+                            lower[finite_mask],
+                            upper[finite_mask],
+                            color=colors[optimizer],
+                            alpha=args.spread_alpha,
+                            linewidth=0,
+                        )
                 handle = ax.plot(
                     batch_sizes,
                     y,
