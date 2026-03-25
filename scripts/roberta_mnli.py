@@ -795,11 +795,14 @@ def _train_ibprobit_head(
     batch_size: int,
     epochs: int,
     num_update_iters: int,
+    ibprobit_alpha: float,
     reset_loss_per_epoch: bool,
     seed: int,
 ) -> Tuple[IBProbit, Dict[str, Any]]:
     if num_update_iters <= 0:
         raise ValueError("num_update_iters must be > 0 when optimizer=cavi.")
+    if ibprobit_alpha <= 0.0:
+        raise ValueError("ibprobit_alpha must be > 0 when optimizer=cavi.")
 
     num_features = x_train.shape[1]
     num_classes = int(y_train.max()) + 1
@@ -831,6 +834,7 @@ def _train_ibprobit_head(
                 x_batch,
                 y_batch,
                 num_iters=num_update_iters,
+                alpha=ibprobit_alpha,
             )
             updated_loss_params = eqx.filter(updated_loss, eqx.is_array)
             batch_loss = updated_loss(x_batch, y_batch, loss_type=3).mean()
@@ -953,6 +957,7 @@ def _train_and_evaluate(
     train_batch_size: int,
     epochs: int,
     num_update_iters: int,
+    ibprobit_alpha: float,
     learning_rate: float,
     weight_decay: float,
     dropout_rate: float,
@@ -995,6 +1000,7 @@ def _train_and_evaluate(
             batch_size=train_batch_size,
             epochs=epochs,
             num_update_iters=num_update_iters,
+            ibprobit_alpha=ibprobit_alpha,
             reset_loss_per_epoch=reset_loss_per_epoch,
             seed=seed,
         )
@@ -1197,6 +1203,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--train-batch-size", type=int, default=1024)
     parser.add_argument("--num-update-iters", type=int, default=16)
+    parser.add_argument("--ibprobit-alpha", type=float, default=1e-3)
     parser.add_argument("--reset-loss-per-epoch", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -1264,6 +1271,7 @@ def main(args) -> None:
                     "epochs": args.epochs,
                     "train_batch_size": args.train_batch_size,
                     "num_update_iters": args.num_update_iters,
+                    "ibprobit_alpha": args.ibprobit_alpha,
                     "reset_loss_per_epoch": int(args.reset_loss_per_epoch),
                     "learning_rate": args.learning_rate,
                     "weight_decay": args.weight_decay,
@@ -1326,6 +1334,7 @@ def main(args) -> None:
             train_batch_size=args.train_batch_size,
             epochs=args.epochs,
             num_update_iters=args.num_update_iters,
+            ibprobit_alpha=args.ibprobit_alpha,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             dropout_rate=args.dropout_rate,
