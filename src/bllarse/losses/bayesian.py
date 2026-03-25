@@ -56,16 +56,10 @@ class IBProbit(eqx.Module):
 
     def reset(self, key: PRNGKey) -> "IBProbit":
         d, num_classes = self.mu.shape
-<<<<<<< Updated upstream
-        mu = initializer(key, (d, num_classes), jnp.float32)
-        L = jnp.eye(d, dtype=jnp.float32)
-        return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu, L))
-=======
         input_dim = d - int(self.use_bias)
         mu = jnp.pad(initializer(key, (input_dim, num_classes), jnp.float32), [(0, int(self.use_bias)), (0, 0)])
         Lambda = jnp.eye(d, dtype=jnp.float32)
         return eqx.tree_at(lambda x: (x.mu, x.Lambda), self, (mu, Lambda))
->>>>>>> Stashed changes
 
     def update(self, features: Array, y: Array, *, num_iters: int = 32, alpha: float = 1e-3) -> "IBProbit":
         fts = vmap(self.norm)(features.astype(jnp.float32))
