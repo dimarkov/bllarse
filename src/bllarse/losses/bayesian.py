@@ -31,7 +31,7 @@ class IBProbit(eqx.Module):
     variational inference for a multinomial probit model.
     """
     mu: Array
-    L: Array
+    Lambda: Array
     use_bias: bool
     cdf: Callable
     logcdf: Callable
@@ -47,8 +47,8 @@ class IBProbit(eqx.Module):
         use_approx_cdf: bool = True
     ):
 
-        self.mu = initializer(key, (input_dim + int(use_bias), num_classes), jnp.float32)
-        self.L = jnp.eye(input_dim + int(use_bias), dtype=jnp.float32)
+        self.mu = jnp.pad(initializer(key, (input_dim, num_classes), jnp.float32), [(0, int(use_bias)), (0, 0)])
+        self.Lambda = jnp.eye(input_dim + int(use_bias), dtype=jnp.float32)
         self.use_bias = use_bias
         self.cdf = approx_cdf if use_approx_cdf else norm.cdf
         self.logcdf = approx_logcdf if use_approx_cdf else norm.logcdf
@@ -56,19 +56,25 @@ class IBProbit(eqx.Module):
 
     def reset(self, key: PRNGKey) -> "IBProbit":
         d, num_classes = self.mu.shape
+<<<<<<< Updated upstream
         mu = initializer(key, (d, num_classes), jnp.float32)
         L = jnp.eye(d, dtype=jnp.float32)
         return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu, L))
+=======
+        input_dim = d - int(self.use_bias)
+        mu = jnp.pad(initializer(key, (input_dim, num_classes), jnp.float32), [(0, int(self.use_bias)), (0, 0)])
+        Lambda = jnp.eye(d, dtype=jnp.float32)
+        return eqx.tree_at(lambda x: (x.mu, x.Lambda), self, (mu, Lambda))
+>>>>>>> Stashed changes
 
-    def update(self, features: Array, y: Array, *, num_iters: int = 32) -> "IBProbit":
+    def update(self, features: Array, y: Array, *, num_iters: int = 32, alpha: float = 1e-3) -> "IBProbit":
         fts = vmap(self.norm)(features.astype(jnp.float32))
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
 
         xxT = mm_update(fts.T, fts)
 
-        Lambda_old = mm_update(self.L, self.L.T)
-        eta_old = mm_update(Lambda_old, self.mu)
-        Lambda_new = Lambda_old + xxT
+        eta_old = mm_update(self.Lambda, self.mu)
+        Lambda_new = (1 - alpha) * self.Lambda + xxT + alpha * jnp.eye(self.mu.shape[0])
 
         L_new, lower = cho_factor(Lambda_new, lower=True)
         y_one_hot = nn.one_hot(y, self.mu.shape[-1])
@@ -92,7 +98,7 @@ class IBProbit(eqx.Module):
 
         mu_new = cho_solve((L_new, lower), eta_new)
 
-        return eqx.tree_at(lambda x: (x.mu, x.L), self, (mu_new, jnp.tril(L_new)))
+        return eqx.tree_at(lambda x: (x.mu, x.Lambda), self, (mu_new, Lambda_new))
     
     @property
     def params(self) -> Tuple[Array, Array]:
