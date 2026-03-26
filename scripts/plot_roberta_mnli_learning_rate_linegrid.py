@@ -64,6 +64,7 @@ def _group_runs(
     runs: Iterable,
     *,
     min_batch_size: int,
+    dropout_rate: float | None,
     summary_stat: str,
 ) -> tuple[
     list[int],
@@ -71,9 +72,13 @@ def _group_runs(
     dict[str, dict[str, np.ndarray]],
     dict[str, dict[str, list[list[list[float]]]]],
 ]:
-    run_list = [
-        run for run in runs if _int_param(run, "train_batch_size") >= min_batch_size
-    ]
+    run_list = []
+    for run in runs:
+        if _int_param(run, "train_batch_size") < min_batch_size:
+            continue
+        if dropout_rate is not None and abs(_float_param(run, "dropout_rate") - dropout_rate) > 1e-12:
+            continue
+        run_list.append(run)
     if not run_list:
         raise ValueError("No MLflow runs remain after applying the batch-size filter.")
 
@@ -163,6 +168,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--parent-run-id", type=str, required=True)
     parser.add_argument("--output-prefix", type=str, required=True)
     parser.add_argument("--min-batch-size", type=int, default=512)
+    parser.add_argument("--dropout-rate", type=float, default=None)
     parser.add_argument("--title", type=str, default="Adam — RoBERTa-large MNLI")
     parser.add_argument("--legend-title", type=str, default="learning_rate")
     parser.add_argument("--share-y-by-row", action="store_true")
@@ -188,6 +194,7 @@ def main(args: argparse.Namespace) -> None:
     batch_sizes, learning_rates, grids, samples = _group_runs(
         runs,
         min_batch_size=args.min_batch_size,
+        dropout_rate=args.dropout_rate,
         summary_stat=args.summary_stat,
     )
 
