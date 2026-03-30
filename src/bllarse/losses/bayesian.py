@@ -61,36 +61,42 @@ class IBProbit(eqx.Module):
         Lambda = jnp.eye(d, dtype=jnp.float32)
         return eqx.tree_at(lambda x: (x.mu, x.Lambda), self, (mu, Lambda))
 
-    def update(self, features: Array, y: Array, *, num_iters: int = 32, alpha: float = 1e-3) -> "IBProbit":
+    def update(self, features: Array, y: Array, *, num_iters: int = 32, alpha: float = 1e-2) -> "IBProbit":
         fts = vmap(self.norm)(features.astype(jnp.float32))
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
 
         xxT = mm_update(fts.T, fts)
 
         eta_old = mm_update(self.Lambda, self.mu)
-        Lambda_new = (1 - alpha) * self.Lambda + xxT + alpha * jnp.eye(self.mu.shape[0])
+        Lambda_new = self.Lambda + xxT
 
-        L_new, lower = cho_factor(Lambda_new, lower=True)
         y_one_hot = nn.one_hot(y, self.mu.shape[-1])
 
-        x = cho_solve((L_new, lower), fts.T).T
+        x = solve(Lambda_new, fts.T, assume_a='sym').T
+        cutoff = jnp.log(0.5) * self.mu.shape[-1]
 
         def step_fn(eta_carry, *args):
             pred = mm_update(x, eta_carry)
 
             # Compute E_q[z_ik] via log-space Mills ratios
             log_pdf = norm.logpdf(pred)
-            mills_pos = jnp.exp(log_pdf - norm.logcdf(pred))
-            mills_neg = jnp.exp(log_pdf - norm.logcdf(-pred))
+            logcdf1 = norm.logcdf(pred)
+            logcdf2 = norm.logcdf(-pred)
+            mills_pos = jnp.exp(log_pdf - logcdf1)
+            mills_neg = jnp.exp(log_pdf - logcdf2)
             correction = jnp.where(y_one_hot, mills_pos, -mills_neg)
             E_q_z = pred + correction
+
+            ll = jnp.sum(y_one_hot * logcdf1 + (1 - y_one_hot) * logcdf2, -1, keepdims=True)
+            E_q_z = nn.sigmoid(ll - cutoff) * E_q_z
 
             eta_carry = eta_old + mm_update(fts.T, E_q_z)
             return eta_carry, None
 
         eta_new, _ = lax.scan(step_fn, eta_old, jnp.arange(num_iters))
 
-        mu_new = cho_solve((L_new, lower), eta_new)
+        Lambda_new = (1 - alpha) * self.Lambda + alpha * jnp.eye(self.mu.shape[0]) + xxT
+        mu_new = solve(Lambda_new, eta_new - alpha * eta_old, assume_a='sym')
 
         return eqx.tree_at(lambda x: (x.mu, x.Lambda), self, (mu_new, Lambda_new))
     
