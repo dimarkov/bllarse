@@ -1047,3 +1047,45 @@ def test_roberta_large_len512_linear_probe_bs512_refine_sweep_config():
         assert cfg["epochs"] == 140
         assert cfg["dropout_rate"] == 0.0
         assert cfg["num_update_iters"] == 0
+
+
+def test_roberta_large_len512_linear_probe_bs512_data_efficiency_sweep_config():
+    repo_root = Path(__file__).resolve().parents[2]
+    sweep_path = (
+        repo_root
+        / "bllarse_sweeps"
+        / "mnli_roberta_large_len512_linear_probe_bs512_data_efficiency.py"
+    )
+    sweep = _load_module(sweep_path)
+
+    configs = sweep.create_configs()
+    assert len(configs) == 120
+
+    backbones = {cfg["backbone"] for cfg in configs}
+    assert backbones == {"FacebookAI/roberta-large"}
+
+    batch_sizes = {cfg["train_batch_size"] for cfg in configs}
+    assert batch_sizes == {512}
+
+    learning_rates = {cfg["learning_rate"] for cfg in configs}
+    assert learning_rates == {1.2e-3}
+
+    subset_sizes = {cfg["max_train_samples"] for cfg in configs}
+    assert min(subset_sizes) == 16384
+    assert max(subset_sizes) == 392702
+    assert len(subset_sizes) == 24
+
+    seeds = {cfg["seed"] for cfg in configs}
+    assert seeds == {2022, 2023, 2024, 2025, 2026}
+
+    subset_seed_values = {cfg["train_subset_seed"] for cfg in configs}
+    assert subset_seed_values == seeds
+
+    for cfg in configs:
+        assert cfg["stage"] == "train_eval"
+        assert cfg["optimizer"] == "adam"
+        assert cfg["weight_decay"] == 0.0
+        assert cfg["max_length"] == 512
+        assert cfg["epochs"] == 140
+        assert cfg["dropout_rate"] == 0.0
+        assert cfg["num_update_iters"] == 0
