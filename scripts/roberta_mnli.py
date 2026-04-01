@@ -1187,13 +1187,22 @@ def _setup_mlflow(args) -> Any:
     return context, True
 
 
+def _cache_key_sample_limits(args) -> tuple[int | None, int | None]:
+    # Training/eval on cached features should reuse the canonical full-feature cache
+    # and apply any subset restriction after loading.
+    if args.stage == "train_eval":
+        return None, None
+    return args.max_train_samples, args.max_val_samples
+
+
 def _resolve_cache_root(args) -> Path:
+    key_train_samples, key_val_samples = _cache_key_sample_limits(args)
     cache_key = make_cache_key(
         args.backbone,
         args.max_length,
         args.cache_dtype,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
+        max_train_samples=key_train_samples,
+        max_val_samples=key_val_samples,
     )
     cache_root = Path(args.cache_dir).expanduser().resolve() / args.hf_subdir_prefix / cache_key
     return cache_root
@@ -1202,12 +1211,13 @@ def _resolve_cache_root(args) -> Path:
 def _ensure_cache(args, cache_root: Path) -> Tuple[Dict[str, Any], bool]:
     pull_enabled, push_enabled = hf_sync_flags(args.hf_sync)
     token = os.environ.get("HF_TOKEN", "").strip() or None
+    key_train_samples, key_val_samples = _cache_key_sample_limits(args)
     cache_key = make_cache_key(
         args.backbone,
         args.max_length,
         args.cache_dtype,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
+        max_train_samples=key_train_samples,
+        max_val_samples=key_val_samples,
     )
     prefix = build_hf_cache_prefix(args.hf_subdir_prefix, cache_key)
 
@@ -1387,12 +1397,13 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(args) -> None:
     _validate_args(args)
 
+    key_train_samples, key_val_samples = _cache_key_sample_limits(args)
     cache_key = make_cache_key(
         args.backbone,
         args.max_length,
         args.cache_dtype,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
+        max_train_samples=key_train_samples,
+        max_val_samples=key_val_samples,
     )
     cache_root = _resolve_cache_root(args)
     mlflow_context, mlflow_enabled = _setup_mlflow(args)

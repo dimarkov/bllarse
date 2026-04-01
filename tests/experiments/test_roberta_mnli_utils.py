@@ -170,3 +170,29 @@ def test_truncate_samples_uses_seeded_nested_train_prefix():
     assert np.array_equal(first["y_train"], second["y_train"])
     assert not np.array_equal(first["X_train"], third["X_train"])
     assert not np.array_equal(first["y_train"], third["y_train"])
+
+
+def test_train_eval_cache_root_ignores_subset_sizes():
+    mod = _load_script_module()
+    parser = mod.build_argparser()
+    args = parser.parse_args(
+        [
+            "--stage",
+            "train_eval",
+            "--backbone",
+            "FacebookAI/roberta-large",
+            "--max-length",
+            "512",
+            "--cache-dtype",
+            "float16",
+            "--max-train-samples",
+            "16384",
+            "--max-val-samples",
+            "1024",
+        ]
+    )
+    cache_root = mod._resolve_cache_root(args)
+    cache_key = cache_root.name
+
+    assert "tr16384" not in cache_key
+    assert "val1024" not in cache_key
