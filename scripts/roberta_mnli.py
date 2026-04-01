@@ -535,9 +535,15 @@ def _truncate_samples(
     *,
     max_train_samples: int | None,
     max_val_samples: int | None,
+    train_subset_seed: int | None,
 ) -> Dict[str, np.ndarray]:
     out = dict(arrays)
     if max_train_samples is not None:
+        if train_subset_seed is not None:
+            rng = np.random.default_rng(train_subset_seed)
+            perm = rng.permutation(out["y_train"].shape[0])
+            out["X_train"] = out["X_train"][perm]
+            out["y_train"] = out["y_train"][perm]
         n = min(max_train_samples, out["y_train"].shape[0])
         out["X_train"] = out["X_train"][:n]
         out["y_train"] = out["y_train"][:n]
@@ -796,6 +802,7 @@ def _train_ibprobit_head(
     epochs: int,
     num_update_iters: int,
     ibprobit_alpha: float,
+    eval_every_batches: int,
     reset_loss_per_epoch: bool,
     seed: int,
 ) -> Tuple[IBProbit, Dict[str, Any]]:
@@ -813,6 +820,10 @@ def _train_ibprobit_head(
             "IBProbit training requires train_batch_size <= number of training samples "
             f"(got batch_size={batch_size}, n_train={n})."
         )
+    if eval_every_batches < 0:
+        raise ValueError("eval_every_batches must be >= 0.")
+    if eval_every_batches > 0 and epochs != 1:
+        raise ValueError("eval_every_batches is only supported for epochs=1.")
 
     key = jr.PRNGKey(seed)
     key, init_key = jr.split(key)
@@ -842,6 +853,23 @@ def _train_ibprobit_head(
 
         return lax.scan(_batch_body, curr_loss_params, batch_indices)
 
+    @eqx.filter_jit
+    def _run_single_batch(
+        curr_loss_params,
+        x_batch: jnp.ndarray,
+        y_batch: jnp.ndarray,
+    ):
+        current_loss = eqx.combine(curr_loss_params, loss_static)
+        updated_loss = current_loss.update(
+            x_batch,
+            y_batch,
+            num_iters=num_update_iters,
+            alpha=ibprobit_alpha,
+        )
+        updated_loss_params = eqx.filter(updated_loss, eqx.is_array)
+        batch_loss = updated_loss(x_batch, y_batch, loss_type=3).mean()
+        return updated_loss_params, batch_loss
+
     x_train_device = jax.device_put(jnp.asarray(x_train))
     y_train_device = jax.device_put(jnp.asarray(y_train, dtype=jnp.int32))
     x_val_m_device = jax.device_put(jnp.asarray(x_val_m))
@@ -865,79 +893,180 @@ def _train_ibprobit_head(
 
         perm = jr.permutation(perm_key, n)
         batch_indices = perm[: n_batches * batch_size].reshape(n_batches, batch_size)
-        loss_params, batch_losses = _run_epoch(
-            loss_params,
-            x_train_device,
-            y_train_device,
-            jax.device_put(jnp.asarray(batch_indices, dtype=jnp.int32)),
-        )
-        model = eqx.combine(loss_params, loss_static)
-        epoch_train_loss = float(jnp.mean(batch_losses))
-        epoch_losses.append(epoch_train_loss)
+        if eval_every_batches > 0:
+            batch_losses_host: list[float] = []
+            for batch_idx, idx in enumerate(np.asarray(batch_indices, dtype=np.int32), start=1):
+                x_batch = x_train_device[idx]
+                y_batch = y_train_device[idx]
+                loss_params, batch_loss = _run_single_batch(loss_params, x_batch, y_batch)
+                batch_losses_host.append(float(batch_loss))
 
-        metrics_m = _evaluate_ibprobit_head(
-            model,
-            x_val_m_device,
-            y_val_m_device,
-            batch_size=batch_size,
-        )
-        metrics_mm = _evaluate_ibprobit_head(
-            model,
-            x_val_mm_device,
-            y_val_mm_device,
-            batch_size=batch_size,
-        )
-        epoch_seconds = float(time.perf_counter() - epoch_start)
-        history.append(
-            {
-                "loss": epoch_train_loss,
-                "epoch_seconds": epoch_seconds,
-                "val_matched_acc": metrics_m["acc"],
-                "val_matched_nll": metrics_m["nll"],
-                "val_matched_ece": metrics_m["ece"],
-                "val_mismatched_acc": metrics_mm["acc"],
-                "val_mismatched_nll": metrics_mm["nll"],
-                "val_mismatched_ece": metrics_mm["ece"],
-            }
-        )
-        print(
-            "[bllarse] "
-            f"epoch={epoch_idx + 1}/{epochs} "
-            f"epoch_seconds={epoch_seconds:.2f} "
-            f"train_loss={epoch_train_loss:.4f} "
-            f"val_matched_acc={metrics_m['acc']:.4f} "
-            f"val_matched_nll={metrics_m['nll']:.4f} "
-            f"val_matched_ece={metrics_m['ece']:.4f} "
-            f"val_mismatched_acc={metrics_mm['acc']:.4f} "
-            f"val_mismatched_nll={metrics_mm['nll']:.4f} "
-            f"val_mismatched_ece={metrics_mm['ece']:.4f}"
-        )
+                should_eval = (batch_idx % eval_every_batches == 0) or (batch_idx == n_batches)
+                if not should_eval:
+                    continue
 
-        if checkpoint_is_better(metrics_m, best_metrics_m):
-            best_model = eqx.combine(
-                jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), loss_params),
-                loss_static,
+                model = eqx.combine(loss_params, loss_static)
+                metrics_m = _evaluate_ibprobit_head(
+                    model,
+                    x_val_m_device,
+                    y_val_m_device,
+                    batch_size=batch_size,
+                )
+                metrics_mm = _evaluate_ibprobit_head(
+                    model,
+                    x_val_mm_device,
+                    y_val_mm_device,
+                    batch_size=batch_size,
+                )
+                seen_examples = int(batch_idx * batch_size)
+                step_train_loss = float(np.mean(batch_losses_host))
+                elapsed = float(time.perf_counter() - epoch_start)
+                history.append(
+                    {
+                        "step": seen_examples,
+                        "seen_examples": seen_examples,
+                        "loss": step_train_loss,
+                        "epoch_seconds": elapsed,
+                        "val_matched_acc": metrics_m["acc"],
+                        "val_matched_nll": metrics_m["nll"],
+                        "val_matched_ece": metrics_m["ece"],
+                        "val_mismatched_acc": metrics_mm["acc"],
+                        "val_mismatched_nll": metrics_mm["nll"],
+                        "val_mismatched_ece": metrics_mm["ece"],
+                    }
+                )
+                print(
+                    "[bllarse] "
+                    f"epoch={epoch_idx + 1}/{epochs} "
+                    f"seen_examples={seen_examples} "
+                    f"epoch_seconds={elapsed:.2f} "
+                    f"train_loss={step_train_loss:.4f} "
+                    f"val_matched_acc={metrics_m['acc']:.4f} "
+                    f"val_matched_nll={metrics_m['nll']:.4f} "
+                    f"val_matched_ece={metrics_m['ece']:.4f} "
+                    f"val_mismatched_acc={metrics_mm['acc']:.4f} "
+                    f"val_mismatched_nll={metrics_mm['nll']:.4f} "
+                    f"val_mismatched_ece={metrics_mm['ece']:.4f}"
+                )
+
+                if checkpoint_is_better(metrics_m, best_metrics_m):
+                    best_model = eqx.combine(
+                        jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), loss_params),
+                        loss_static,
+                    )
+                    best_epoch = epoch_idx + 1
+                    best_metrics_m = dict(metrics_m)
+
+                step_is_finite = np.isfinite(step_train_loss) and all(
+                    np.isfinite(v)
+                    for v in (
+                        metrics_m["acc"],
+                        metrics_m["nll"],
+                        metrics_m["ece"],
+                        metrics_mm["acc"],
+                        metrics_mm["nll"],
+                        metrics_mm["ece"],
+                    )
+                )
+                if not step_is_finite:
+                    print(
+                        "[bllarse] Non-finite IBProbit metrics detected; "
+                        "stopping early and keeping the best finite checkpoint."
+                    )
+                    break
+            epoch_train_loss = float(np.mean(batch_losses_host)) if batch_losses_host else float("nan")
+            epoch_losses.append(epoch_train_loss)
+            if history and not np.isfinite(history[-1]["loss"]):
+                break
+            if history:
+                last = history[-1]
+                last_is_finite = np.isfinite(last["loss"]) and all(
+                    np.isfinite(last[k])
+                    for k in (
+                        "val_matched_acc",
+                        "val_matched_nll",
+                        "val_matched_ece",
+                        "val_mismatched_acc",
+                        "val_mismatched_nll",
+                        "val_mismatched_ece",
+                    )
+                )
+                if not last_is_finite:
+                    break
+        else:
+            loss_params, batch_losses = _run_epoch(
+                loss_params,
+                x_train_device,
+                y_train_device,
+                jax.device_put(jnp.asarray(batch_indices, dtype=jnp.int32)),
             )
-            best_epoch = epoch_idx + 1
-            best_metrics_m = dict(metrics_m)
+            model = eqx.combine(loss_params, loss_static)
+            epoch_train_loss = float(jnp.mean(batch_losses))
+            epoch_losses.append(epoch_train_loss)
 
-        epoch_is_finite = np.isfinite(epoch_train_loss) and all(
-            np.isfinite(v)
-            for v in (
-                metrics_m["acc"],
-                metrics_m["nll"],
-                metrics_m["ece"],
-                metrics_mm["acc"],
-                metrics_mm["nll"],
-                metrics_mm["ece"],
+            metrics_m = _evaluate_ibprobit_head(
+                model,
+                x_val_m_device,
+                y_val_m_device,
+                batch_size=batch_size,
             )
-        )
-        if not epoch_is_finite:
+            metrics_mm = _evaluate_ibprobit_head(
+                model,
+                x_val_mm_device,
+                y_val_mm_device,
+                batch_size=batch_size,
+            )
+            epoch_seconds = float(time.perf_counter() - epoch_start)
+            history.append(
+                {
+                    "loss": epoch_train_loss,
+                    "epoch_seconds": epoch_seconds,
+                    "val_matched_acc": metrics_m["acc"],
+                    "val_matched_nll": metrics_m["nll"],
+                    "val_matched_ece": metrics_m["ece"],
+                    "val_mismatched_acc": metrics_mm["acc"],
+                    "val_mismatched_nll": metrics_mm["nll"],
+                    "val_mismatched_ece": metrics_mm["ece"],
+                }
+            )
             print(
-                "[bllarse] Non-finite IBProbit metrics detected; "
-                "stopping early and keeping the best finite checkpoint."
+                "[bllarse] "
+                f"epoch={epoch_idx + 1}/{epochs} "
+                f"epoch_seconds={epoch_seconds:.2f} "
+                f"train_loss={epoch_train_loss:.4f} "
+                f"val_matched_acc={metrics_m['acc']:.4f} "
+                f"val_matched_nll={metrics_m['nll']:.4f} "
+                f"val_matched_ece={metrics_m['ece']:.4f} "
+                f"val_mismatched_acc={metrics_mm['acc']:.4f} "
+                f"val_mismatched_nll={metrics_mm['nll']:.4f} "
+                f"val_mismatched_ece={metrics_mm['ece']:.4f}"
             )
-            break
+
+            if checkpoint_is_better(metrics_m, best_metrics_m):
+                best_model = eqx.combine(
+                    jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), loss_params),
+                    loss_static,
+                )
+                best_epoch = epoch_idx + 1
+                best_metrics_m = dict(metrics_m)
+
+            epoch_is_finite = np.isfinite(epoch_train_loss) and all(
+                np.isfinite(v)
+                for v in (
+                    metrics_m["acc"],
+                    metrics_m["nll"],
+                    metrics_m["ece"],
+                    metrics_mm["acc"],
+                    metrics_mm["nll"],
+                    metrics_mm["ece"],
+                )
+            )
+            if not epoch_is_finite:
+                print(
+                    "[bllarse] Non-finite IBProbit metrics detected; "
+                    "stopping early and keeping the best finite checkpoint."
+                )
+                break
 
     training_info = {
         "epoch_losses": epoch_losses,
@@ -958,6 +1087,7 @@ def _train_and_evaluate(
     epochs: int,
     num_update_iters: int,
     ibprobit_alpha: float,
+    eval_every_batches: int,
     learning_rate: float,
     weight_decay: float,
     dropout_rate: float,
@@ -1001,6 +1131,7 @@ def _train_and_evaluate(
             epochs=epochs,
             num_update_iters=num_update_iters,
             ibprobit_alpha=ibprobit_alpha,
+            eval_every_batches=eval_every_batches,
             reset_loss_per_epoch=reset_loss_per_epoch,
             seed=seed,
         )
@@ -1179,10 +1310,16 @@ def _validate_args(args) -> None:
         raise ValueError("--dropout-rate must be in [0, 1) for linear-head training.")
     if args.optimizer == "cavi" and args.dropout_rate != 0.0:
         print("[bllarse] Ignoring --dropout-rate for optimizer cavi.")
+    if args.optimizer != "cavi" and args.eval_every_batches != 0:
+        print("[bllarse] Ignoring --eval-every-batches for non-CAVI optimizer.")
     if args.stage != "extract" and args.epochs <= 0:
         raise ValueError("--epochs must be > 0 for training.")
     if args.optimizer == "cavi" and args.num_update_iters <= 0:
         raise ValueError("--num-update-iters must be > 0 when --optimizer cavi.")
+    if args.optimizer == "cavi" and args.eval_every_batches < 0:
+        raise ValueError("--eval-every-batches must be >= 0 when --optimizer cavi.")
+    if args.optimizer == "cavi" and args.eval_every_batches > 0 and args.epochs != 1:
+        raise ValueError("--eval-every-batches currently requires --epochs 1 for optimizer cavi.")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -1204,6 +1341,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--train-batch-size", type=int, default=1024)
     parser.add_argument("--num-update-iters", type=int, default=16)
     parser.add_argument("--ibprobit-alpha", type=float, default=1e-3)
+    parser.add_argument("--eval-every-batches", type=int, default=0)
     parser.add_argument("--reset-loss-per-epoch", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -1241,6 +1379,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dtype", choices=["float16", "float32"], default="float16")
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument("--train-subset-seed", type=int, default=None)
 
     return parser
 
@@ -1272,6 +1411,7 @@ def main(args) -> None:
                     "train_batch_size": args.train_batch_size,
                     "num_update_iters": args.num_update_iters,
                     "ibprobit_alpha": args.ibprobit_alpha,
+                    "eval_every_batches": args.eval_every_batches,
                     "reset_loss_per_epoch": int(args.reset_loss_per_epoch),
                     "learning_rate": args.learning_rate,
                     "weight_decay": args.weight_decay,
@@ -1283,6 +1423,7 @@ def main(args) -> None:
                     "cache_dtype": args.cache_dtype,
                     "max_train_samples": -1 if args.max_train_samples is None else args.max_train_samples,
                     "max_val_samples": -1 if args.max_val_samples is None else args.max_val_samples,
+                    "train_subset_seed": -1 if args.train_subset_seed is None else args.train_subset_seed,
                 }
             )
 
@@ -1326,6 +1467,7 @@ def main(args) -> None:
             arrays,
             max_train_samples=args.max_train_samples,
             max_val_samples=args.max_val_samples,
+            train_subset_seed=args.train_subset_seed,
         )
 
         results = _train_and_evaluate(
@@ -1335,6 +1477,7 @@ def main(args) -> None:
             epochs=args.epochs,
             num_update_iters=args.num_update_iters,
             ibprobit_alpha=args.ibprobit_alpha,
+            eval_every_batches=args.eval_every_batches,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             dropout_rate=args.dropout_rate,
@@ -1362,6 +1505,7 @@ def main(args) -> None:
                 mlflow.log_metric("best_epoch", best_epoch)
             history = results["training"].get("history", [])
             for epoch_idx, row in enumerate(history, start=1):
+                step = int(row.get("step", epoch_idx))
                 mlflow.log_metrics(
                     {
                         # Keep canonical keys aligned with finetuning/run_training for primary split.
@@ -1376,8 +1520,9 @@ def main(args) -> None:
                         "val_mismatched_acc": float(row["val_mismatched_acc"]),
                         "val_mismatched_nll": float(row["val_mismatched_nll"]),
                         "val_mismatched_ece": float(row["val_mismatched_ece"]),
+                        "seen_examples": float(row.get("seen_examples", step)),
                     },
-                    step=epoch_idx,
+                    step=step,
                 )
 
 

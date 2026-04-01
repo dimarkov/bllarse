@@ -155,6 +155,7 @@ def _scatter_seed_points(
     alpha: float,
     size: float,
     jitter_width: float,
+    min_batch_size: int | None = None,
 ) -> None:
     if num_series <= 1:
         series_center = 0.0
@@ -162,6 +163,8 @@ def _scatter_seed_points(
         series_center = np.linspace(-jitter_width, jitter_width, num_series)[series_idx]
 
     for batch_idx, batch_size in enumerate(batch_sizes):
+        if min_batch_size is not None and batch_size < min_batch_size:
+            continue
         values = sample_rows[batch_idx]
         if not values:
             continue
@@ -198,6 +201,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--point-alpha", type=float, default=0.55)
     parser.add_argument("--point-size", type=float, default=18.0)
     parser.add_argument("--point-jitter-width", type=float, default=0.12)
+    parser.add_argument(
+        "--nll-min-batch-size",
+        type=int,
+        default=None,
+        help="If set, mask NLL points for batch sizes below this threshold.",
+    )
+    parser.add_argument(
+        "--nll-ymax",
+        type=float,
+        default=None,
+        help="If set, clip the NLL row to this upper y-limit.",
+    )
     return parser
 
 
@@ -244,9 +259,18 @@ def main(args: argparse.Namespace) -> None:
             upper_values = uppers[split][metric]
             sample_values = samples[split][metric]
             for iter_idx, num_update_iters in enumerate(num_iters):
-                y = values[iter_idx]
-                lower = lower_values[iter_idx]
-                upper = upper_values[iter_idx]
+                y = values[iter_idx].copy()
+                lower = lower_values[iter_idx].copy()
+                upper = upper_values[iter_idx].copy()
+                nll_min_batch_size = (
+                    args.nll_min_batch_size if metric == "nll" else None
+                )
+                if nll_min_batch_size is not None:
+                    for batch_idx, batch_size in enumerate(batch_sizes):
+                        if batch_size < nll_min_batch_size:
+                            y[batch_idx] = np.nan
+                            lower[batch_idx] = np.nan
+                            upper[batch_idx] = np.nan
                 if args.spread != "none":
                     finite_mask = np.isfinite(lower) & np.isfinite(upper)
                     if np.any(finite_mask):
@@ -269,6 +293,7 @@ def main(args: argparse.Namespace) -> None:
                         alpha=args.point_alpha,
                         size=args.point_size,
                         jitter_width=args.point_jitter_width,
+                        min_batch_size=nll_min_batch_size,
                     )
                 handle = ax.plot(
                     batch_sizes,
@@ -296,6 +321,8 @@ def main(args: argparse.Namespace) -> None:
                 ax.set_xlabel("Batch Size")
             if metric == "nll" and args.log_nll:
                 ax.set_yscale("log")
+            if metric == "nll" and args.nll_ymax is not None:
+                ax.set_ylim(top=args.nll_ymax)
 
     fig.legend(
         legend_handles,

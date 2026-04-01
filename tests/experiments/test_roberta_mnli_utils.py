@@ -122,3 +122,51 @@ def test_argparser_accepts_adam_and_dropout_rate():
 
     assert args.optimizer == "adam"
     assert np.isclose(args.dropout_rate, 0.1)
+
+
+def test_argparser_accepts_eval_every_batches_and_subset_seed():
+    mod = _load_script_module()
+    parser = mod.build_argparser()
+    args = parser.parse_args(
+        ["--optimizer", "cavi", "--eval-every-batches", "1", "--train-subset-seed", "7"]
+    )
+
+    assert args.optimizer == "cavi"
+    assert args.eval_every_batches == 1
+    assert args.train_subset_seed == 7
+
+
+def test_truncate_samples_uses_seeded_nested_train_prefix():
+    mod = _load_script_module()
+    arrays = {
+        "X_train": np.arange(20, dtype=np.float32).reshape(10, 2),
+        "y_train": np.arange(10, dtype=np.int32),
+        "X_val_m": np.arange(12, dtype=np.float32).reshape(6, 2),
+        "y_val_m": np.arange(6, dtype=np.int32),
+        "X_val_mm": np.arange(12, dtype=np.float32).reshape(6, 2),
+        "y_val_mm": np.arange(6, dtype=np.int32),
+    }
+
+    first = mod._truncate_samples(
+        arrays,
+        max_train_samples=4,
+        max_val_samples=None,
+        train_subset_seed=3,
+    )
+    second = mod._truncate_samples(
+        arrays,
+        max_train_samples=4,
+        max_val_samples=None,
+        train_subset_seed=3,
+    )
+    third = mod._truncate_samples(
+        arrays,
+        max_train_samples=4,
+        max_val_samples=None,
+        train_subset_seed=5,
+    )
+
+    assert np.array_equal(first["X_train"], second["X_train"])
+    assert np.array_equal(first["y_train"], second["y_train"])
+    assert not np.array_equal(first["X_train"], third["X_train"])
+    assert not np.array_equal(first["y_train"], third["y_train"])
