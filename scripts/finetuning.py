@@ -16,11 +16,14 @@ except:
     print('wandb not installed')
     no_wandb = True
 import jax.tree_util as jtu
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from functools import partial
 from datasets import load_dataset
 
-from jax import random as jr, config
+from jax import random as jr, config, clear_caches
 
 from blrax.optim import ivon
 from mlpox.load_models import load_model
@@ -37,9 +40,6 @@ from bllarse.utils import (
     save_ivon_checkpoint,
     save_checkpoint_bundle,
 )
-
-config.update("jax_default_matmul_precision", "highest")
-
 
 def _build_wandb_config(args, o_config):
     """Return shared run metadata plus optimizer-specific hyperparameters."""
@@ -283,6 +283,8 @@ def main(args, m_config, o_config):
             artifact = wandb.Artifact(f"{wandb.run.id}-ivon-{epoch}", type="model")
             artifact.add_file(ckpt_path, name=ckpt_name)
             wandb.run.log_artifact(artifact)
+        
+        clear_caches()
 
 
 def build_argparser():
