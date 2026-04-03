@@ -2,10 +2,6 @@ import os
 import argparse
 import warnings
 
-# do not preallocate memory
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-
 import jax.numpy as jnp
 import equinox as eqx
 import optax
