@@ -28,6 +28,8 @@ passthrough_vars=(
   MLFLOW_TRACKING_URI
   MLFLOW_EXPERIMENT_NAME
   BLLARSE_REPO_ROOT
+  HF_TOKEN
+  PYTHONPATH
 )
 for var_name in "${passthrough_vars[@]}"; do
   if [[ -n "${!var_name:-}" ]]; then
