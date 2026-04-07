@@ -14,6 +14,7 @@ cd "$REPO_ROOT"
 
 # 2) Make the repo root discoverable for the adapter inside the container
 export BLLARSE_REPO_ROOT="$REPO_ROOT"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 INDEX_OFFSET="${INDEX_OFFSET:-0}"
 CONFIG_IDX=$((SLURM_ARRAY_TASK_ID+INDEX_OFFSET))
