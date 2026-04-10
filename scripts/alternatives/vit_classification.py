@@ -18,9 +18,6 @@ Example usage:
 
 import os
 
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-
 import shutil
 import argparse
 import warnings
@@ -30,6 +27,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 load_dotenv()
+load_dotenv(".env.secrets", override=False) # loads secrets if present locally, no-op otherwise
 
 import numpy as np
 import jax.numpy as jnp
@@ -63,7 +61,7 @@ from calibration import evaluate_classification
 
 # Model configurations available in equimo
 EQUIMO_MODELS = {
-    # DINOv2 models (ViT with LayerNorm only) — expect CHW input
+    # DINOv3 models (ViT with LayerNorm only) — expect CHW input
     "dinov3_small": {"img_size": 224, "embed_dim": 384, "channels_first": True},
     "dinov3_big": {"img_size": 224, "embed_dim": 768, "channels_first": True},
     "dinov3_large": {"img_size": 224, "embed_dim": 1024, "channels_first": True},

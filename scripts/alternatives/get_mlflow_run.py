@@ -13,7 +13,6 @@ import sys
 import mlflow
 from dotenv import load_dotenv
 
-
 def main():
     parser = argparse.ArgumentParser(description="Get or create an MLflow parent run")
     parser.add_argument("--experiment-name", required=True, help="MLflow experiment name")
@@ -21,6 +20,7 @@ def main():
     args = parser.parse_args()
 
     load_dotenv()
+    load_dotenv(".env.secrets", override=False)
 
     # Suppress MLflow's console output so only the run ID goes to stdout
     logging.getLogger("mlflow").setLevel(logging.WARNING)
