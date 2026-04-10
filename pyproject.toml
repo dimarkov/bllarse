@@ -15,12 +15,13 @@ dependencies = [
     "tqdm>=4.67.1",
     "pillow>=11.1.0",
     "ipykernel>=6.29.5",
-    "jax[cuda]>=0.6.2",
+    "jax[cuda]>=0.9.0",
     "optax>=0.2.4",
     "tfp-nightly[jax]>=0.25",
+    "dotenv<1.0.0",
+    "mlflow>=3.11",
     "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
     "blrax @ git+https://github.com/dimarkov/blrax.git@main",
-    "wandb>=0.18.3",
 ]
 
 [build-system]
@@ -34,9 +35,5 @@ allow-direct-references = true
 dev = [
     "matplotlib>=3.10.3",
     "pytest>=8.3.5",
-]
-alternatives = [
-    "transformers[flax]>=4.35.0",
-    "sentencepiece>=0.2.0",
 ]
 
