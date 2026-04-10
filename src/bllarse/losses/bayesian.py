@@ -1,7 +1,7 @@
 import equinox as eqx
 import optax
 import jax.numpy as jnp
-from jax import nn, vmap, random as jr, lax
+from jax import nn, vmap, random as jr, lax, grad
 from jax.scipy.stats import norm
 from jax.scipy.linalg import solve, lu_solve, lu_factor, cho_factor, cho_solve
 from jaxtyping import Array, PRNGKeyArray as PRNGKey
@@ -32,10 +32,12 @@ class IBProbit(eqx.Module):
     """
     mu: Array
     Lambda: Array
+    beta: Array
     use_bias: bool
     cdf: Callable
     logcdf: Callable
     norm: eqx.nn.LayerNorm
+    key: PRNGKey
 
     def __init__(
         self,
@@ -47,8 +49,10 @@ class IBProbit(eqx.Module):
         use_approx_cdf: bool = True
     ):
 
-        self.mu = jnp.pad(initializer(key, (input_dim, num_classes), jnp.float32), [(0, int(use_bias)), (0, 0)])
+        self.key = key
+        self.mu = jnp.zeros(((input_dim + int(use_bias), num_classes)))
         self.Lambda = jnp.eye(input_dim + int(use_bias), dtype=jnp.float32)
+        self.beta = jnp.ones((), dtype=jnp.float32)
         self.use_bias = use_bias
         self.cdf = approx_cdf if use_approx_cdf else norm.cdf
         self.logcdf = approx_logcdf if use_approx_cdf else norm.logcdf
@@ -56,25 +60,16 @@ class IBProbit(eqx.Module):
 
     def reset(self, key: PRNGKey) -> "IBProbit":
         d, num_classes = self.mu.shape
-        input_dim = d - int(self.use_bias)
-        mu = jnp.pad(initializer(key, (input_dim, num_classes), jnp.float32), [(0, int(self.use_bias)), (0, 0)])
+        mu = jnp.zeros(((d, num_classes)))
         Lambda = jnp.eye(d, dtype=jnp.float32)
-        return eqx.tree_at(lambda x: (x.mu, x.Lambda), self, (mu, Lambda))
+        return eqx.tree_at(
+            lambda x: (x.mu, x.Lambda, x.beta),
+            self,
+            (mu, Lambda, jnp.ones((), dtype=jnp.float32)),
+        )
 
-    def update(self, features: Array, y: Array, *, num_iters: int = 32, alpha: float = 1e-2) -> "IBProbit":
-        fts = vmap(self.norm)(features.astype(jnp.float32))
-        fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
-
-        xxT = mm_update(fts.T, fts)
-
-        eta_old = mm_update(self.Lambda, self.mu)
-        Lambda_new = self.Lambda + xxT
-
-        y_one_hot = nn.one_hot(y, self.mu.shape[-1])
-
-        x = solve(Lambda_new, fts.T, assume_a='sym').T
-        cutoff = jnp.log(0.5) * self.mu.shape[-1]
-
+    def _cavi_scan(self, fts: Array, x: Array, y_one_hot: Array, eta_init: Array, eta_old: Array, num_iters: int) -> Array:
+        """CAVI fixed-point scan. Returns eta_new = eta_old + X^T E_q[z]."""
         def step_fn(eta_carry, *args):
             pred = mm_update(x, eta_carry)
 
@@ -87,25 +82,54 @@ class IBProbit(eqx.Module):
             correction = jnp.where(y_one_hot, mills_pos, -mills_neg)
             E_q_z = pred + correction
 
-            ll = jnp.sum(y_one_hot * logcdf1 + (1 - y_one_hot) * logcdf2, -1, keepdims=True)
-            E_q_z = nn.sigmoid(ll - cutoff) * E_q_z
+            return eta_old + mm_update(fts.T, E_q_z), None
 
-            eta_carry = eta_old + mm_update(fts.T, E_q_z)
-            return eta_carry, None
+        eta_new, _ = lax.scan(step_fn, eta_init, jnp.arange(num_iters))
+        return eta_new
 
-        eta_new, _ = lax.scan(step_fn, eta_old, jnp.arange(num_iters))
+    def calibrate(self, features: Array, y: Array, *, num_iters: int = 8, loss_type: int = 2) -> "IBProbit":
+        """Temperature scaling via Newton steps on beta, using held-out (val) data.
+        """
+        def nll(b):
+            lf = eqx.tree_at(lambda m: m.beta, self, b)
+            return lf(features, y, loss_type=loss_type).mean()
 
-        Lambda_new = (1 - alpha) * self.Lambda + alpha * jnp.eye(self.mu.shape[0]) + xxT
-        mu_new = solve(Lambda_new, eta_new - alpha * eta_old, assume_a='sym')
+        def newton_step(b, _):
+            g = grad(nll)(b)
+            h = grad(grad(nll))(b)
+            return jnp.clip(b - 0.25 * g / (h + 1e-8), 0.01, 100.0), None
+
+        beta_new, _ = lax.scan(newton_step, self.beta, jnp.arange(num_iters))
+        return eqx.tree_at(lambda m: m.beta, self, beta_new)
+
+    def update(self, features: Array, y: Array, *, num_iters: int = 32, alpha: float = 1e-3) -> "IBProbit":
+        fts = vmap(self.norm)(features.astype(jnp.float32))
+        fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
+
+        xxT = mm_update(fts.T, fts)
+        eta_old = mm_update(self.Lambda, self.mu)
+        I = jnp.eye(self.mu.shape[0])
+        Lambda_accum = I + xxT
+        y_one_hot = nn.one_hot(y, self.mu.shape[-1])
+
+        L = cho_factor(Lambda_accum)
+        x = cho_solve(L, fts.T).T
+        key = jr.fold_in(self.key, y.sum().astype(jnp.int32))
+        eta_init = initializer(key, eta_old.shape, jnp.float32)
+        eta_new = self._cavi_scan(fts, x, y_one_hot, eta_init, jnp.zeros_like(eta_old), num_iters)
+
+        Lambda_new = (1 - alpha) * (self.Lambda - I) + Lambda_accum
+        # we use solve with 'sym' assumption instead of 'pos' for numerical stability
+        mu_new = solve(Lambda_new, eta_new + (1 - alpha) * eta_old, assume_a='sym')
 
         return eqx.tree_at(lambda x: (x.mu, x.Lambda), self, (mu_new, Lambda_new))
-    
+
     @property
     def params(self) -> Tuple[Array, Array]:
         params = self.mu
         return (params[:-1], params[-1]) if self.use_bias else (params, None)
 
-    def __call__(self, features: Array, y: Array, *, with_logits: bool = False, loss_type: int = 3) -> Tuple[Array, Optional[Array]]:
+    def __call__(self, features: Array, y: Array, *, with_logits: bool = False, loss_type: int = 2) -> Tuple[Array, Optional[Array]]:
         weights, bias = self.params
 
         y_one_hot = nn.one_hot(y, weights.shape[-1])
@@ -116,33 +140,33 @@ class IBProbit(eqx.Module):
         if self.use_bias:
             logits = logits + bias
 
-        # note: computation of loss is relevant for gradients over model parameters
+        # note: choice of loss is relevant for gradients over model parameters
         if loss_type == 0:
             # binary loss
-            loss = optax.sigmoid_binary_cross_entropy(logits, y_one_hot).sum(-1)
+            loss = optax.sigmoid_binary_cross_entropy(self.beta * logits, y_one_hot).sum(-1)
 
         elif loss_type == 1:
             # CBM Loss
-            logits = self.logcdf(logits) # jnp.log(self.cdf(logits))
-            loss = optax.safe_softmax_cross_entropy(logits, y_one_hot)
+            logits = self.logcdf(logits)
+            loss = optax.safe_softmax_cross_entropy(self.beta * logits, y_one_hot)
 
         elif loss_type == 2:
             # CBC Loss
-            logits = self.logcdf(logits) - self.logcdf(- logits)
-            loss = optax.safe_softmax_cross_entropy(logits, y_one_hot)
+            logits = self.logcdf(logits) - self.logcdf(-logits)
+            loss = optax.safe_softmax_cross_entropy(self.beta * logits, y_one_hot)
 
         elif loss_type == 3:
             # mixed loss
             logits1 = self.logcdf(logits)
             logits = logits1 - self.logcdf(-logits)
 
-            loss_cbm = optax.safe_softmax_cross_entropy(logits1, y_one_hot)
-            loss_cbc = optax.safe_softmax_cross_entropy(logits, y_one_hot)
+            loss_cbm = optax.safe_softmax_cross_entropy(self.beta * logits1, y_one_hot)
+            loss_cbc = optax.safe_softmax_cross_entropy(self.beta * logits, y_one_hot)
 
             loss = loss_cbm - nn.softplus(loss_cbm - loss_cbc) + jnp.log(2)
 
         if with_logits:
-            return loss, logits
+            return loss, self.beta * logits
         else:
             return loss
 
