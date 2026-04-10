@@ -16,6 +16,7 @@ from contextlib import nullcontext
 from dotenv import load_dotenv
 
 load_dotenv()
+load_dotenv(".env.secrets", override=False) # loads secrets if present locally, no-op otherwise
 
 from functools import partial
 from datasets import load_dataset
