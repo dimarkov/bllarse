@@ -18,6 +18,7 @@ dependencies = [
     "jax[cuda]>=0.6.2",
     "optax>=0.2.4",
     "tfp-nightly[jax]>=0.25",
+    "dotenv<1.0.0",
     "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
     "blrax @ git+https://github.com/dimarkov/blrax.git@main",
     "wandb>=0.18.3",
@@ -39,4 +40,3 @@ alternatives = [
     "transformers[flax]>=4.35.0",
     "sentencepiece>=0.2.0",
 ]
-
