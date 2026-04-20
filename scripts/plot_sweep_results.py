@@ -50,25 +50,27 @@ def fetch_mlflow_runs(experiment_name: str, parent_run_name: str) -> pd.DataFram
     from dotenv import load_dotenv
 
     load_dotenv()
-    mlflow.set_experiment(experiment_name)
+    load_dotenv(".env.secrets", override=False)
+    experiment = mlflow.set_experiment(experiment_name)
+    experiment_id = experiment.experiment_id
     client = MlflowClient()
 
-    # Find parent run
-    parents = mlflow.search_runs(
+    # Find parent run by name within the experiment
+    parents = client.search_runs(
+        experiment_ids=[experiment_id],
         filter_string=f"run_name = '{parent_run_name}'",
-        output_format="list",
     )
     if not parents:
-        print(f"ERROR: parent run '{parent_run_name}' not found in experiment '{experiment_name}'", file=sys.stderr)
+        print(f"ERROR: parent run '{parent_run_name}' not found in experiment '{experiment_name}' (id={experiment_id})", file=sys.stderr)
         sys.exit(1)
 
     parent_id = parents[0].info.run_id
     print(f"Parent run: {parent_id} ({parent_run_name})")
 
     # Fetch all FINISHED child runs
-    all_runs = mlflow.search_runs(
+    all_runs = client.search_runs(
+        experiment_ids=[experiment_id],
         filter_string=f"tags.mlflow.parentRunId = '{parent_id}' and attributes.status = 'FINISHED'",
-        output_format="list",
         max_results=5000,
     )
     total_runs = len(all_runs)
@@ -233,6 +235,7 @@ def make_figure(
     output_dir: str,
     sequential_update: bool | None = None,
     reset_loss_per_epoch: bool | None = None,
+    label: str = "sweep_results",
 ):
     """Create 3x6 figure: rows are datasets (cifar10/cifar100), columns are metrics × data_aug.
 
@@ -381,11 +384,11 @@ def make_figure(
     )
     fig.tight_layout()
 
-    fname = f"{output_dir}/sweep_results{filter_suffix}.pdf"
+    fname = f"{output_dir}/{label}{filter_suffix}.pdf"
     fig.savefig(fname, bbox_inches="tight", dpi=150)
     print(f"Saved {fname}")
 
-    fname_png = f"{output_dir}/sweep_results{filter_suffix}.png"
+    fname_png = f"{output_dir}/{label}{filter_suffix}.png"
     fig.savefig(fname_png, bbox_inches="tight", dpi=150)
     print(f"Saved {fname_png}")
 
@@ -437,6 +440,12 @@ def main():
         "--plot-only",
         action="store_true",
         help="Only plot from existing CSV (requires --input)",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default="sweep_results",
+        help="Prefix for output figure filenames (default: sweep_results)",
     )
     parser.add_argument(
         "--skip-baselines",
@@ -495,7 +504,7 @@ def main():
         return
 
     # Plot
-    make_figure(df, args.output_dir, sequential_update=seq_update, reset_loss_per_epoch=reset_loss)
+    make_figure(df, args.output_dir, sequential_update=seq_update, reset_loss_per_epoch=reset_loss, label=args.label)
 
 
 if __name__ == "__main__":
