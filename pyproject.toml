@@ -1,6 +1,6 @@
 [project]
 name = "bllarse"
-version = "0.1.0"
+version = "0.2.0"
 description = "Learning Bayesian last layers on top of deep neural networks with sparse priors and Bayesian model reduction"
 readme = "README.md"
 authors = [
@@ -20,8 +20,7 @@ dependencies = [
     "tfp-nightly[jax]>=0.25",
     "dotenv<1.0.0",
     "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
-    "blrax @ git+https://github.com/dimarkov/blrax.git@main",
-    "wandb>=0.18.3",
+    "blrax @ git+https://github.com/dimarkov/blrax.git@main"
 ]
 
 [build-system]
