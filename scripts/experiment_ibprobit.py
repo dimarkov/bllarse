@@ -22,8 +22,12 @@ from bllarse.utils import (
     resize_images,
     augmentdata,
     evaluate_model,
+    extract_features,
     MEAN_DICT,
     STD_DICT,
+)
+from tensorflow_probability.substrates.jax.stats import (
+    expected_calibration_error as compute_ece,
 )
 
 warnings.filterwarnings("ignore")
@@ -94,6 +98,8 @@ def run_experiment(args):
                 "ece",
                 "nll",
                 "time_taken",
+                "temperature",
+                "test_fraction",
             ]
         )
         df_header.to_csv(output_file, index=False)
@@ -167,13 +173,113 @@ def run_experiment(args):
                     "ece": float(ece),
                     "nll": float(nll),
                     "time_taken": elapsed,
+                    "temperature": float("nan"),
+                    "test_fraction": float("nan"),
                 }
                 pd.DataFrame([row]).to_csv(
                     output_file, mode="a", header=False, index=False
                 )
 
+                # Optional: temperature scaling using a fraction of the test set
+                # (calibrate beta on f*N_test, evaluate on the remaining (1-f)*N_test).
+                # Repeated `repeats` times per fraction with different random splits to
+                # match the IBProbit linear-probing repeat statistics.
+                if args.temperature_scaling:
+                    print(
+                        f"    Running TS on test fractions {args.ts_test_fractions} "
+                        f"(Newton iters={args.ts_iters}, {repeats} repeats per fraction)"
+                    )
+                    aug_test = _augdata_eval(test_ds["image"], key=None)
+                    test_logits_all = extract_features(baseline_nnet, aug_test)
+                    test_lbls_all = test_ds["label"]
+                    n_test = test_logits_all.shape[0]
+
+                    ts_rows = []
+                    for f in args.ts_test_fractions:
+                        n_cal = int(round(f * n_test))
+                        accs, eces, nlls, betas = [], [], [], []
+                        for r_idx in range(repeats):
+                            ts_seed = (
+                                args.seed
+                                + r_idx
+                                + int(round(f * 100000))
+                                + (hash(("ts", dataset_name, num_blocks, embed_dim))
+                                   % 100000)
+                            )
+                            ts_key = jr.PRNGKey(ts_seed % (2**32))
+                            perm = jr.permutation(ts_key, n_test)
+                            cal_idx = perm[:n_cal]
+                            eval_idx = perm[n_cal:]
+
+                            cal_logits = test_logits_all[cal_idx]
+                            cal_lbls = test_lbls_all[cal_idx]
+                            eval_logits = test_logits_all[eval_idx]
+                            eval_lbls = test_lbls_all[eval_idx]
+
+                            start_t = time.time()
+                            loss_fn_ts = CrossEntropy(0.0, num_classes).calibrate(
+                                cal_logits, cal_lbls, num_iters=args.ts_iters
+                            )
+                            beta_ts = float(loss_fn_ts.beta)
+                            nll_ts_arr, scaled_eval = loss_fn_ts(
+                                eval_logits, eval_lbls, with_logits=True
+                            )
+                            preds_ts = jnp.argmax(scaled_eval, axis=-1)
+                            acc_ts = float(jnp.mean(preds_ts == eval_lbls))
+                            ece_ts = float(compute_ece(
+                                20,
+                                logits=scaled_eval,
+                                labels_true=eval_lbls,
+                                labels_predicted=preds_ts,
+                            ))
+                            nll_ts = float(nll_ts_arr.mean())
+                            elapsed_ts = time.time() - start_t
+
+                            accs.append(acc_ts)
+                            eces.append(ece_ts)
+                            nlls.append(nll_ts)
+                            betas.append(beta_ts)
+
+                            ts_rows.append({
+                                "dataset": dataset_name,
+                                "num_blocks": num_blocks,
+                                "embed_dim": embed_dim,
+                                "pretrained_source": "in21k_cifar",
+                                "type": "baseline_ts",
+                                "batch_size": -1,
+                                "update_iters": args.ts_iters,
+                                "repeat_idx": r_idx,
+                                "data_aug": False,
+                                "acc": acc_ts,
+                                "ece": ece_ts,
+                                "nll": nll_ts,
+                                "time_taken": elapsed_ts,
+                                "temperature": 1.0 / beta_ts,
+                                "test_fraction": float(f),
+                            })
+
+                        accs_arr = jnp.asarray(accs)
+                        eces_arr = jnp.asarray(eces)
+                        nlls_arr = jnp.asarray(nlls)
+                        betas_arr = jnp.asarray(betas)
+                        Ts_arr = 1.0 / betas_arr
+                        print(
+                            f"      f={f:.3f}  n_cal={n_cal}  n_eval={n_test - n_cal}  "
+                            f"T={float(Ts_arr.mean()):.3f}±{float(Ts_arr.std()):.3f}  "
+                            f"Acc={float(accs_arr.mean()):.4f}±{float(accs_arr.std()):.4f}  "
+                            f"ECE={float(eces_arr.mean()):.4f}±{float(eces_arr.std()):.4f}  "
+                            f"NLL={float(nlls_arr.mean()):.4f}±{float(nlls_arr.std()):.4f}"
+                        )
+
+                    pd.DataFrame(ts_rows).to_csv(
+                        output_file, mode="a", header=False, index=False
+                    )
+
             except Exception as e:
                 print(f"    Failed to load/eval baseline {baseline_name}: {e}")
+
+            if args.skip_ibprobit:
+                continue
 
             # 2. Run IBProbit Experiments
             for p_source in pretrained_types:
@@ -262,6 +368,8 @@ def run_experiment(args):
                                     "ece": float(ece),
                                     "nll": float(nll),
                                     "time_taken": elapsed,
+                                    "temperature": float("nan"),
+                                    "test_fraction": float("nan"),
                                 }
                             )
 
@@ -317,6 +425,32 @@ if __name__ == "__main__":
         "--nodataaug",
         action="store_true",
         help="Disable data augmentation (normalization only)",
+    )
+    parser.add_argument(
+        "--temperature-scaling",
+        action="store_true",
+        help="Fit beta on a fraction of the test set and evaluate on the rest. "
+             "Sweeps over --ts-test-fractions, with `repeats` random splits per "
+             "fraction; emits one 'baseline_ts' row per (fraction, repeat).",
+    )
+    parser.add_argument(
+        "--ts-iters",
+        type=int,
+        default=4,
+        help="Newton iterations per TS calibration (default: 4 — convex CE "
+             "converges fast).",
+    )
+    parser.add_argument(
+        "--ts-test-fractions",
+        nargs="+",
+        type=float,
+        default=[0.10],
+        help="Fractions of the test set used as TS calibration data.",
+    )
+    parser.add_argument(
+        "--skip-ibprobit",
+        action="store_true",
+        help="Skip the IBProbit sweep (only run baseline / temperature scaling).",
     )
     args = parser.parse_args()
 
