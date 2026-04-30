@@ -29,6 +29,16 @@ METRIC_BETTER = {"acc": "higher", "ece": "lower", "nll": "lower"}
 def make_figure(df_dataset, dataset_name, data_aug, pretrained_sources, output_dir):
     """Create and save one figure for a dataset, combining all sources."""
 
+    plt.rcParams.update({
+        "font.size": 12,
+        "axes.titlesize": 13,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 12,
+        "figure.titlesize": 16,
+    })
+
     df_ib = df_dataset[df_dataset["type"] == "ibprobit"]
     df_bl = df_dataset[
         (df_dataset["type"] == "baseline")
@@ -60,7 +70,7 @@ def make_figure(df_dataset, dataset_name, data_aug, pretrained_sources, output_d
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(18, 2.5 * n_rows),
+        figsize=(11, 2.0 * n_rows),
         squeeze=False,
         sharex=True,
     )
@@ -121,7 +131,7 @@ def make_figure(df_dataset, dataset_name, data_aug, pretrained_sources, output_d
                 # Titles on top row
                 if row_idx == 0:
                     display_source = source_labels.get(source, source)
-                    ax.set_title(f"{display_source}\n{METRIC_LABELS[metric]}", fontsize=10, fontweight="bold")
+                    ax.set_title(f"{display_source}\n{METRIC_LABELS[metric]}", fontweight="bold")
                 
                 # X-label on bottom row
                 if row_idx == n_rows - 1:
@@ -130,7 +140,7 @@ def make_figure(df_dataset, dataset_name, data_aug, pretrained_sources, output_d
                 # Y-label / Row label on left column
                 if col_idx == 0:
                     label_str = f"B={nb}, D={ed}"
-                    ax.set_ylabel(label_str, fontsize=10)
+                    ax.set_ylabel(label_str)
 
     # Single legend
     handles, labels = axes[0, 0].get_legend_handles_labels()
@@ -141,17 +151,15 @@ def make_figure(df_dataset, dataset_name, data_aug, pretrained_sources, output_d
         by_label.keys(),
         loc="center left",
         ncol=1,
-        fontsize=10,
         frameon=True,
         bbox_to_anchor=(1.01, 0.5),
     )
 
     fig.suptitle(
         "CIFAR-10" if dataset_name == 'cifar10' else 'CIFAR-100',
-        fontsize=14,
         y=1.005,
     )
-    fig.tight_layout()
+    fig.tight_layout(pad=0.2)
 
     fname = f"{output_dir}/linear_probing_ibprobit_{dataset_name}_{'aug' if data_aug else 'noaug'}.pdf"
     fig.savefig(fname, bbox_inches="tight", dpi=150)

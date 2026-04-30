@@ -130,6 +130,16 @@ MODEL_DISPLAY = {
 
 def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", model: str = "dinov3_huge", dataset_info: dict | None = None):
     """3-row (metrics) x 6-col (datasets) figure."""
+    plt.rcParams.update({
+        "font.size": 12,
+        "axes.titlesize": 13,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 12,
+        "figure.titlesize": 16,
+    })
+
     df_model = df[df["model"] == model].copy()
 
     n_rows = len(METRICS)
@@ -137,7 +147,7 @@ def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", mode
 
     fig, axes = plt.subplots(
         n_rows, n_cols,
-        figsize=(3.5 * n_cols, 3 * n_rows),
+        figsize=(1.7 * n_cols, 1.8 * n_rows),
         squeeze=False,
         sharex="col",
     )
@@ -183,6 +193,11 @@ def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", mode
                 ax.xaxis.set_major_locator(ticker.FixedLocator(ds_batch_sizes))
             ax.tick_params(axis="x", rotation=45)
 
+            ax.yaxis.set_major_locator(
+                ticker.MaxNLocator(nbins=3, steps=[1, 2, 10], prune="both")
+            )
+            ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
+
 
 
             if row_idx == 0:
@@ -196,7 +211,7 @@ def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", mode
                 if n_classes:
                     parts.append(f"C={n_classes}")
                 title = f"{ds_label}\n({', '.join(parts)})" if parts else ds_label
-                ax.set_title(title, fontsize=10, fontweight="bold")
+                ax.set_title(title, fontweight="bold")
             if row_idx == n_rows - 1:
                 ax.set_xlabel("Batch Size")
             if col_idx == 0:
@@ -214,99 +229,18 @@ def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", mode
         handles, labels,
         loc="center left",
         ncol=1,
-        fontsize=9,
         frameon=True,
         bbox_to_anchor=(1.01, 0.5),
     )
 
     model_label = MODEL_DISPLAY.get(model, model)
-    fig.suptitle(f"IBProbit linear probing — {model_label}", fontsize=13, y=1.005)
-    fig.tight_layout()
+    fig.suptitle(f"IBProbit linear probing — {model_label}", y=1.005)
+    fig.tight_layout(pad=0.1, w_pad=0.1, h_pad=0.1)
 
-    for ext in ("pdf", "png"):
-        fname = os.path.join(output_dir, f"{prefix}_dinov3_huge.{ext}")
-        fig.savefig(fname, bbox_inches="tight", dpi=150)
-        print(f"Saved {fname}")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# LaTeX table
-# ---------------------------------------------------------------------------
-
-ALL_MODELS = [
-    "dinov3_small", "dinov3_big", "dinov3_large", "dinov3_huge",
-]
-ALL_DATASETS = [
-    "cifar10", "cifar100", "oxford_pets", "food101",
-    "flowers102", "stanford_cars", "dtd", "imagenet1k",
-]
-
-
-def make_latex_table(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a"):
-    """Table for largest batch_size and num_update_iters, all models x datasets."""
-    max_bs = df["batch_size"].max()
-    max_ui = df["num_update_iters"].max()
-    df_filt = df[(df["batch_size"] == max_bs) & (df["num_update_iters"] == max_ui)]
-
-    print(f"LaTeX table: batch_size={max_bs}, num_update_iters={max_ui}")
-
-    # Aggregate over seeds
-    grouped = (
-        df_filt.groupby(["model", "dataset"])[METRICS]
-        .agg(["mean", "std"])
-    )
-
-    def fmt(mean, std):
-        if np.isnan(mean):
-            return "—"
-        if np.isnan(std) or std == 0:
-            return f"{mean:.2f}"
-        return f"{mean:.2f} $\\pm$ {std:.2f}"
-
-    # Build table
-    header_datasets = " & ".join(d.replace("_", "\\_") for d in ALL_DATASETS)
-    lines = [
-        r"\begin{table}[ht]",
-        r"\centering",
-        r"\caption{IBProbit results (batch\_size=" + str(max_bs) + r", update\_iters=" + str(max_ui) + r")}",
-        r"\label{tab:sweep2a}",
-        r"\resizebox{\textwidth}{!}{%",
-        r"\begin{tabular}{l" + "c" * len(ALL_DATASETS) + "}",
-        r"\toprule",
-    ]
-
-    for metric in METRICS:
-        label = METRIC_LABELS[metric]
-        lines.append(r"\multicolumn{" + str(len(ALL_DATASETS) + 1) + r"}{c}{\textbf{" + label + r"}} \\")
-        lines.append(r"\midrule")
-        lines.append(r"Model & " + header_datasets + r" \\")
-        lines.append(r"\midrule")
-
-        for model in ALL_MODELS:
-            cells = [model.replace("_", "\\_")]
-            for dataset in ALL_DATASETS:
-                try:
-                    row = grouped.loc[(model, dataset)]
-                    m = row[(metric, "mean")]
-                    s = row[(metric, "std")]
-                    cells.append(fmt(m, s))
-                except KeyError:
-                    cells.append("—")
-            lines.append(" & ".join(cells) + r" \\")
-
-        lines.append(r"\midrule")
-
-    # Replace last \midrule with \bottomrule
-    lines[-1] = r"\bottomrule"
-    lines.append(r"\end{tabular}}")
-    lines.append(r"\end{table}")
-
-    tex = "\n".join(lines) + "\n"
-    fname = os.path.join(output_dir, f"{prefix}_table.tex")
-    with open(fname, "w") as f:
-        f.write(tex)
+    fname = os.path.join(output_dir, f"{prefix}_dinov3_huge.pdf")
+    fig.savefig(fname, bbox_inches="tight", dpi=150)
     print(f"Saved {fname}")
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +280,6 @@ def main():
     prefix = args.parent_run_name.split("-")[0]
     dataset_info = _load_dataset_info(args.cache_dir)
     make_figure(df, args.output_dir, prefix=prefix, dataset_info=dataset_info)
-    make_latex_table(df, args.output_dir, prefix=prefix)
 
 
 if __name__ == "__main__":

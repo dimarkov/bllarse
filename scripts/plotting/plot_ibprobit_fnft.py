@@ -119,6 +119,16 @@ def make_binary_settings_figure(
     setting_colors = {False: "steelblue", True: "tomato"}
     setting_labels = {False: "DA", True: "No-DA"}
 
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "figure.titlesize": 14,
+    })
+
     # Layout: 2 rows (datasets) × 3 columns (metrics)
     fig, axes = plt.subplots(
         len(datasets), len(METRICS),
@@ -171,23 +181,21 @@ def make_binary_settings_figure(
                 legend_handles, legend_labels = ax.get_legend_handles_labels()
 
             if ds_idx == 0:
-                ax.set_title(METRIC_LABELS[metric], fontsize=12, fontweight="bold")
+                ax.set_title(METRIC_LABELS[metric], fontweight="bold")
             if ds_idx == len(datasets) - 1:
                 ax.set_xlabel("Epoch")
             if m_idx == 0:
-                ax.set_ylabel(dataset_labels[dataset], fontsize=11)
+                ax.set_ylabel(dataset_labels[dataset])
 
     # Place legend in the first subplot (cifar10 / Accuracy), bottom-right
     axes[0, 0].legend(
         legend_handles, legend_labels,
         loc="lower right",
-        fontsize=9,
         frameon=True,
     )
 
     fig.suptitle(
         "IBProbit full-network fine-tuning — DA vs No-DA",
-        fontsize=13,
     )
     fig.tight_layout()
 
