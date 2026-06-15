@@ -57,6 +57,7 @@ def _build_run_config(args, o_config):
         tune_mode=args.tune_mode,
         sequential_update=args.sequential_update,
         reset_loss_per_epoch=args.reset_loss_per_epoch,
+        val_fraction=args.val_fraction,
     )
 
     if args.loss_fn == 'IBProbit':
@@ -153,6 +154,19 @@ def main(args, m_config, o_config):
     # define data augmentation
     train_ds['image'] = resize_images(train_ds['image'], m_config['img_size'])
     test_ds['image'] = resize_images(test_ds['image'], m_config['img_size'])
+
+    # Optionally reserve a held-out validation subset (drawn from the test set)
+    # used only to flag the best/optimal epoch via validation NLL. The reported
+    # test metrics still use the full test set. A dedicated RNG key is used so
+    # enabling validation does not perturb model initialisation / training.
+    val_ds = None
+    if args.val_fraction > 0:
+        n_test = int(test_ds['label'].shape[0])
+        n_val = max(1, int(n_test * args.val_fraction))
+        val_key = jr.fold_in(jr.PRNGKey(seed), 0x7A11)
+        val_idx = jr.permutation(val_key, n_test)[:n_val]
+        val_ds = {'image': test_ds['image'][val_idx], 'label': test_ds['label'][val_idx]}
+        print(f"Reserved {n_val}/{n_test} test samples for validation (epoch selection).")
 
     mean = MEAN_DICT[args.dataset]
     std = STD_DICT[args.dataset]
@@ -259,6 +273,7 @@ def main(args, m_config, o_config):
     opt_state = None
     trained_loss_fn = loss_fn
     trained_model = nnet
+    val_nll_history = []
 
     with mlflow_context:
         if enable_mlflow:
@@ -279,6 +294,7 @@ def main(args, m_config, o_config):
                 _augdata,
                 train_ds,
                 test_ds,
+                val_ds=val_ds,
                 optimizer=optim,
                 opt_state=opt_state,
                 tune_last_layer_only=tune_last_layer_only,
@@ -302,6 +318,9 @@ def main(args, m_config, o_config):
                     to_save = {"last_layer": trained_model, "opt_state": opt_state, "metrics": metrics}
                 else:
                     to_save = {"nnet": trained_model, "opt_state": opt_state, "metrics": metrics}
+
+            if val_ds is not None and "val_nll" in metrics:
+                val_nll_history.append(metrics["val_nll"])
 
             vals = jtu.tree_map(lambda x: x[-1], metrics)
 
@@ -345,6 +364,21 @@ def main(args, m_config, o_config):
 
             clear_caches()
 
+        # Flag the optimal epoch as the one with the lowest validation NLL.
+        # Training is not stopped early; this only records where convergence to
+        # the best validation NLL occurred.
+        if val_nll_history:
+            val_nll_all = jnp.concatenate([jnp.atleast_1d(v) for v in val_nll_history])
+            best_idx = int(jnp.argmin(val_nll_all))
+            best_epoch = best_idx + 1  # epochs are 1-indexed
+            best_val_nll = float(val_nll_all[best_idx])
+            print(f"Optimal epoch (min validation nll): {best_epoch} / {num_epochs} "
+                  f"(val_nll={best_val_nll:.4f})")
+            if enable_mlflow:
+                mlflow.log_metric("best_epoch", best_epoch)
+                mlflow.log_metric("best_val_nll", best_val_nll)
+                mlflow.set_tag("best_epoch", best_epoch)
+
 
 def build_argparser():
     parser = argparse.ArgumentParser(description="Finetuning script")
@@ -380,6 +414,10 @@ def build_argparser():
     parser.add_argument("--num-update-iters", nargs='?', default=16, type=int, 
                        help='Number of CAVI iterations per mini-batch for Bayesian last layer')
     parser.add_argument("--pretrained", nargs='?', choices=['in21k', 'in21k_cifar'], default='in21k_cifar', type=str)
+    parser.add_argument("--val-fraction", "--val_fraction", nargs='?', default=0.0, type=float,
+                       help='Fraction of the test set to reserve as a held-out validation set '
+                            'used to flag the optimal epoch (lowest validation NLL). Training is '
+                            'not stopped early. 0 disables it (default).')
     parser.add_argument("--reinitialize", action="store_true")
     parser.add_argument("--nodataaug", action="store_true")
     parser.add_argument("--sequential-update", action="store_true",

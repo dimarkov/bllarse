@@ -113,6 +113,7 @@ def run_training(
     train_ds,
     test_ds,
     *,
+    val_ds=None,
     optimizer=None,
     opt_state=None,
     tune_last_layer_only: bool = False,
@@ -138,6 +139,9 @@ def run_training(
     data_augmentation : Data augmentation function
     train_ds : Training dataset dict with 'image' and 'label' keys
     test_ds : Test dataset dict with 'image' and 'label' keys
+    val_ds : Optional held-out validation dataset dict ('image', 'label'). When
+        provided, a per-epoch validation NLL is computed and returned under the
+        'val_nll' metric (used by callers to flag the best/optimal epoch).
     optimizer : Optimizer (None for CAVI-only with Bayesian + tune_last_layer_only)
     opt_state : Optional initial optimizer state
     last_layer : LastLayer wrapper (required for classical + tune_last_layer_only)
@@ -390,6 +394,14 @@ def run_training(
             "nll": nll,
         }
 
+        # Held-out validation NLL for epoch selection (same metric definition as
+        # the reported test nll: label-smoothing-free for CrossEntropy).
+        if val_ds is not None:
+            _, val_nll, _ = evaluate(
+                updated_loss_params, updated_params, val_ds["image"], val_ds["label"]
+            )
+            metrics["val_nll"] = val_nll
+
         return (updated_loss_params, updated_params, opt_state), metrics
 
     # Main training loop
@@ -404,16 +416,16 @@ def run_training(
             metrics_np = jtu.map(lambda x: onp.asarray(x), metrics_seq)
             for ep in range(num_epochs):
                 step = epoch_offset + ep + 1
-                mlflow.log_metrics(
-                    {
-                        "loss": float(metrics_np["loss"][ep]),
-                        "nll": float(metrics_np["nll"][ep]),
-                        "acc": float(metrics_np["acc"][ep]),
-                        "ece": float(metrics_np["ece"][ep]),
-                        "epoch": float(step),
-                    },
-                    step=step,
-                )
+                log_dict = {
+                    "loss": float(metrics_np["loss"][ep]),
+                    "nll": float(metrics_np["nll"][ep]),
+                    "acc": float(metrics_np["acc"][ep]),
+                    "ece": float(metrics_np["ece"][ep]),
+                    "epoch": float(step),
+                }
+                if "val_nll" in metrics_np:
+                    log_dict["val_nll"] = float(metrics_np["val_nll"][ep])
+                mlflow.log_metrics(log_dict, step=step)
         except Exception as exc:
             print(f"[bllarse] MLflow logging failed: {exc}")
 
