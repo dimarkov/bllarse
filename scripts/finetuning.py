@@ -219,6 +219,37 @@ def main(args, m_config, o_config):
         conf['ess'] = datasize
         optim = ivon(lr_schd, **conf)
 
+    # Optionally give the classifier head (the network's `.fc`) its own learning
+    # rate. Only meaningful for full-network fine-tuning with a classical loss:
+    # in last-layer mode `--learning-rate` already controls the head, and the
+    # IBProbit head is updated via CAVI rather than the optimizer.
+    if args.head_lr is not None:
+        is_classical = args.loss_fn in ('MSE', 'CrossEntropy')
+        opt_name = 'adamw' if 'adamw' in o_config else ('lion' if 'lion' in o_config else None)
+        if is_classical and not tune_last_layer_only and opt_name is not None:
+            head_conf = dict(o_config[opt_name])
+            head_conf['learning_rate'] = args.head_lr
+            head_optim = getattr(optax, opt_name)(**head_conf)
+
+            def _param_labels(params):
+                labels = jtu.tree_map(lambda _: 'backbone', params)
+                return eqx.tree_at(
+                    lambda m: m.fc,
+                    labels,
+                    replace_fn=lambda fc: jtu.tree_map(lambda _: 'head', fc),
+                )
+
+            optim = optax.multi_transform(
+                {'backbone': optim, 'head': head_optim}, _param_labels
+            )
+            print(f"Using separate head learning rate: {args.head_lr}")
+        else:
+            warnings.warn(
+                "--head-lr is only applied for full-network fine-tuning with a "
+                "classical loss (MSE/CrossEntropy) and the adamw/lion optimizer; "
+                "ignoring it."
+            )
+
     num_update_iters = args.num_update_iters
     num_params = get_number_of_parameters(pretrained_nnet)
     print('Loss Function:', args.loss_fn, 'Optimizer:', args.optimizer, 'Finetune Mode:', args.tune_mode)
@@ -330,8 +361,12 @@ def build_argparser():
     parser.add_argument("-e", "--epochs", nargs='?', default=100, type=int)
     parser.add_argument("-bs", "--batch-size", nargs='?', default=64, type=int)
     parser.add_argument("-ls", "--label-smooth", nargs='?', default=0.0, type=float)
-    parser.add_argument("-lr", "--learning-rate", nargs='?', default=1e-3, type=float, 
+    parser.add_argument("-lr", "--learning-rate", nargs='?', default=1e-3, type=float,
                        help='Learning rate for AdamW or Lion optimizers')
+    parser.add_argument("--head-lr", "--head-learning-rate", nargs='?', default=None, type=float,
+                       help='Optional separate learning rate for the classifier head (the '
+                            'network .fc). Only applied for full-network fine-tuning with a '
+                            'classical loss (MSE/CrossEntropy) and AdamW/Lion.')
     parser.add_argument("-wd", "--weight-decay", nargs='?', default=1e-2, type=float, 
                        help='Weight decay for AdamW or Lion optimizers')
     parser.add_argument("-mc", "--mc-samples", nargs='?', default=1, type=int)
