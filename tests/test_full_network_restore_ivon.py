@@ -28,7 +28,7 @@ _NUM_CLASSES = {
 
 
 def _coerce_value(value: str) -> Any:
-    """Best-effort conversion of W&B config scalar values."""
+    """Best-effort conversion of config scalar values."""
     value = value.strip()
     if value.startswith('"') and value.endswith('"'):
         value = value[1:-1]
@@ -47,8 +47,8 @@ def _coerce_value(value: str) -> Any:
         return value
 
 
-def _parse_wandb_config(config_path: Path) -> Dict[str, Any]:
-    """Lightweight parser for W&B offline config.yaml files."""
+def _parse_run_config(config_path: Path) -> Dict[str, Any]:
+    """Lightweight parser for offline config.yaml files."""
     cfg: Dict[str, Any] = {}
     current_key: Optional[str] = None
 
@@ -72,14 +72,11 @@ def _parse_wandb_config(config_path: Path) -> Dict[str, Any]:
 
 
 def _resolve_run_dir(run_dir: str) -> Path:
-    """Accept absolute/relative run_dir or just the W&B run name."""
+    """Accept an absolute or relative path to a run directory."""
     path = Path(run_dir)
     if path.exists():
         return path.resolve()
-    wandb_path = Path("wandb") / run_dir
-    if wandb_path.exists():
-        return wandb_path.resolve()
-    raise FileNotFoundError(f"Could not find run directory at '{run_dir}' or '{wandb_path}'.")
+    raise FileNotFoundError(f"Could not find run directory at '{run_dir}'.")
 
 
 def _select_checkpoint(run_path: Path, checkpoint: Optional[str]) -> Path:
@@ -166,9 +163,9 @@ def restore_full_network_checkpoint(run_dir: str, checkpoint: Optional[str] = No
     run_path = _resolve_run_dir(run_dir)
     cfg_path = run_path / "files" / "config.yaml"
     if not cfg_path.exists():
-        raise FileNotFoundError(f"W&B config file not found at '{cfg_path}'.")
+        raise FileNotFoundError(f"Config file not found at '{cfg_path}'.")
 
-    config = _parse_wandb_config(cfg_path)
+    config = _parse_run_config(cfg_path)
     model_like, dataset, embed_dim = _build_backbone(config)
     bayes_head_like = _build_ibprobit_head(embed_dim, dataset)
 
@@ -208,7 +205,7 @@ def main():
     parser.add_argument(
         "--run-dir",
         required=True,
-        help="Path to the W&B run directory (e.g. 'wandb/run-YYYYMMDD_HHMMSS-uid').",
+        help="Path to the run directory containing files/config.yaml.",
     )
     parser.add_argument(
         "--checkpoint",

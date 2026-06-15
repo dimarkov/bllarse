@@ -40,9 +40,9 @@ def test_ibprobit_reset_preserves_parameter_shapes():
     reset_model = model.reset(reset_key)
 
     assert reset_model.mu.shape == model.mu.shape
-    assert reset_model.L.shape == model.L.shape
+    assert reset_model.Lambda.shape == model.Lambda.shape
     assert jnp.isfinite(reset_model.mu).all()
-    assert jnp.isfinite(reset_model.L).all()
+    assert jnp.isfinite(reset_model.Lambda).all()
 
 
 def test_independent_binary_polyagamma_loss():

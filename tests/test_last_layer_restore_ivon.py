@@ -9,7 +9,6 @@ import jax.random as jr
 import optax
 
 from blrax.optim import ivon
-from bllarse.layers import LastLayer
 from bllarse.utils import load_ivon_checkpoint
 from mlpox.load_models import load_model
 
@@ -44,7 +43,7 @@ def _coerce_value(value: str) -> Any:
         return value
 
 
-def _parse_wandb_config(config_path: Path) -> Dict[str, Any]:
+def _parse_run_config(config_path: Path) -> Dict[str, Any]:
     cfg: Dict[str, Any] = {}
     current_key: Optional[str] = None
     with config_path.open("r") as f:
@@ -70,10 +69,7 @@ def _resolve_run_dir(run_dir: str) -> Path:
     path = Path(run_dir)
     if path.exists():
         return path.resolve()
-    wandb_path = Path("wandb") / run_dir
-    if wandb_path.exists():
-        return wandb_path.resolve()
-    raise FileNotFoundError(f"Could not find run directory at '{run_dir}' or '{wandb_path}'.")
+    raise FileNotFoundError(f"Could not find run directory at '{run_dir}'.")
 
 
 def _select_checkpoint(run_path: Path, checkpoint: Optional[str]) -> Path:
@@ -109,13 +105,19 @@ def _build_backbone(config: Dict[str, Any]) -> Tuple[eqx.Module, str, int]:
     return backbone, dataset, embed_dim
 
 
-def _build_last_layer(embed_dim: int, dataset: str) -> LastLayer:
+def _build_nnet_template(backbone: eqx.Module, embed_dim: int, dataset: str) -> eqx.Module:
+    """Reconstruct the full network template (backbone with a fresh last layer).
+
+    Last-layer fine-tuning embeds the trained classifier directly in the
+    backbone's ``fc`` attribute and checkpoints the whole network, so the
+    restore template must mirror that structure.
+    """
     if dataset not in _NUM_CLASSES:
         raise KeyError(f"Unknown dataset '{dataset}'. Please extend _NUM_CLASSES.")
     num_classes = _NUM_CLASSES[dataset]
     key = jr.PRNGKey(0)
-    linear = eqx.nn.Linear(embed_dim, num_classes, key=key)
-    return LastLayer(linear)
+    last_layer = eqx.nn.Linear(embed_dim, num_classes, key=key)
+    return eqx.tree_at(lambda m: m.fc, backbone, last_layer)
 
 
 def _rebuild_optimizer(config: Dict[str, Any], dataset: str):
@@ -152,21 +154,21 @@ def restore_last_layer_checkpoint(run_dir: str, checkpoint: Optional[str] = None
     run_path = _resolve_run_dir(run_dir)
     cfg_path = run_path / "files" / "config.yaml"
     if not cfg_path.exists():
-        raise FileNotFoundError(f"W&B config file not found at '{cfg_path}'.")
+        raise FileNotFoundError(f"Config file not found at '{cfg_path}'.")
 
-    config = _parse_wandb_config(cfg_path)
+    config = _parse_run_config(cfg_path)
     backbone, dataset, embed_dim = _build_backbone(config)
-    last_layer_like = _build_last_layer(embed_dim, dataset)
+    nnet_like = _build_nnet_template(backbone, embed_dim, dataset)
 
     ckpt_path = _select_checkpoint(run_path, checkpoint)
     optim = _rebuild_optimizer(config, dataset)
 
-    restored_last_layer, restored_opt_state = load_ivon_checkpoint(
-        ckpt_path, last_layer_like, optim
+    restored_nnet, restored_opt_state = load_ivon_checkpoint(
+        ckpt_path, nnet_like, optim
     )
 
     dummy_image = jnp.zeros((64, 64, 3), dtype=jnp.float32)
-    logits = restored_last_layer(backbone, dummy_image)
+    logits = restored_nnet(dummy_image)
 
     num_classes = _NUM_CLASSES[dataset]
     if logits.shape[-1] != num_classes:
@@ -182,7 +184,7 @@ def main():
     parser.add_argument(
         "--run-dir",
         required=True,
-        help="Path to the W&B run directory (e.g. 'wandb/run-YYYYMMDD_HHMMSS-uid').",
+        help="Path to the run directory containing files/config.yaml.",
     )
     parser.add_argument(
         "--checkpoint",

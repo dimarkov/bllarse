@@ -339,7 +339,6 @@ def run_experiment(args):
                                 batch_size=batch_size,
                                 num_update_iters=num_update_iters,
                                 mc_samples=1,
-                                log_to_wandb=False,
                             )
 
                             # Eval
