@@ -18,7 +18,7 @@ import numpy as onp
 from typing import Mapping, Optional
 
 from blrax.utils import noisy_value_and_grad
-from bllarse.losses import Classical
+from bllarse.losses import Classical, CrossEntropy
 
 import augmax
 from math import prod
@@ -285,6 +285,11 @@ def run_training(
     # Evaluation
     def evaluate(loss_params, net_params, images, labels):
         loss_fn = eqx.combine(loss_params, loss_static)
+        # Report a genuine held-out NLL: drop label smoothing so the reported
+        # nll is comparable across different --label-smooth values. The trained
+        # temperature (beta) is preserved.
+        if isinstance(loss_fn, CrossEntropy):
+            loss_fn = eqx.tree_at(lambda m: m.alpha, loss_fn, 0.0)
         nnet = get_nnet(net_params)
         return evaluate_model(
             data_augmentation, loss_fn, nnet, images, labels, loss_type=loss_type
