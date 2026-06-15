@@ -15,9 +15,11 @@ from contextlib import nullcontext
 try:
     import mlflow
     no_mlflow = False
-except Exception:
+    _mlflow_import_error = None
+except Exception as exc:  # record the real cause; reported in main() if needed
     mlflow = None
     no_mlflow = True
+    _mlflow_import_error = exc
 
 from functools import partial
 from datasets import load_dataset
@@ -94,8 +96,18 @@ def main(args, m_config, o_config):
     use_ivon = 'ivon' in o_config
     enable_mlflow = args.enable_mlflow
     if enable_mlflow and no_mlflow:
-        print("[bllarse] MLflow is not installed; disabling MLflow logging.")
-        enable_mlflow = False
+        # --enable-mlflow was requested but `import mlflow` failed. Do NOT
+        # silently disable logging: that drops the run from the tracking server
+        # and is easy to miss in a large sweep. Surface the real error and fail
+        # so the run is reported/retried rather than completing untracked. The
+        # error is often transient (e.g. a memory error while importing the
+        # heavy mlflow stack under parallel runs), not a missing install.
+        raise RuntimeError(
+            "MLflow logging was requested (--enable-mlflow) but importing mlflow "
+            f"failed: {_mlflow_import_error!r}. If mlflow is genuinely not "
+            "installed, omit --enable-mlflow; otherwise this is likely a transient "
+            "resource error under parallel execution -- reduce concurrency or rerun."
+        ) from _mlflow_import_error
 
     log_ivon_checkpoints = args.log_checkpoints and enable_mlflow and use_ivon
     
