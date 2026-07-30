@@ -1,6 +1,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -60,33 +61,80 @@ def test_falls_back_to_hf_when_the_local_cache_misses(tmp_path, monkeypatch):
     assert (cache / "dinov3_small_fake_res224_train.npz").exists()
 
 
-def test_absent_file_on_the_hub_raises_file_not_found(tmp_path, monkeypatch):
-    class EntryNotFoundError(Exception):
-        pass
+class _HubHTTPError(Exception):
+    """Stands in for huggingface_hub's HfHubHTTPError, which carries .response."""
 
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.response = SimpleNamespace(status_code=status)
+
+
+def _raising(exc):
     def fake_download(repo_id, filename, repo_type):
-        raise EntryNotFoundError("404")
+        raise exc
 
-    monkeypatch.setattr(features, "_hf_hub_download", fake_download)
+    return fake_download
+
+
+def test_404_on_the_hub_means_the_features_were_never_generated(tmp_path, monkeypatch):
+    monkeypatch.setattr(features, "_hf_hub_download", _raising(_HubHTTPError(404)))
     with pytest.raises(FileNotFoundError, match="precompute_features"):
         features.load_cached_features(
             tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
         )
 
 
-def test_network_failure_is_not_reported_as_missing_data(tmp_path, monkeypatch):
-    """An auth or connectivity failure must not tell the user to spend GPU hours
-    regenerating features that already exist."""
-
-    def fake_download(repo_id, filename, repo_type):
-        raise ConnectionError("connection reset")
-
-    monkeypatch.setattr(features, "_hf_hub_download", fake_download)
-    with pytest.raises(RuntimeError, match="network or authentication") as excinfo:
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_failure_does_not_tell_the_user_to_regenerate(tmp_path, monkeypatch, status):
+    """A bad token against a private repo must not send someone to burn GPU
+    hours regenerating features that are sitting on the Hub."""
+    monkeypatch.setattr(features, "_hf_hub_download", _raising(_HubHTTPError(status)))
+    with pytest.raises(RuntimeError, match="HF_TOKEN") as excinfo:
         features.load_cached_features(
             tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
         )
     assert "precompute_features" not in str(excinfo.value)
+
+
+def test_connection_failure_does_not_tell_the_user_to_regenerate(tmp_path, monkeypatch):
+    monkeypatch.setattr(features, "_hf_hub_download", _raising(ConnectionError("reset")))
+    with pytest.raises(RuntimeError, match="network or offline") as excinfo:
+        features.load_cached_features(
+            tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+        )
+    assert "precompute_features" not in str(excinfo.value)
+
+
+def test_classification_matches_the_real_huggingface_hub_hierarchy(tmp_path, monkeypatch):
+    """Guard against the library's shape changing under us.
+
+    The previous version of this module matched exception CLASS NAMES and got it
+    wrong in both directions: the real 404 is RemoteEntryNotFoundError (plain
+    EntryNotFoundError is a bare base class), and GatedRepoError -- an auth
+    failure -- subclasses RepositoryNotFoundError. This test constructs the
+    genuine article rather than a stand-in.
+    """
+    errors = pytest.importorskip("huggingface_hub.errors")
+
+    class _Req:
+        method, url = "GET", "https://huggingface.co/x"
+
+    def _resp(status):
+        return SimpleNamespace(status_code=status, headers={}, text="", request=_Req())
+
+    real_404 = errors.RemoteEntryNotFoundError("nope", response=_resp(404))
+    monkeypatch.setattr(features, "_hf_hub_download", _raising(real_404))
+    with pytest.raises(FileNotFoundError, match="precompute_features"):
+        features.load_cached_features(
+            tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+        )
+
+    real_gated = errors.GatedRepoError("gated", response=_resp(403))
+    monkeypatch.setattr(features, "_hf_hub_download", _raising(real_gated))
+    with pytest.raises(RuntimeError, match="HF_TOKEN"):
+        features.load_cached_features(
+            tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+        )
 
 
 def test_module_imports_without_jax_or_torch():

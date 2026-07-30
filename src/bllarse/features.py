@@ -14,13 +14,20 @@ from pathlib import Path
 
 import numpy as np
 
-# Hugging Face's "this does not exist" errors, matched by class name so this
-# module stays importable without huggingface_hub installed. Anything else --
-# timeouts, 401s, proxy errors -- is a transient/config problem, and telling the
-# user to regenerate their features would send them down the wrong path.
-_HF_ABSENT_ERRORS = frozenset(
-    {"EntryNotFoundError", "RepositoryNotFoundError", "RevisionNotFoundError"}
-)
+
+def _hub_status(exc: BaseException) -> int | None:
+    """HTTP status behind a Hub failure, or None if it was not an HTTP error.
+
+    Read by duck-typing on `.response.status_code` rather than by catching
+    huggingface_hub's exception classes. Two reasons: importing them would break
+    the lazy-import contract this module exists to satisfy, and the class names
+    do not mean what they look like -- the 404 for an absent file is
+    RemoteEntryNotFoundError (EntryNotFoundError is a bare base class), and
+    GatedRepoError subclasses RepositoryNotFoundError, so name-matching
+    'not found' silently swallows auth failures. The status code does not lie.
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status if isinstance(status, int) else None
 
 
 def feature_cache_path(cache_dir, model: str, dataset: str, img_size: int, split: str) -> Path:
@@ -59,18 +66,26 @@ def load_cached_features(
         try:
             downloaded = _hf_hub_download(repo_id=hf_repo, filename=remote, repo_type="dataset")
         except Exception as exc:
-            if type(exc).__name__ in _HF_ABSENT_ERRORS:
+            status = _hub_status(exc)
+            if status == 404:
                 raise FileNotFoundError(
                     f"Features not in the local cache ({local}) and "
-                    f"{hf_repo}/{remote} does not exist on the Hub "
-                    f"({type(exc).__name__}). Run precompute_features.py "
-                    f"--models {model} --datasets {dataset} to create them."
+                    f"{hf_repo}/{remote} does not exist on the Hub. Run "
+                    f"precompute_features.py --models {model} --datasets {dataset} "
+                    f"to create them."
+                ) from exc
+            if status in (401, 403):
+                raise RuntimeError(
+                    f"Features not in the local cache ({local}) and the Hub "
+                    f"refused access to {hf_repo}/{remote} (HTTP {status}). Check "
+                    f"HF_TOKEN and that you have access to the repo. Do NOT "
+                    f"regenerate -- the data may well be there."
                 ) from exc
             raise RuntimeError(
                 f"Features not in the local cache ({local}) and fetching "
                 f"{hf_repo}/{remote} failed with {type(exc).__name__}: {exc}. "
-                f"That is a network or authentication problem, not missing data "
-                f"-- check connectivity and HF_TOKEN before regenerating anything."
+                f"That is a network or offline problem, not missing data -- do "
+                f"NOT regenerate before checking connectivity."
             ) from exc
         local.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(downloaded, local)
