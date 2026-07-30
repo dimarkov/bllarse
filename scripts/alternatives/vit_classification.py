@@ -49,7 +49,7 @@ from jax import random as jr, config, vmap
 from datasets import load_dataset
 
 try:
-    import equimo.vision.models as equimo_models
+    import equimo.models as equimo_models
     NO_EQUIMO = False
 except ImportError:
     NO_EQUIMO = True
