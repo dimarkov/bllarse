@@ -1177,7 +1177,7 @@ def iter_dumps(root, group_id: str, uid: str) -> Iterator[DumpRecord]:
 uv run pytest tests/test_evaldump.py -v
 ```
 
-Expected: 14 passed (the invariants are parametrised over eight size pairs).
+Expected: 15 passed (the invariants are parametrised over eight size pairs).
 
 - [ ] **Step 5: Commit**
 
