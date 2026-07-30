@@ -243,15 +243,29 @@ def test_nll_matches_hand_computation_for_uniform():
     assert metrics.nll(logits, jnp.array([3])) == pytest.approx(np.log(10.0), abs=1e-6)
 
 
+def _calibrated_logits_and_labels(seed, n=4000, k=5):
+    """Logits that are calibrated at T=1, by SAMPLING labels from softmax(base).
+
+    Do not use labels = base.argmax(-1) here: that makes the model correct on
+    every point, so NLL falls monotonically as T -> 0 and there is no interior
+    optimum for fit_temperature to find.
+    """
+    rng = np.random.default_rng(seed)
+    base = rng.normal(size=(n, k)).astype(np.float32)
+    probs = np.exp(base) / np.exp(base).sum(axis=-1, keepdims=True)
+    labels = np.array([rng.choice(k, p=row) for row in probs])
+    return base, jnp.asarray(labels)
+
+
 def test_fit_temperature_recovers_a_known_scaling():
-    # Build well-separated logits, then blow them up by 4x. The fitted T should
-    # pull them back toward the original scale, i.e. T > 1.
-    rng = np.random.default_rng(0)
-    base = rng.normal(size=(2000, 5)).astype(np.float32)
-    labels = jnp.asarray(base.argmax(axis=-1))
+    # base is calibrated at T=1, so base * 4 is overconfident by exactly 4x and
+    # the NLL-optimal temperature is 4.
+    base, labels = _calibrated_logits_and_labels(0)
     overconfident = jnp.asarray(base * 4.0)
+
     T = metrics.fit_temperature(overconfident, labels)
-    assert T > 1.5, f"expected softening temperature, got {T}"
+    assert 3.0 < T < 5.0, f"expected T near 4, got {T}"
+
     # Applying it must not change accuracy — temperature is rank-preserving.
     before = metrics.accuracy(overconfident, labels)
     after = metrics.accuracy(metrics.apply_temperature(overconfident, T), labels)
@@ -259,9 +273,7 @@ def test_fit_temperature_recovers_a_known_scaling():
 
 
 def test_fit_temperature_reduces_nll():
-    rng = np.random.default_rng(1)
-    base = rng.normal(size=(2000, 5)).astype(np.float32)
-    labels = jnp.asarray(base.argmax(axis=-1))
+    base, labels = _calibrated_logits_and_labels(1)
     overconfident = jnp.asarray(base * 4.0)
     T = metrics.fit_temperature(overconfident, labels)
     assert metrics.nll(metrics.apply_temperature(overconfident, T), labels) < metrics.nll(
