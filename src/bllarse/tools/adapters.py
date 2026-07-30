@@ -6,6 +6,10 @@ from typing import Any
 
 from bllarse.tools.module import get_module_from_source_path
 
+# Config keys whose False value must be passed explicitly as --no-<flag> rather
+# than omitted, because the target script's default is True.
+NEGATABLE_FLAGS = frozenset({"return_ood"})
+
 
 def config_to_argv(config: Mapping[str, Any]) -> list[str]:
     """Convert a config mapping to conventional argparse flags."""
@@ -18,6 +22,8 @@ def config_to_argv(config: Mapping[str, Any]) -> list[str]:
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
+            elif key in NEGATABLE_FLAGS:
+                argv.append("--no-" + key.replace("_", "-"))
             continue
 
         argv.extend((flag, str(value)))
@@ -59,6 +65,11 @@ def _resolve_script_path(script_path: str | Path) -> Path:
 def run_training_from_config(config: Mapping[str, Any]) -> None:
     """Run the repository's standard finetuning script from a config."""
     run_script_from_config("scripts/finetuning.py", config)
+
+
+def run_vbll_training_from_config(config: Mapping[str, Any]) -> None:
+    """Run the PyTorch VBLL finetuning script from a config."""
+    run_script_from_config("scripts/vbll_pytorch/finetuning_vbll.py", config)
 
 
 def run_script_from_config(
