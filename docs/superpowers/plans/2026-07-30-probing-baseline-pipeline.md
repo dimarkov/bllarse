@@ -17,7 +17,7 @@
 - Brier is the **full predictive vector** multiclass form `BS = (1/N) Σᵢ Σₖ (p_ik − y_ik)²`, never the top-label variant.
 - OOD score convention is **higher = more OOD**, uniformly, for every score function.
 - Dumps are `float16` on disk; every metric upcasts to `float32` before computing.
-- Seeds for probing are **25** per `results-plan.md` §0.5.
+- Seeds for probing are **10**. This deviates from `results-plan.md` §0.5 (which says 25) and is recorded in the spec's sync-back table.
 - Backbone ladder is exactly `dinov3_small`, `dinov3_big`, `dinov3_large`, `dinov3_huge`. `dinov3_max` is out of scope.
 - Commit after every task. Branch is `infra/results-protocol`.
 - `origin` is the private Forgejo remote and takes all branches. Never push feature branches to `github`.
@@ -2387,15 +2387,15 @@ def test_all_configs_share_one_group_id(path):
 
 
 def test_fig1_sweep_sizes_match_the_plan():
-    # 4 backbones x 6 datasets x 25 seeds
-    assert len(get_module_from_source_path(SWEEPS[0]).create_configs()) == 600
+    # 4 backbones x 6 datasets x 10 seeds
+    assert len(get_module_from_source_path(SWEEPS[0]).create_configs()) == 240
 
 
 def test_fig2_sweep_sizes_match_the_plan():
-    # 4 backbones x 3 (ID, OOD) pairs x 25 seeds.
+    # 4 backbones x 3 (ID, OOD) pairs x 10 seeds.
     # Three pairs, not two ID datasets: CIFAR-10 appears twice, against SVHN
     # (far-OOD) and against CIFAR-100 (near-OOD).
-    assert len(get_module_from_source_path(SWEEPS[2]).create_configs()) == 300
+    assert len(get_module_from_source_path(SWEEPS[2]).create_configs()) == 120
 
 
 def test_fig2_sweeps_pair_each_id_dataset_with_an_ood_dataset():
@@ -2436,7 +2436,7 @@ DATASETS = {
     "dtd": (47, 512),
     "imagenet1k": (1000, 512),
 }
-SEEDS = list(range(137, 162))  # 25 seeds, results-plan 0.5
+SEEDS = list(range(137, 147))  # 10 seeds
 
 BASE = dict(
     arm="adamw_ce",
@@ -2498,7 +2498,7 @@ DATASETS = {
     "dtd": (47, 512),
     "imagenet1k": (1000, 512),
 }
-SEEDS = list(range(137, 162))
+SEEDS = list(range(137, 147))
 
 BASE = dict(
     epochs=40,
@@ -2562,7 +2562,7 @@ PAIRS = [
     ("cifar10", 10, "cifar100"),
     ("cifar100", 100, "svhn"),
 ]
-SEEDS = list(range(137, 162))
+SEEDS = list(range(137, 147))
 
 BASE = dict(
     arm="adamw_ce",
@@ -2596,7 +2596,7 @@ def run(config):
     run_script_from_config("scripts/alternatives/probe.py", config)
 ```
 
-This yields 4 × 3 × 25 = 300 configs — three pairs, because CIFAR-10 appears
+This yields 4 × 3 × 10 = 120 configs — three pairs, because CIFAR-10 appears
 against both SVHN and CIFAR-100.
 
 `bllarse_sweeps/probe_ood_vbll.py`:
@@ -2620,7 +2620,7 @@ PAIRS = [
     ("cifar10", 10, "cifar100"),
     ("cifar100", 100, "svhn"),
 ]
-SEEDS = list(range(137, 162))
+SEEDS = list(range(137, 147))
 
 BASE = dict(
     epochs=40,
@@ -2672,8 +2672,8 @@ Expected: all pass, with the corrected Fig 2 count.
 uv run python -m bllarse.tools.run_sweep bllarse_sweeps/probe_adamw_ce.py --dry-run
 ```
 
-Expected: an `sbatch --export=ALL --array=0-599%7 ... slurm_run_config_apptainer.sh`
-line. Compare `599` against the cluster's `MaxArraySize` from Task 10 Step 1; if
+Expected: an `sbatch --export=ALL --array=0-239%7 ... slurm_run_config_apptainer.sh`
+line. Compare `239` against the cluster's `MaxArraySize` from Task 10 Step 1; if
 it exceeds it, submission must be chunked with `--index-offset` / `--num-jobs`.
 
 - [ ] **Step 8: Commit**
@@ -2682,7 +2682,7 @@ it exceeds it, submission must be chunked with `--index-offset` / `--num-jobs`.
 git add bllarse_sweeps/probe_*.py tests/test_sweep_definitions.py
 git commit -m "feat(sweeps): Fig 1 and Fig 2 probing sweep definitions
 
-Four-model ladder, 25 seeds. Fig 2 covers three (ID, OOD) pairs including
+Four-model ladder, 10 seeds. Fig 2 covers three (ID, OOD) pairs including
 the near-OOD CIFAR-10 vs CIFAR-100. TS is post-hoc, so no TS sweep."
 ```
 
@@ -3110,7 +3110,7 @@ trajectory in Figs 5-7 instead of a single endpoint."
 ## After this plan
 
 Phase 1a can launch: `probe_adamw_ce`, `probe_vbll`, `probe_ood_adamw_ce`,
-`probe_ood_vbll` — ~1800 array tasks, Figs 1–4 buildable from the dumps.
+`probe_ood_vbll` — 720 array tasks, Figs 1–4 buildable from the dumps.
 
 Then **Plan B**: 0d-ii, the PyTorch full-FT backend (torch DINOv3, ImageNet
 pipeline at 512, matched augmentation/precision/optimizer, forward and recipe

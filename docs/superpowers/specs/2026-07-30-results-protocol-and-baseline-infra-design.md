@@ -427,20 +427,22 @@ contract consumed by `run_sweep.py` and `run_config.py`.
 
 | file | arm | grid | figure |
 |---|---|---|---|
-| `probe_adamw_ce.py` | AdamW+CE | 4 backbones × 6 datasets × 25 seeds | Fig 1 |
+| `probe_adamw_ce.py` | AdamW+CE | 4 backbones × 6 datasets × 10 seeds | Fig 1 |
 | `probe_vbll.py` | VBLL | same grid | Fig 1 |
-| `probe_ood_adamw_ce.py` | AdamW+CE | 4 backbones × {CIFAR-10, CIFAR-100} × 25 seeds | Fig 2 |
+| `probe_ood_adamw_ce.py` | AdamW+CE | 4 backbones × 3 (ID, OOD) pairs × 10 seeds | Fig 2 |
 | `probe_ood_vbll.py` | VBLL | same grid | Fig 2 |
 | `fnft_imagenet_adamw_ce.py` | AdamW+CE | ImageNet-1k × 5 seeds | Figs 5–7 |
 | `fnft_imagenet_vbll.py` | VBLL | ImageNet-1k × 5 seeds | Figs 5–7 |
 
-Seeds per `results-plan.md` §0.5: 25 probing, 5 full FT. AdamW+CE+TS is **not** a
+Seeds: **10 probing** (deviating from `results-plan.md` §0.5's 25), 5 full FT.
+AdamW+CE+TS is **not** a
 separate sweep — it is post-hoc from the AdamW dumps, refit per dump point
 (0b.3), so it costs no GPU time and adds no array tasks.
 
-Sizing: Fig 1 is 4 × 6 × 25 × 2 = 1200 array tasks, Fig 2 is 4 × 2 × 25 × 2 = 400,
-so ~1600 probing tasks (seconds-to-minutes each, on cached features), plus 10
-long ImageNet full-FT runs.
+Sizing: Fig 1 is 4 × 6 × 10 × 2 = 480 array tasks, Fig 2 is 4 × 3 × 10 × 2 = 240
+(three pairs, not two ID datasets — CIFAR-10 appears against both SVHN and
+CIFAR-100), so **720 probing tasks** (seconds-to-minutes each, on cached
+features), plus 10 long ImageNet full-FT runs.
 
 The Fig 2 sweeps are separate files rather than extra datasets in the Fig 1
 sweeps because they differ in what they dump (OOD `score` on a second dataset,
@@ -494,6 +496,7 @@ so the two files do not drift apart silently.
 | Fig 1 ladder is `dinov3_small/big/large/huge`; `dinov3_max` (embed 4096) is out | §5.2 (listed as open) | resolved |
 | TS refit at every dumped step rather than once at convergence | §0.2 (schedule unspecified) | refinement; needs a caption note |
 | Max-logit demoted to an AdamW-side extra, not a cross-arm score | §1 Fig 2 | deviation, follows from the scoring change |
+| Probing runs use **10 seeds**, not 25 | §0.5 | deviation — halves the error-bar resolution on Figs 1–4 and the per-seed censoring picture in §0.4; full-FT stays at 5 |
 
 ---
 
@@ -527,6 +530,8 @@ Not blocking Phase 0. Listed so they are not silently forgotten.
    smoke test exercises both arms end to end, and `full_finetune_comparison.py`
    has its own tests on that branch (`tests/test_full_finetune_*.py`) which come
    across with it.
-4. **Cluster array-size limits.** ~1500 probing tasks may exceed `MaxArraySize`.
+4. **Cluster array-size limits.** 720 probing tasks, submitted as four arrays of
+   240 and 120, sit under the common `MaxArraySize` defaults — but read the
+   cluster's value rather than assuming.
    `run_sweep.py` already chunks via `--index-offset`/`--num-jobs`; the limit
    needs reading off the cluster before the first large submission.
