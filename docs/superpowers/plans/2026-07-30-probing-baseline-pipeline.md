@@ -32,6 +32,7 @@
 | `src/bllarse/detection.py` | OOD detection metrics on `(scores_id, scores_ood)`. NumPy — post-hoc only. |
 | `src/bllarse/splits.py` | seed-independent pinned val/test index files |
 | `src/bllarse/evaldump.py` | dump writer/reader + the log-spaced step schedule |
+| `src/bllarse/features.py` | cached-feature loader; framework-free, both arms import it |
 | `src/bllarse/analysis/thresholds.py` | the §0.4 joint threshold protocol |
 | `src/bllarse/analysis/curves.py` | dumps → metric curves; where per-point TS is refit |
 | `scripts/alternatives/probe.py` | JAX probing entry point (CE now, IBProbit arm ready for Phase 3) |
@@ -1095,7 +1096,212 @@ once. Schedule is dense early where the sample-efficiency claim lives."
 
 ---
 
-## Task 6: `bllarse.analysis.thresholds` — the joint threshold protocol
+## Task 6: `bllarse.features` — the shared cached-feature loader
+
+**Files:**
+- Create: `src/bllarse/features.py`
+- Test: `tests/test_features.py`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `feature_cache_path(cache_dir, model, dataset, img_size, split) -> Path`
+  - `feature_hf_path(model, dataset, img_size, split) -> str`
+  - `load_cached_features(cache_dir, model, dataset, img_size, split, hf_repo=None) -> tuple[np.ndarray, np.ndarray]`
+
+Both probing arms read the same `.npz` files, so this loader must be importable
+from the PyTorch container as well as the JAX one. That rules out reusing
+`ood_evaluation.load_cached_features`, which reaches `vit_classification` and so
+drags in `mlpox`, `datasets`, `PIL`, `equinox`, `optax` and `jax` for what is a
+`np.load` with an HF fallback.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/test_features.py`:
+
+```python
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from bllarse import features
+
+
+def test_cache_path_matches_the_precompute_layout():
+    path = features.feature_cache_path(".cache/features", "dinov3_huge", "cifar10", 224, "test")
+    assert Path(path).name == "dinov3_huge_cifar10_res224_test.npz"
+
+
+def test_hf_path_matches_the_mirror_layout():
+    assert features.feature_hf_path("dinov3_huge", "cifar10", 224, "test") == (
+        "dinov3_huge/cifar10_res224_test.npz"
+    )
+
+
+def test_loads_from_the_local_cache(tmp_path):
+    feats = np.arange(12, dtype=np.float32).reshape(4, 3)
+    labels = np.array([0, 1, 0, 1])
+    np.savez(tmp_path / "dinov3_small_fake_res224_train.npz", features=feats, labels=labels)
+
+    got_f, got_l = features.load_cached_features(tmp_path, "dinov3_small", "fake", 224, "train")
+    np.testing.assert_array_equal(got_f, feats)
+    np.testing.assert_array_equal(got_l, labels)
+
+
+def test_missing_features_raise_a_message_naming_the_fix(tmp_path):
+    with pytest.raises(FileNotFoundError, match="precompute_features"):
+        features.load_cached_features(tmp_path, "dinov3_small", "absent", 224, "train")
+
+
+def test_falls_back_to_hf_when_the_local_cache_misses(tmp_path, monkeypatch):
+    remote = tmp_path / "remote.npz"
+    feats = np.ones((2, 3), dtype=np.float32)
+    np.savez(remote, features=feats, labels=np.zeros(2, dtype=int))
+
+    calls = {}
+
+    def fake_download(repo_id, filename, repo_type):
+        calls["repo_id"] = repo_id
+        calls["filename"] = filename
+        calls["repo_type"] = repo_type
+        return str(remote)
+
+    monkeypatch.setattr(features, "_hf_hub_download", fake_download)
+
+    cache = tmp_path / "cache"
+    got_f, _ = features.load_cached_features(
+        cache, "dinov3_small", "fake", 224, "train", hf_repo="dimarkov/bllarse-features"
+    )
+    np.testing.assert_array_equal(got_f, feats)
+    assert calls["filename"] == "dinov3_small/fake_res224_train.npz"
+    assert calls["repo_type"] == "dataset"
+    # The download must be cached locally so the next run does not re-fetch.
+    assert (cache / "dinov3_small_fake_res224_train.npz").exists()
+
+
+def test_module_imports_without_jax_or_torch():
+    """The torch container must import this without the JAX stack, and vice
+    versa. A heavy import chain here would defeat the point of the module."""
+    code = (
+        "import sys, bllarse.features; "
+        "heavy = [m for m in ('jax', 'torch', 'equimo', 'mlpox', 'datasets') "
+        "if m in sys.modules]; "
+        "assert not heavy, heavy; print('clean')"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "clean" in result.stdout
+```
+
+- [ ] **Step 2: Run to confirm they fail**
+
+```bash
+uv run pytest tests/test_features.py -v
+```
+
+Expected: collection error — no module `bllarse.features`.
+
+- [ ] **Step 3: Implement `src/bllarse/features.py`**
+
+```python
+"""Loading cached backbone features.
+
+Both probing arms read the same .npz files that precompute_features.py writes,
+so the backbone is byte-identical across frameworks and Figs 1-4 carry no
+cross-framework parity risk.
+
+Deliberately free of JAX and PyTorch. The PyTorch container must import this
+without the JAX stack, and the JAX arm must not pull equimo/mlpox/datasets in
+just to call np.load. `huggingface_hub` is imported lazily for the same reason.
+"""
+
+import os
+import shutil
+from pathlib import Path
+
+import numpy as np
+
+
+def feature_cache_path(cache_dir, model: str, dataset: str, img_size: int, split: str) -> Path:
+    """Local cache path, matching precompute_features.py's layout exactly."""
+    return Path(cache_dir) / f"{model}_{dataset}_res{img_size}_{split}.npz"
+
+
+def feature_hf_path(model: str, dataset: str, img_size: int, split: str) -> str:
+    """Path within the HF dataset repo. Note the model is a directory there,
+    where it is a filename prefix locally."""
+    return f"{model}/{dataset}_res{img_size}_{split}.npz"
+
+
+def _hf_hub_download(repo_id: str, filename: str, repo_type: str) -> str:
+    """Indirection so tests can substitute the download without network access."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
+
+
+def load_cached_features(
+    cache_dir, model: str, dataset: str, img_size: int, split: str, hf_repo: str | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (features, labels) from the local cache, falling back to HF Hub.
+
+    A successful HF fetch is copied into the local cache, so a sweep pays the
+    download once per node rather than once per task.
+    """
+    local = feature_cache_path(cache_dir, model, dataset, img_size, split)
+    if local.exists():
+        data = np.load(local)
+        return data["features"], data["labels"]
+
+    if hf_repo:
+        remote = feature_hf_path(model, dataset, img_size, split)
+        try:
+            downloaded = _hf_hub_download(repo_id=hf_repo, filename=remote, repo_type="dataset")
+        except Exception as exc:  # network, auth, or a genuinely absent file
+            raise FileNotFoundError(
+                f"Features not in the local cache ({local}) and the HF fetch of "
+                f"{hf_repo}/{remote} failed: {exc}. Run precompute_features.py "
+                f"for {model} x {dataset}."
+            ) from exc
+        local.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(downloaded, local)
+        data = np.load(local)
+        return data["features"], data["labels"]
+
+    raise FileNotFoundError(
+        f"Features not found at {local} and no hf_repo was given. Run "
+        f"precompute_features.py --models {model} --datasets {dataset} first."
+    )
+```
+
+- [ ] **Step 4: Run the tests**
+
+```bash
+uv run pytest tests/test_features.py -v
+```
+
+Expected: 6 passed. If `test_module_imports_without_jax_or_torch` fails, something
+in `bllarse/__init__.py` is importing the heavy stack — check it and make that
+import lazy rather than weakening the test.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bllarse/features.py tests/test_features.py
+git commit -m "feat(features): framework-free loader for the cached feature files
+
+Both probing arms read the same .npz files, so the loader must import from
+the torch container as well as the JAX one. ood_evaluation's version reaches
+vit_classification and drags in mlpox/datasets/PIL/jax for what is an
+np.load with an HF fallback."
+```
+
+---
+
+## Task 7: `bllarse.analysis.thresholds` — the joint threshold protocol
 
 **Files:**
 - Create: `src/bllarse/analysis/__init__.py`
@@ -1322,7 +1528,7 @@ nothing runs in a training loop."
 
 ---
 
-## Task 7: Register SVHN and precompute its features
+## Task 8: Register SVHN and precompute its features
 
 **Files:**
 - Modify: `scripts/alternatives/vit_classification.py` (`DATASET_CONFIGS`, `DINOV3_DATASET_IMG_SIZES`)
@@ -1331,7 +1537,7 @@ nothing runs in a training loop."
 **Interfaces:**
 - Consumes: nothing.
 - Produces: `DATASET_CONFIGS["svhn"]` and `DINOV3_DATASET_IMG_SIZES["svhn"] == 224`,
-  consumed by Task 8's OOD path and Task 11's sweep definitions.
+  consumed by Task 9's OOD path and Task 12's sweep definitions.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1457,16 +1663,16 @@ features do not share a space."
 
 ---
 
-## Task 8: JAX probing entry point with dump wiring
+## Task 9: JAX probing entry point with dump wiring
 
 **Files:**
 - Create: `scripts/alternatives/probe.py`
 - Test: `tests/test_probe_smoke.py`
 
 **Interfaces:**
-- Consumes: `bllarse.metrics`, `bllarse.splits`, `bllarse.evaldump`, and from
-  `scripts/alternatives/ood_evaluation.py`: `load_cached_features`,
-  `collect_logits`, `train_ce_head`.
+- Consumes: `bllarse.metrics`, `bllarse.splits`, `bllarse.evaldump`,
+  `bllarse.features.load_cached_features` (Task 6). Nothing from
+  `scripts/alternatives/` — see Task 6 on why that import chain is avoided.
 - Produces: a CLI with `build_argparser()` and `main(args)`, callable through
   `bllarse.tools.adapters.run_script_from_config("scripts/alternatives/probe.py", cfg)`.
 
@@ -1608,18 +1814,9 @@ import numpy as np
 import optax
 from jax import random as jr, vmap
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 from bllarse import evaldump, metrics, splits
+from bllarse.features import load_cached_features
 from bllarse.losses import CrossEntropy
-
-from ood_evaluation import load_cached_features
-
-
-def _feature_paths(cache_dir, model, dataset, img_size, split, hf_repo):
-    cache = os.path.join(cache_dir, f"{model}_{dataset}_res{img_size}_{split}.npz")
-    hf = f"{model}/{dataset}_res{img_size}_{split}.npz" if hf_repo else None
-    return cache, hf
 
 
 def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, key):
@@ -1656,14 +1853,12 @@ def main(args):
     hf_repo = None if args.no_hf_cache else args.hf_repo
     img_size = args.img_size
 
-    tr_cache, tr_hf = _feature_paths(
-        args.cache_dir, args.model, args.dataset, img_size, "train", hf_repo
+    train_f, train_l = load_cached_features(
+        args.cache_dir, args.model, args.dataset, img_size, "train", hf_repo=hf_repo
     )
-    te_cache, te_hf = _feature_paths(
-        args.cache_dir, args.model, args.dataset, img_size, "test", hf_repo
+    eval_f, eval_l = load_cached_features(
+        args.cache_dir, args.model, args.dataset, img_size, "test", hf_repo=hf_repo
     )
-    train_f, train_l = load_cached_features(tr_cache, hf_repo, tr_hf)
-    eval_f, eval_l = load_cached_features(te_cache, hf_repo, te_hf)
 
     # Pinned split: val is for post-hoc temperature scaling, test for reporting.
     # Seed-independent by construction (bllarse.splits).
@@ -1709,10 +1904,9 @@ def main(args):
 
     # OOD dump: final point only. Fig 2 is a converged-endpoint figure.
     if args.ood_dataset:
-        ood_cache, ood_hf = _feature_paths(
-            args.cache_dir, args.model, args.ood_dataset, img_size, "test", hf_repo
+        ood_f, ood_l = load_cached_features(
+            args.cache_dir, args.model, args.ood_dataset, img_size, "test", hf_repo=hf_repo
         )
-        ood_f, ood_l = load_cached_features(ood_cache, hf_repo, ood_hf)
         ood_logits = _logits_for(head, loss_fn, ood_f, ood_l)
         evaldump.write_dump(
             args.dump_root, args.group_id, args.uid, args.epochs,
@@ -1776,7 +1970,7 @@ is a converged-endpoint figure."
 
 ---
 
-## Task 9: PyTorch VBLL probing entry point
+## Task 10: PyTorch VBLL probing entry point
 
 **Files:**
 - Create: `scripts/vbll_pytorch/probing_vbll.py`
@@ -1784,8 +1978,9 @@ is a converged-endpoint figure."
 - Test: `tests/test_probing_vbll_smoke.py`
 
 **Interfaces:**
-- Consumes: `bllarse.evaldump`, `bllarse.splits`; the `vbll` package.
-- Produces: `build_argparser()` / `main(args)` with the same dump contract as Task 8.
+- Consumes: `bllarse.evaldump`, `bllarse.splits`,
+  `bllarse.features.load_cached_features` (Task 6); the `vbll` package.
+- Produces: `build_argparser()` / `main(args)` with the same dump contract as Task 9.
 
 The key simplification: VBLL reads the **same `.npz` feature files** the JAX arm
 does, so no PyTorch DINOv3 is needed here and the backbone is byte-identical
@@ -1934,17 +2129,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from bllarse import evaldump, splits
+from bllarse.features import load_cached_features
 from vbll_experiments.models import build_vbll_head
-
-
-def _load_features(cache_dir, model, dataset, img_size, split):
-    path = os.path.join(cache_dir, f"{model}_{dataset}_res{img_size}_{split}.npz")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Features not found at {path}. Run precompute_features.py first."
-        )
-    data = np.load(path)
-    return data["features"], data["labels"]
 
 
 def _forward(head, feats, device, chunk=4096):
@@ -1967,10 +2153,10 @@ def main(args):
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    train_f, train_l = _load_features(
+    train_f, train_l = load_cached_features(
         args.cache_dir, args.model, args.dataset, args.img_size, "train"
     )
-    eval_f, eval_l = _load_features(
+    eval_f, eval_l = load_cached_features(
         args.cache_dir, args.model, args.dataset, args.img_size, "test"
     )
     val_idx, test_idx = splits.load_or_make_pinned_split(
@@ -2019,7 +2205,7 @@ def main(args):
         print(f"[vbll] epoch {epoch}: dumped {len(val_idx)} val / {len(test_idx)} test")
 
     if args.ood_dataset:
-        ood_f, ood_l = _load_features(
+        ood_f, ood_l = load_cached_features(
             args.cache_dir, args.model, args.ood_dataset, args.img_size, "test"
         )
         ood_logits, ood_score = _forward(head, ood_f, device)
@@ -2103,7 +2289,7 @@ scaling_mlps submodule import lazy -- it belongs to the excised experiment."
 
 ---
 
-## Task 10: Apptainer SLURM job script
+## Task 11: Apptainer SLURM job script
 
 **Files:**
 - Create: `src/slurm/jobs/slurm_run_config_apptainer.sh`
@@ -2113,7 +2299,7 @@ scaling_mlps submodule import lazy -- it belongs to the excised experiment."
 **Interfaces:**
 - Consumes: the sweep contract from `run_sweep.py` / `run_config.py`.
 - Produces: a job script selected by `BLLARSE_SIF`, and a changed default in
-  `run_sweep.py` that Task 11's sweeps rely on.
+  `run_sweep.py` that Task 12's sweeps rely on.
 
 - [ ] **Step 1: Check what the cluster actually provides**
 
@@ -2126,7 +2312,7 @@ scontrol show config | grep -i MaxArraySize
 echo "$SCRATCH"
 ```
 
-Record `MaxArraySize` — Task 11 submits ~1600 tasks and may need chunking via
+Record `MaxArraySize` — Task 12 submits ~1600 tasks and may need chunking via
 `--index-offset` / `--num-jobs`. If `apptainer` is absent but `singularity` is
 present, use `singularity` in the script; the CLI is compatible for `exec --nv`.
 
@@ -2328,7 +2514,7 @@ secrets and the per-node image-presence failure mode disappears."
 
 ---
 
-## Task 11: Sweep definitions
+## Task 12: Sweep definitions
 
 **Files:**
 - Create: `bllarse_sweeps/probe_adamw_ce.py`
@@ -2338,8 +2524,8 @@ secrets and the per-node image-presence failure mode disappears."
 - Test: `tests/test_sweep_definitions.py`
 
 **Interfaces:**
-- Consumes: `bllarse.tools.adapters.run_script_from_config`, Task 8's `probe.py`,
-  Task 9's `probing_vbll.py`.
+- Consumes: `bllarse.tools.adapters.run_script_from_config`, Task 9's `probe.py`,
+  Task 10's `probing_vbll.py`.
 - Produces: `create_configs() -> list[dict]` and `run(config) -> None` in each
   file, the contract `run_sweep.py` and `run_config.py` expect.
 
@@ -2673,7 +2859,7 @@ uv run python -m bllarse.tools.run_sweep bllarse_sweeps/probe_adamw_ce.py --dry-
 ```
 
 Expected: an `sbatch --export=ALL --array=0-239%7 ... slurm_run_config_apptainer.sh`
-line. Compare `239` against the cluster's `MaxArraySize` from Task 10 Step 1; if
+line. Compare `239` against the cluster's `MaxArraySize` from Task 11 Step 1; if
 it exceeds it, submission must be chunked with `--index-offset` / `--num-jobs`.
 
 - [ ] **Step 8: Commit**
@@ -2688,7 +2874,7 @@ the near-OOD CIFAR-10 vs CIFAR-100. TS is post-hoc, so no TS sweep."
 
 ---
 
-## Task 12: End-to-end smoke test on the cluster
+## Task 13: End-to-end smoke test on the cluster
 
 **Files:**
 - Create: `tests/test_dump_roundtrip.py`
@@ -2877,7 +3063,7 @@ dump paths, and the VBLL score channel before 1600 real tasks are queued."
 
 ---
 
-## Task 13: `bllarse.analysis.curves` — dumps to metric curves, with per-point TS
+## Task 14: `bllarse.analysis.curves` — dumps to metric curves, with per-point TS
 
 **Files:**
 - Create: `src/bllarse/analysis/curves.py`
@@ -2890,7 +3076,7 @@ dump paths, and the VBLL score channel before 1600 real tasks are queued."
   - `run_detection(root, group_id, uid, score_fn) -> dict` — `auroc`/`fpr95`/`aupr` at the final point
 
 This is the figure-assembly layer. It is **not** on the critical path for
-launching runs — Tasks 1–12 produce the dumps, and this reads them — but Figs 1–4
+launching runs — Tasks 1–13 produce the dumps, and this reads them — but Figs 1–4
 cannot be drawn without it, and it is where the per-dump-point temperature refit
 actually happens.
 
