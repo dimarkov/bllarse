@@ -893,7 +893,7 @@ def main(args):
     mean, std = NORM_STATS.get(args.dataset, (IMAGENET_MEAN, IMAGENET_STD))
 
     print(f"Loading dataset: {args.dataset}")
-    ds = load_dataset(ds_config["hf_path"])
+    ds = load_dataset(ds_config["hf_path"], name=ds_config.get("hf_config"))
     train_split = ds["train"]
     test_split = ds[ds_config["test_split"]]
     print(f"Train samples: {len(train_split)}, Test samples: {len(test_split)}")
