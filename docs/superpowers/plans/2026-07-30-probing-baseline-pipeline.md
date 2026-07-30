@@ -17,6 +17,9 @@
 - Brier is the **full predictive vector** multiclass form `BS = (1/N) Σᵢ Σₖ (p_ik − y_ik)²`, never the top-label variant.
 - OOD score convention is **higher = more OOD**, uniformly, for every score function.
 - Dumps are `float16` on disk; every metric upcasts to `float32` before computing.
+  The risk is **precision collapse, not overflow**: `jax.nn.softmax` returns fp16 for
+  fp16 input, and MSP over 5000 points then collapses from ~4989 distinct values to
+  ~381. AUROC gives ties half credit, so Fig 2 would be measurably wrong.
 - Seeds for probing are **10**. This deviates from `results-plan.md` §0.5 (which says 25) and is recorded in the spec's sync-back table.
 - Backbone ladder is exactly `dinov3_small`, `dinov3_big`, `dinov3_large`, `dinov3_huge`. `dinov3_max` is out of scope.
 - Commit after every task. Branch is `infra/results-protocol`.
@@ -307,8 +310,22 @@ def test_classification_metrics_returns_all_four_keys():
     assert all(isinstance(v, float) for v in out.values())
 
 
-def test_metrics_accept_float16_input_without_overflow():
-    # Dumps are fp16 on disk; metrics must upcast before exponentiating.
+def test_ood_scores_do_not_collapse_to_ties_on_float16_input():
+    """Dumps are fp16, and jax.nn.softmax returns fp16 for fp16 input. Without the
+    upcast, MSP over 5000 points collapses to a few hundred distinct values --
+    and AUROC gives ties half credit, so Fig 2's detection metrics would be
+    measurably wrong. Overflow is NOT the risk here: softmax subtracts the max
+    internally, so raw fp16 logits never actually overflow through this path."""
+    rng = np.random.default_rng(1)
+    logits16 = rng.normal(size=(5000, 100)).astype(np.float16)
+
+    scores = np.asarray(metrics.msp_ood_score(logits16))
+    assert scores.dtype == np.float32
+    distinct = len(np.unique(scores))
+    assert distinct > 4000, f"only {distinct} distinct scores -- fp16 ties will distort AUROC"
+
+
+def test_metrics_accept_float16_input(): 
     logits = jnp.asarray(np.full((10, 4), 60.0, dtype=np.float16))
     labels = jnp.zeros((10,), dtype=jnp.int32)
     assert np.isfinite(metrics.nll(logits, labels))
@@ -330,8 +347,10 @@ Expected: collection error — `ModuleNotFoundError: No module named 'bllarse.me
 
 One implementation, used both in training loops and by post-hoc analysis over
 dumped logits. Dumps are float16 on disk, so every entry point upcasts to
-float32 before any exponentiation -- softmax of a raw fp16 logit overflows
-around |z| > 11.
+float32 first. The risk is precision, not overflow: jax.nn.softmax subtracts the
+max internally so fp16 logits never overflow, but it also RETURNS fp16, and an
+fp16 MSP over 5000 points collapses to a few hundred distinct values. AUROC
+gives ties half credit, so that would distort the detection figures.
 
 OOD score functions in this module follow the project-wide convention:
 **higher means more OOD**.
@@ -339,7 +358,6 @@ OOD score functions in this module follow the project-wide convention:
 
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 from jax import lax, nn
 from jaxtyping import Array
@@ -351,7 +369,8 @@ DEFAULT_NUM_BINS = 20
 
 
 def _f32(x: Any) -> Array:
-    """Upcast to float32. Dumped logits are fp16 and would overflow in softmax."""
+    """Upcast to float32. Dumped logits are fp16; without this, softmax returns
+    fp16 and the score functions lose the ranking resolution AUROC depends on."""
     return jnp.asarray(x, dtype=jnp.float32)
 
 
@@ -445,7 +464,7 @@ def entropy_ood_score(logits: Any) -> Array:
 uv run pytest tests/test_metrics.py -v
 ```
 
-Expected: 11 passed.
+Expected: 12 passed.
 
 - [ ] **Step 5: Commit**
 
