@@ -131,8 +131,9 @@ smaller.
 **Dump schedule — log-spaced, not every point.** `full_finetune_comparison.py`
 defaults to `--eval-every 1` over `--num-steps 500`; dumping all 500 is ~5 GB
 per run for no benefit. Fig 5's claim is that *the gap is largest early*, so the
-schedule should be dense early and sparse late: log-spaced steps
-(`np.unique(np.geomspace(1, num_steps, n_dumps).astype(int))`), ~40 points per
+schedule should be dense early and sparse late: a geometric grid with each
+step advanced past its predecessor (a naive `np.unique(np.round(...))` collapses
+the early points and silently returns 25-36 of the 40), ~40 points per
 run, ~400 MB, plus always the final point at full eval-set size. In-loop scalar metrics stay at
 `--eval-every` and are unaffected — this schedule governs the array dumps only.
 

@@ -901,14 +901,34 @@ import pytest
 from bllarse import evaldump
 
 
-def test_dump_schedule_is_log_spaced_and_bounded():
+def test_dump_schedule_is_dense_early_and_sparse_late():
     sched = evaldump.dump_schedule(500, n_dumps=40)
     assert sched[0] == 1
     assert sched[-1] == 500
-    assert len(sched) <= 40
+    assert len(sched) == 40, "must return exactly the number of points requested"
     assert list(sched) == sorted(set(sched)), "must be strictly increasing, no repeats"
-    # Dense early: more than half the points fall in the first tenth of training.
-    assert (sched <= 50).sum() > len(sched) // 2
+    # The defining property: gaps never shrink as training progresses. Do NOT
+    # assert an absolute fraction in the first tenth -- that is arithmetically
+    # impossible at moderate num_steps (at 100 steps only 10 of 40 points can
+    # possibly land at or below step 10).
+    gaps = np.diff(sched)
+    assert np.all(np.diff(gaps) >= 0), f"gaps must be non-decreasing, got {gaps}"
+
+
+@pytest.mark.parametrize("num_steps", [41, 100, 200, 500, 2000])
+def test_dump_schedule_holds_its_invariants_across_scales(num_steps):
+    """A naive round-then-unique returns 25-36 points instead of 40 across this
+    range, thinning exactly the early region the schedule exists to resolve."""
+    sched = evaldump.dump_schedule(num_steps, n_dumps=40)
+    assert len(sched) == 40
+    assert sched[0] == 1
+    assert sched[-1] == num_steps
+    assert np.all(np.diff(sched) > 0)
+
+
+def test_dump_schedule_rejects_a_degenerate_n_dumps():
+    with pytest.raises(ValueError):
+        evaldump.dump_schedule(500, n_dumps=1)
 
 
 def test_dump_schedule_handles_fewer_steps_than_dumps():
@@ -1016,14 +1036,31 @@ def dump_schedule(num_steps: int, n_dumps: int = 40) -> np.ndarray:
     belongs there. Dumping all `num_steps` points would be ~5 GB per run for no
     additional information about the claim.
 
+    Rounding a geometric grid to integers collapses its early points -- at
+    num_steps=100 the first twenty all land below 3 -- so a naive unique() drops
+    exactly the resolution this schedule exists to provide, and silently returns
+    fewer points than were asked for. Each step is therefore advanced to at least
+    one past its predecessor, giving exactly min(num_steps, n_dumps) distinct
+    steps with non-decreasing gaps.
+
     Always includes step 1 and step `num_steps`.
     """
     if num_steps < 1:
         raise ValueError("num_steps must be >= 1")
+    if n_dumps < 2:
+        raise ValueError("n_dumps must be >= 2 so the schedule spans 1..num_steps")
     if num_steps <= n_dumps:
         return np.arange(1, num_steps + 1)
-    raw = np.geomspace(1, num_steps, n_dumps)
-    return np.unique(np.round(raw).astype(int))
+
+    steps: list[int] = []
+    previous = 0
+    for value in np.geomspace(1, num_steps, n_dumps):
+        step = max(int(round(value)), previous + 1)
+        if step > num_steps:
+            break
+        steps.append(step)
+        previous = step
+    return np.asarray(steps, dtype=int)
 
 
 def dump_dir(root, group_id: str, uid: str) -> Path:
@@ -1062,6 +1099,13 @@ def write_dump(
     if logits.shape[0] != labels.shape[0]:
         raise ValueError(
             f"logits and labels length mismatch: {logits.shape[0]} vs {labels.shape[0]}"
+        )
+    # Labels are stored int16. This module exists to stop silent, unrecoverable
+    # loss, and an out-of-range cast wraps rather than raising.
+    if labels.size and (labels.min() < -32768 or labels.max() > 32767):
+        raise ValueError(
+            f"labels outside int16 range [{labels.min()}, {labels.max()}]; "
+            f"storing them would wrap silently"
         )
 
     meta = {
@@ -1113,7 +1157,7 @@ def iter_dumps(root, group_id: str, uid: str) -> Iterator[DumpRecord]:
 uv run pytest tests/test_evaldump.py -v
 ```
 
-Expected: 6 passed.
+Expected: 12 passed (the scale invariants are parametrised over five sizes).
 
 - [ ] **Step 5: Commit**
 
