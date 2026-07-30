@@ -2,8 +2,10 @@
 
 One implementation, used both in training loops and by post-hoc analysis over
 dumped logits. Dumps are float16 on disk, so every entry point upcasts to
-float32 before any exponentiation -- softmax of a raw fp16 logit overflows
-around |z| > 11.
+float32 first. The risk is precision, not overflow: jax.nn.softmax subtracts the
+max internally so fp16 logits never overflow, but it also RETURNS fp16, and an
+fp16 MSP over 5000 points collapses to a few hundred distinct values. AUROC
+gives ties half credit, so that would distort the detection figures.
 
 OOD score functions in this module follow the project-wide convention:
 **higher means more OOD**.
@@ -11,7 +13,6 @@ OOD score functions in this module follow the project-wide convention:
 
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 from jax import lax, nn
 from jaxtyping import Array
@@ -23,7 +24,8 @@ DEFAULT_NUM_BINS = 20
 
 
 def _f32(x: Any) -> Array:
-    """Upcast to float32. Dumped logits are fp16 and would overflow in softmax."""
+    """Upcast to float32. Dumped logits are fp16; without this, softmax returns
+    fp16 and the score functions lose the ranking resolution AUROC depends on."""
     return jnp.asarray(x, dtype=jnp.float32)
 
 

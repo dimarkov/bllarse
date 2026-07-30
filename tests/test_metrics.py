@@ -93,8 +93,22 @@ def test_classification_metrics_returns_all_four_keys():
     assert all(isinstance(v, float) for v in out.values())
 
 
-def test_metrics_accept_float16_input_without_overflow():
-    # Dumps are fp16 on disk; metrics must upcast before exponentiating.
+def test_ood_scores_do_not_collapse_to_ties_on_float16_input():
+    """Dumps are fp16, and jax.nn.softmax returns fp16 for fp16 input. Without the
+    upcast, MSP over 5000 points collapses to a few hundred distinct values --
+    and AUROC gives ties half credit, so Fig 2's detection metrics would be
+    measurably wrong. Overflow is NOT the risk here: softmax subtracts the max
+    internally, so raw fp16 logits never actually overflow through this path."""
+    rng = np.random.default_rng(1)
+    logits16 = rng.normal(size=(5000, 100)).astype(np.float16)
+
+    scores = np.asarray(metrics.msp_ood_score(logits16))
+    assert scores.dtype == np.float32
+    distinct = len(np.unique(scores))
+    assert distinct > 4000, f"only {distinct} distinct scores -- fp16 ties will distort AUROC"
+
+
+def test_metrics_accept_float16_input():
     logits = jnp.asarray(np.full((10, 4), 60.0, dtype=np.float16))
     labels = jnp.zeros((10,), dtype=jnp.int32)
     assert np.isfinite(metrics.nll(logits, labels))
