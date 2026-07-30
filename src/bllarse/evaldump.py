@@ -1,0 +1,123 @@
+"""Per-eval-point logit dumps -- the source of truth for every reported figure.
+
+Everything downstream (accuracy, ECE at any binning, NLL, Brier, temperature
+scaling, threshold crossings, OOD detection) is computed from these files, so a
+run is measured once and never re-run to add a metric.
+
+Logits are float16 on disk: at ImageNet's K=1000 a 5k eval subset is 10 MB per
+point, and a full 50k final eval is 100 MB. Readers upcast before any
+exponentiation (see bllarse.metrics).
+"""
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class DumpRecord:
+    logits: np.ndarray
+    labels: np.ndarray
+    score: np.ndarray | None
+    meta: dict[str, Any]
+
+
+def dump_schedule(num_steps: int, n_dumps: int = 40) -> np.ndarray:
+    """Log-spaced eval steps: dense early, sparse late.
+
+    Fig 5's claim is that the calibration gap is largest early, so resolution
+    belongs there. Dumping all `num_steps` points would be ~5 GB per run for no
+    additional information about the claim.
+
+    Always includes step 1 and step `num_steps`.
+    """
+    if num_steps < 1:
+        raise ValueError("num_steps must be >= 1")
+    if num_steps <= n_dumps:
+        return np.arange(1, num_steps + 1)
+    raw = np.geomspace(1, num_steps, n_dumps)
+    return np.unique(np.round(raw).astype(int))
+
+
+def dump_dir(root, group_id: str, uid: str) -> Path:
+    return Path(root) / group_id / uid
+
+
+def write_dump(
+    root,
+    group_id: str,
+    uid: str,
+    step: int,
+    logits,
+    labels,
+    *,
+    arm: str,
+    split: str,
+    logit_kind: str,
+    seed: int,
+    samples_seen: int,
+    score=None,
+    score_kind: str | None = None,
+    eps_hat: float | None = None,
+) -> Path:
+    """Write one eval point. Returns the path written.
+
+    `logit_kind` records what the array actually is -- "softmax_logits" for CE
+    and VBLL, "moderated_score" for IBProbit (q-update-spec.md 5.8) -- so no
+    downstream consumer has to infer it.
+
+    `score` is the arm's native epistemic score and is diagnostic only: the
+    primary Fig 2 comparison uses MSP and entropy derived from `logits`, which
+    every arm has. It is absent for AdamW+CE, which has no such quantity.
+    """
+    logits = np.asarray(logits)
+    labels = np.asarray(labels)
+    if logits.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"logits and labels length mismatch: {logits.shape[0]} vs {labels.shape[0]}"
+        )
+
+    meta = {
+        "arm": arm,
+        "step": int(step),
+        "samples_seen": int(samples_seen),
+        "split": split,
+        "logit_kind": logit_kind,
+        "score_kind": score_kind,
+        "seed": int(seed),
+        "eps_hat": None if eps_hat is None else float(eps_hat),
+    }
+
+    payload = {
+        "logits": logits.astype(np.float16),
+        "labels": labels.astype(np.int16),
+        "meta": np.asarray(json.dumps(meta)),
+    }
+    if score is not None:
+        payload["score"] = np.asarray(score, dtype=np.float32)
+
+    directory = dump_dir(root, group_id, uid)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"step_{int(step):07d}.npz"
+    np.savez_compressed(path, **payload)
+    return path
+
+
+def load_dump(path) -> DumpRecord:
+    data = np.load(path, allow_pickle=False)
+    return DumpRecord(
+        logits=data["logits"],
+        labels=data["labels"],
+        score=data["score"] if "score" in data.files else None,
+        meta=json.loads(str(data["meta"])),
+    )
+
+
+def iter_dumps(root, group_id: str, uid: str) -> Iterator[DumpRecord]:
+    """Yield every dump for one run, ordered by step."""
+    directory = dump_dir(root, group_id, uid)
+    for path in sorted(directory.glob("step_*.npz")):
+        yield load_dump(path)
