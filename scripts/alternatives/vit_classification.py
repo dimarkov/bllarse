@@ -80,6 +80,7 @@ EQUIMO_MODELS = {
 DINOV3_DATASET_IMG_SIZES = {
     "cifar10":       224,
     "cifar100":      224,
+    "svhn":          224,
     "oxford_pets":   512,
     "food101":       512,
     "flowers102":    512,
@@ -110,6 +111,14 @@ DATASET_CONFIGS = {
         "num_classes": 100,
         "label_key": "fine_label",
         "img_key": "img",
+        "test_split": "test",
+    },
+    "svhn": {
+        "hf_path": "ufldl-stanford/svhn",
+        "hf_config": "cropped_digits",
+        "num_classes": 10,
+        "label_key": "label",
+        "img_key": "image",
         "test_split": "test",
     },
     "oxford_pets": {
@@ -522,7 +531,7 @@ def main(args):
         print(f"Train features: {train_features.shape}, Test features: {test_features.shape}")
     else:
         print(f"Loading dataset: {args.dataset}")
-        ds = load_dataset(ds_config["hf_path"])
+        ds = load_dataset(ds_config["hf_path"], name=ds_config.get("hf_config"))
         train_split = ds["train"]
         test_split = ds[test_split_name]
         print(f"Train samples: {len(train_split)}, Test samples: {len(test_split)}")

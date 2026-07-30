@@ -70,7 +70,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"Loading dataset: {dataset_name}")
         print(f"{'='*60}")
-        ds = load_dataset(ds_config["hf_path"])
+        ds = load_dataset(ds_config["hf_path"], name=ds_config.get("hf_config"))
         mean, std = NORM_STATS.get(dataset_name, (IMAGENET_MEAN, IMAGENET_STD))
 
         for model_name in args.models:
