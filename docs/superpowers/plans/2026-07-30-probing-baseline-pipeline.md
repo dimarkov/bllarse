@@ -1277,6 +1277,35 @@ def test_falls_back_to_hf_when_the_local_cache_misses(tmp_path, monkeypatch):
     assert (cache / "dinov3_small_fake_res224_train.npz").exists()
 
 
+def test_absent_file_on_the_hub_raises_file_not_found(tmp_path, monkeypatch):
+    class EntryNotFoundError(Exception):
+        pass
+
+    def fake_download(repo_id, filename, repo_type):
+        raise EntryNotFoundError("404")
+
+    monkeypatch.setattr(features, "_hf_hub_download", fake_download)
+    with pytest.raises(FileNotFoundError, match="precompute_features"):
+        features.load_cached_features(
+            tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+        )
+
+
+def test_network_failure_is_not_reported_as_missing_data(tmp_path, monkeypatch):
+    """An auth or connectivity failure must not tell the user to spend GPU hours
+    regenerating features that already exist."""
+
+    def fake_download(repo_id, filename, repo_type):
+        raise ConnectionError("connection reset")
+
+    monkeypatch.setattr(features, "_hf_hub_download", fake_download)
+    with pytest.raises(RuntimeError, match="network or authentication") as excinfo:
+        features.load_cached_features(
+            tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+        )
+    assert "precompute_features" not in str(excinfo.value)
+
+
 def test_module_imports_without_jax_or_torch():
     """The torch container must import this without the JAX stack, and vice
     versa. A heavy import chain here would defeat the point of the module."""
@@ -1313,11 +1342,18 @@ without the JAX stack, and the JAX arm must not pull equimo/mlpox/datasets in
 just to call np.load. `huggingface_hub` is imported lazily for the same reason.
 """
 
-import os
 import shutil
 from pathlib import Path
 
 import numpy as np
+
+# Hugging Face's "this does not exist" errors, matched by class name so this
+# module stays importable without huggingface_hub installed. Anything else --
+# timeouts, 401s, proxy errors -- is a transient/config problem, and telling the
+# user to regenerate their features would send them down the wrong path.
+_HF_ABSENT_ERRORS = frozenset(
+    {"EntryNotFoundError", "RepositoryNotFoundError", "RevisionNotFoundError"}
+)
 
 
 def feature_cache_path(cache_dir, model: str, dataset: str, img_size: int, split: str) -> Path:
@@ -1355,11 +1391,19 @@ def load_cached_features(
         remote = feature_hf_path(model, dataset, img_size, split)
         try:
             downloaded = _hf_hub_download(repo_id=hf_repo, filename=remote, repo_type="dataset")
-        except Exception as exc:  # network, auth, or a genuinely absent file
-            raise FileNotFoundError(
-                f"Features not in the local cache ({local}) and the HF fetch of "
-                f"{hf_repo}/{remote} failed: {exc}. Run precompute_features.py "
-                f"for {model} x {dataset}."
+        except Exception as exc:
+            if type(exc).__name__ in _HF_ABSENT_ERRORS:
+                raise FileNotFoundError(
+                    f"Features not in the local cache ({local}) and "
+                    f"{hf_repo}/{remote} does not exist on the Hub "
+                    f"({type(exc).__name__}). Run precompute_features.py "
+                    f"--models {model} --datasets {dataset} to create them."
+                ) from exc
+            raise RuntimeError(
+                f"Features not in the local cache ({local}) and fetching "
+                f"{hf_repo}/{remote} failed with {type(exc).__name__}: {exc}. "
+                f"That is a network or authentication problem, not missing data "
+                f"-- check connectivity and HF_TOKEN before regenerating anything."
             ) from exc
         local.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(downloaded, local)
@@ -1378,7 +1422,7 @@ def load_cached_features(
 uv run pytest tests/test_features.py -v
 ```
 
-Expected: 6 passed. If `test_module_imports_without_jax_or_torch` fails, something
+Expected: 8 passed. If `test_module_imports_without_jax_or_torch` fails, something
 in `bllarse/__init__.py` is importing the heavy stack — check it and make that
 import lazy rather than weakening the test.
 
