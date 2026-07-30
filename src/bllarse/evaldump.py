@@ -37,7 +37,12 @@ def dump_schedule(num_steps: int, n_dumps: int = 40) -> np.ndarray:
     exactly the resolution this schedule exists to provide, and silently returns
     fewer points than were asked for. Each step is therefore advanced to at least
     one past its predecessor, giving exactly min(num_steps, n_dumps) distinct
-    steps with non-decreasing gaps.
+    steps.
+
+    Gaps trend upward but are not monotone: where the forced-increment region
+    meets the geometric one they can dip by exactly one, at roughly 2% of sizes.
+    Verified by brute force over 118k (n_dumps, num_steps) combinations -- the
+    dip never exceeds one.
 
     Always includes step 1 and step `num_steps`.
     """
