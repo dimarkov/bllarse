@@ -4,14 +4,34 @@ import pytest
 from bllarse import evaldump
 
 
-def test_dump_schedule_is_log_spaced_and_bounded():
+def test_dump_schedule_is_dense_early_and_sparse_late():
     sched = evaldump.dump_schedule(500, n_dumps=40)
     assert sched[0] == 1
     assert sched[-1] == 500
-    assert len(sched) <= 40
+    assert len(sched) == 40, "must return exactly the number of points requested"
     assert list(sched) == sorted(set(sched)), "must be strictly increasing, no repeats"
-    # Dense early: more than half the points fall in the first tenth of training.
-    assert (sched <= 50).sum() > len(sched) // 2
+    # The defining property: gaps never shrink as training progresses. Do NOT
+    # assert an absolute fraction in the first tenth -- that is arithmetically
+    # impossible at moderate num_steps (at 100 steps only 10 of 40 points can
+    # possibly land at or below step 10).
+    gaps = np.diff(sched)
+    assert np.all(np.diff(gaps) >= 0), f"gaps must be non-decreasing, got {gaps}"
+
+
+@pytest.mark.parametrize("num_steps", [41, 100, 200, 500, 2000])
+def test_dump_schedule_holds_its_invariants_across_scales(num_steps):
+    """A naive round-then-unique returns 25-36 points instead of 40 across this
+    range, thinning exactly the early region the schedule exists to resolve."""
+    sched = evaldump.dump_schedule(num_steps, n_dumps=40)
+    assert len(sched) == 40
+    assert sched[0] == 1
+    assert sched[-1] == num_steps
+    assert np.all(np.diff(sched) > 0)
+
+
+def test_dump_schedule_rejects_a_degenerate_n_dumps():
+    with pytest.raises(ValueError):
+        evaldump.dump_schedule(500, n_dumps=1)
 
 
 def test_dump_schedule_handles_fewer_steps_than_dumps():

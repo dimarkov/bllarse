@@ -32,14 +32,31 @@ def dump_schedule(num_steps: int, n_dumps: int = 40) -> np.ndarray:
     belongs there. Dumping all `num_steps` points would be ~5 GB per run for no
     additional information about the claim.
 
+    Rounding a geometric grid to integers collapses its early points -- at
+    num_steps=100 the first twenty all land below 3 -- so a naive unique() drops
+    exactly the resolution this schedule exists to provide, and silently returns
+    fewer points than were asked for. Each step is therefore advanced to at least
+    one past its predecessor, giving exactly min(num_steps, n_dumps) distinct
+    steps with non-decreasing gaps.
+
     Always includes step 1 and step `num_steps`.
     """
     if num_steps < 1:
         raise ValueError("num_steps must be >= 1")
+    if n_dumps < 2:
+        raise ValueError("n_dumps must be >= 2 so the schedule spans 1..num_steps")
     if num_steps <= n_dumps:
         return np.arange(1, num_steps + 1)
-    raw = np.geomspace(1, num_steps, n_dumps)
-    return np.unique(np.round(raw).astype(int))
+
+    steps: list[int] = []
+    previous = 0
+    for value in np.geomspace(1, num_steps, n_dumps):
+        step = max(int(round(value)), previous + 1)
+        if step > num_steps:
+            break
+        steps.append(step)
+        previous = step
+    return np.asarray(steps, dtype=int)
 
 
 def dump_dir(root, group_id: str, uid: str) -> Path:
@@ -78,6 +95,13 @@ def write_dump(
     if logits.shape[0] != labels.shape[0]:
         raise ValueError(
             f"logits and labels length mismatch: {logits.shape[0]} vs {labels.shape[0]}"
+        )
+    # Labels are stored int16. This module exists to stop silent, unrecoverable
+    # loss, and an out-of-range cast wraps rather than raising.
+    if labels.size and (labels.min() < -32768 or labels.max() > 32767):
+        raise ValueError(
+            f"labels outside int16 range [{labels.min()}, {labels.max()}]; "
+            f"storing them would wrap silently"
         )
 
     meta = {
