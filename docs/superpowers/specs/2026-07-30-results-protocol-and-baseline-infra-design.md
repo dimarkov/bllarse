@@ -136,7 +136,10 @@ at which all three targets hold, and that must be stated in the caption.
 
 `results-plan.md` §0.2 fits TS on a held-out split. Today `--val-fraction`
 draws a seed-dependent shuffle, so every seed gets a different val/test
-partition and TS is not comparable across seeds — nor across arms.
+partition and TS is not comparable across seeds — nor across arms. With T refit
+per dump point (below), the same split is reused ~40 times per run, which makes
+this a correctness requirement rather than a tidiness one: a split that moves
+with the seed would put ~40 differently-conditioned fits on each curve.
 
 Fix: a fixed, seed-independent index file per (dataset, split), generated once
 and cached next to the features:
@@ -160,10 +163,36 @@ temperature scaling; all taking `(logits, labels)`.
 - `scripts/alternatives/calibration.py` has accuracy/ECE/NLL but **no Brier**,
   so the probing path currently cannot report it. It becomes a thin wrapper over
   this module.
-- TS is fit by Newton steps on β; `CrossEntropy.calibrate`
+- TS is fit by Newton steps on β = 1/T; `CrossEntropy.calibrate`
   (`src/bllarse/losses/classical.py`) already implements exactly this. Move the
   Newton loop here so it applies uniformly to every arm including VBLL, and have
   the loss method call it.
+
+**TS schedule — refit at every dumped step.** Standard TS (Guo et al.) fits T
+once, at convergence. Figs 5–6 are trajectories, so a once-fit T would be a
+strawman precisely on the early part of the curve where the sample-efficiency
+claim lives — IBProbit recalibrates itself continuously, and the baseline should
+be allowed to as well. T is therefore refit on the pinned val split at each of
+the ~40 dump points, giving AdamW+CE+TS a full curve in Figs 5–7 rather than a
+single endpoint. This is non-standard and **the captions must say so**; it makes
+the baseline strictly stronger, which is the direction a fairness deviation
+should run.
+
+Cost is nil — it is a Newton fit on logits already on disk, with no extra
+training.
+
+**Why TS is not optional here.** `results-plan.md` §0.2 makes it R2's stated
+bar, and `q-update-spec.md` §5.8 makes it structural: because Σ and Q are
+class-independent, `s(f)` carries no class index and *is* an input-dependent
+temperature, of which TS is the degenerate constant case. Without a TS curve
+that claim has algebra behind it and no measurement.
+
+The linear-probing setting sharpens this rather than weakening it. For a linear
+head on frozen features, `softmax(Wf/T) = softmax((W/T)f)` — the temperature is
+already inside the model class, and the head simply did not learn that scale
+under CE. So TS adds no capacity; it refits the same function class on held-out
+data. An IBProbit win that survives it is demonstrably not a rescaling, which is
+R2's objection answered on R2's own terms.
 
 ### 4. Threshold protocol as post-hoc analysis
 
@@ -248,18 +277,37 @@ comparators consume byte-identical features.
 New `scripts/vbll_pytorch/probing_vbll.py`; `models.py` gains a backbone-free
 head-only path so the `scaling_mlps` import is no longer unconditional.
 
-### 0d-ii. Full fine-tuning (Figs 5–7) — torch DINOv3 required
+### 0d-ii. Full fine-tuning (Figs 5–7) — a full PyTorch backend
+
+Backbone gradients flow, so there is no cached-feature shortcut: this arm needs
+a genuine PyTorch stack end to end.
+
+| piece | requirement |
+|---|---|
+| backbone | torch DINOv3 loading the **same checkpoint** equimo does |
+| data | ImageNet-1k pipeline at the resolution `DINOV3_DATASET_IMG_SIZES` gives it (512) |
+| augmentation | matched to the JAX arm's augmax recipe, transform for transform |
+| precision | matched (`--bf16` on the JAX side) |
+| optimizer | AdamW with the same betas, weight decay, schedule, and warmup |
+| eval | same pinned splits, same dump schedule, same `metrics.py` (0b) |
 
 This is where the accepted parity risk lives. `results-plan.md` §0.4 point 4:
 *"same optimizer state, same augmentation, same precision. Any asymmetry here
-invalidates the compute claim."* A torch DINOv3 must match equimo's.
+invalidates the compute claim."* Every row above is a place the two stacks can
+silently diverge, and only the first is caught by a feature-parity test.
 
-**Gate — a parity test, before any Phase 1b run counts:** load the same
-checkpoint into both stacks, run a fixed batch through each, assert per-feature
-agreement to a stated tolerance. Test lives in `tests/`; the tolerance and the
-achieved max-deviation both go in the paper's appendix, because Fig 7b's
-wall-clock panel is a cross-framework comparison and a reader is entitled to the
-number.
+**Gate — a two-part parity test, before any Phase 1b run counts.**
+
+1. *Forward parity.* Load the same checkpoint into both stacks, run a fixed
+   batch through each, assert per-feature agreement to a stated tolerance. The
+   tolerance and the achieved max-deviation both go in the paper's appendix —
+   Fig 7b is a cross-framework wall-clock comparison and a reader is entitled to
+   the number.
+2. *Recipe parity.* A config-level assertion that the torch arm's augmentation
+   transforms, precision, optimizer hyperparameters, schedule and eval splits
+   equal the JAX arm's. Cheap to write, and it is the only thing standing
+   between "matched recipe" as a claim and as a fact — forward parity says
+   nothing about rows 2–6 of the table above.
 
 **Cost probe, same step:** `results-plan.md` §5.1 asks whether VBLL is feasible
 at ImageNet full FT at all — the prior comparison was CIFAR-scale at batch 512.
@@ -282,7 +330,8 @@ contract consumed by `run_sweep.py` and `run_config.py`.
 | `fnft_imagenet_vbll.py` | VBLL | ImageNet-1k × 5 seeds |
 
 Seeds per `results-plan.md` §0.5: 25 probing, 5 full FT. AdamW+CE+TS is **not** a
-separate sweep — it is post-hoc from the AdamW dumps.
+separate sweep — it is post-hoc from the AdamW dumps, refit per dump point
+(0b.3), so it costs no GPU time and adds no array tasks.
 
 Order-of-magnitude, assuming the five-model DINOv3 ladder (the count is a
 deferred decision below): probing is 5 × 6 × 25 × 2 ≈ 1500 array tasks
@@ -336,12 +385,15 @@ Not blocking Phase 0. Listed so they are not silently forgotten.
 ## Risks
 
 1. **Cross-framework wall-clock (Figs 5–7).** Accepted deliberately in favour of
-   keeping the reference VBLL implementation. Mitigated by the 0d-ii parity test
-   and by reporting the achieved tolerance. FLOPs — the *primary* axis per §0.3 —
-   are framework-independent and unaffected; only 7b is exposed.
+   keeping the reference VBLL implementation. Mitigated by the 0d-ii parity
+   tests and by reporting the achieved tolerance. FLOPs — the *primary* axis per
+   §0.3 — are framework-independent and unaffected; only 7b is exposed. Note the
+   asymmetry across figures: Figs 1–4 have **zero** parity risk (identical
+   cached features), Figs 5–7 carry all of it.
 2. **Dump-grid resolution bounds threshold precision.** Log spacing is dense
    exactly where Fig 5's claim lives, but crossings are quantised to the grid and
-   the caption must say so.
+   the caption must say so. The per-step TS refit (0b.3) is on the same grid and
+   needs the same caption note.
 3. **Branch consolidation drops something.** `ibprobit-process-noise` is +72
    commits and the extraction is selective by design. Mitigation: the Phase 0f
    smoke test exercises both arms end to end, and `full_finetune_comparison.py`
