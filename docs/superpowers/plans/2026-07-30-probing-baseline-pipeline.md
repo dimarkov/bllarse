@@ -704,7 +704,7 @@ convention, ties given half credit."
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `make_pinned_split(n, val_fraction, dataset, split_seed=20260730) -> tuple[np.ndarray, np.ndarray]` returning `(val_idx, test_idx)`
+  - `make_pinned_split(n, val_fraction, dataset) -> tuple[np.ndarray, np.ndarray]` returning `(val_idx, test_idx)`. **No seed parameter** — the fixed `SPLIT_SEED` lives as a module constant, because an overridable seed is the exact footgun this module exists to remove.
   - `pinned_split_path(cache_dir, dataset, split, val_fraction) -> Path`
   - `load_or_make_pinned_split(cache_dir, dataset, split, n, val_fraction) -> tuple[np.ndarray, np.ndarray]`
 
