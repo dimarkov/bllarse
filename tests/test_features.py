@@ -60,6 +60,35 @@ def test_falls_back_to_hf_when_the_local_cache_misses(tmp_path, monkeypatch):
     assert (cache / "dinov3_small_fake_res224_train.npz").exists()
 
 
+def test_absent_file_on_the_hub_raises_file_not_found(tmp_path, monkeypatch):
+    class EntryNotFoundError(Exception):
+        pass
+
+    def fake_download(repo_id, filename, repo_type):
+        raise EntryNotFoundError("404")
+
+    monkeypatch.setattr(features, "_hf_hub_download", fake_download)
+    with pytest.raises(FileNotFoundError, match="precompute_features"):
+        features.load_cached_features(
+            tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+        )
+
+
+def test_network_failure_is_not_reported_as_missing_data(tmp_path, monkeypatch):
+    """An auth or connectivity failure must not tell the user to spend GPU hours
+    regenerating features that already exist."""
+
+    def fake_download(repo_id, filename, repo_type):
+        raise ConnectionError("connection reset")
+
+    monkeypatch.setattr(features, "_hf_hub_download", fake_download)
+    with pytest.raises(RuntimeError, match="network or authentication") as excinfo:
+        features.load_cached_features(
+            tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+        )
+    assert "precompute_features" not in str(excinfo.value)
+
+
 def test_module_imports_without_jax_or_torch():
     """The torch container must import this without the JAX stack, and vice
     versa. A heavy import chain here would defeat the point of the module."""

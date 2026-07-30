@@ -9,11 +9,18 @@ without the JAX stack, and the JAX arm must not pull equimo/mlpox/datasets in
 just to call np.load. `huggingface_hub` is imported lazily for the same reason.
 """
 
-import os
 import shutil
 from pathlib import Path
 
 import numpy as np
+
+# Hugging Face's "this does not exist" errors, matched by class name so this
+# module stays importable without huggingface_hub installed. Anything else --
+# timeouts, 401s, proxy errors -- is a transient/config problem, and telling the
+# user to regenerate their features would send them down the wrong path.
+_HF_ABSENT_ERRORS = frozenset(
+    {"EntryNotFoundError", "RepositoryNotFoundError", "RevisionNotFoundError"}
+)
 
 
 def feature_cache_path(cache_dir, model: str, dataset: str, img_size: int, split: str) -> Path:
@@ -51,11 +58,19 @@ def load_cached_features(
         remote = feature_hf_path(model, dataset, img_size, split)
         try:
             downloaded = _hf_hub_download(repo_id=hf_repo, filename=remote, repo_type="dataset")
-        except Exception as exc:  # network, auth, or a genuinely absent file
-            raise FileNotFoundError(
-                f"Features not in the local cache ({local}) and the HF fetch of "
-                f"{hf_repo}/{remote} failed: {exc}. Run precompute_features.py "
-                f"for {model} x {dataset}."
+        except Exception as exc:
+            if type(exc).__name__ in _HF_ABSENT_ERRORS:
+                raise FileNotFoundError(
+                    f"Features not in the local cache ({local}) and "
+                    f"{hf_repo}/{remote} does not exist on the Hub "
+                    f"({type(exc).__name__}). Run precompute_features.py "
+                    f"--models {model} --datasets {dataset} to create them."
+                ) from exc
+            raise RuntimeError(
+                f"Features not in the local cache ({local}) and fetching "
+                f"{hf_repo}/{remote} failed with {type(exc).__name__}: {exc}. "
+                f"That is a network or authentication problem, not missing data "
+                f"-- check connectivity and HF_TOKEN before regenerating anything."
             ) from exc
         local.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(downloaded, local)
