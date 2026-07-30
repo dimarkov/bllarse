@@ -108,11 +108,20 @@ records which, as a metadata field, so no post-hoc consumer has to guess.
 $BLLARSE_EVAL_DUMP_ROOT/{group_id}/{uid}/step_{step:07d}.npz
   logits  (N, K) float16
   labels  (N,)   int16
-  meta    dict   {arm, step, samples_seen, split, score_type, seed}
+  score   (N,)   float32   # native epistemic score; diagnostic, IBProbit and VBLL only
+  meta    dict   {arm, step, samples_seen, split, logit_kind, score_kind, seed, eps_hat}
 ```
 
 The split index vector is written once per run as `split_indices.npz`, not
-repeated per eval point.
+repeated per eval point. `eps_hat` is IBProbit's converged ε̂ for that step — a
+scalar, needed to reconstruct the floored predictive post-hoc.
+
+**The `score` channel is diagnostic, not load-bearing** — see the Fig 2 scoring
+decision below. The primary detection figure is built from `logits` alone for
+every arm. `score` carries IBProbit's `x̃ᵀΣᵖʳᵉᵈx̃` (`predictive_variance`,
+`bayesian.py:467`) and VBLL's predictive variance so the §5.8 ARD ablation can be
+run; `score_kind` records which, and it is absent for AdamW+CE where no such
+quantity exists.
 
 **Storage.** MLflow gets the *path* as a param plus the scalar metrics; it does
 not get the arrays. ImageNet at K=1000: 10 MB per eval point on the 5k eval
@@ -163,6 +172,17 @@ temperature scaling; all taking `(logits, labels)`.
 - `scripts/alternatives/calibration.py` has accuracy/ECE/NLL but **no Brier**,
   so the probing path currently cannot report it. It becomes a thin wrapper over
   this module.
+- **Detection metrics are entirely new**: AUROC, FPR@95TPR and AUPR
+  (`results-plan.md` §1 Fig 2). Nothing in the repo computes any of them. What
+  exists on `ibprobit-process-noise` — `ood_evaluation.py`,
+  `_ood_metrics_from_logits` — measures accuracy and calibration *under shift*,
+  which is a different question from *detecting* shift. Both are wanted (Fig 6 is
+  the former, Fig 2 the latter) and neither substitutes for the other. Signature
+  is `(scores_id, scores_ood) → {auroc, fpr95, aupr}`, with a documented sign
+  convention for which direction means "more OOD".
+- **MSP and predictive entropy** as score functions over a normalised predictive,
+  so the same functional form applies to every arm (see the Fig 2 scoring
+  decision below).
 - TS is fit by Newton steps on β = 1/T; `CrossEntropy.calibrate`
   (`src/bllarse/losses/classical.py`) already implements exactly this. Move the
   Newton loop here so it applies uniformly to every arm including VBLL, and have
@@ -317,40 +337,135 @@ needs revisiting rather than the figure.
 
 ---
 
-## Phase 0e — Sweep definitions
+## Phase 0e — OOD data for Fig 2
+
+`results-plan.md` §1 Fig 2 evaluates *detection* from frozen features on three
+pairs:
+
+| pair | ID | OOD | character |
+|---|---|---|---|
+| 1 | CIFAR-10 | SVHN | far-OOD |
+| 2 | CIFAR-100 | SVHN | far-OOD |
+| 3 | CIFAR-10 | CIFAR-100 | **near-OOD** — the harder and more informative pair |
+
+CIFAR-100 appears as ID in pair 2 and as OOD in pair 3, so only SVHN is new data.
+
+**Work required:**
+
+- **Register SVHN** in `DATASET_CONFIGS` (`vit_classification.py`):
+  `ufldl-stanford/svhn`, config `cropped_digits`, 10 classes, `test` split. The
+  `img_key`/`label_key` need the same check every other entry got — the registry
+  is not uniform across sources.
+- **`DINOV3_DATASET_IMG_SIZES["svhn"] = 224`**, matching CIFAR's entry. This is
+  not a tuning knob: OOD features must be extracted at the *same resolution with
+  the same backbone* as the ID features or they do not live in the same feature
+  space. `docs/superpowers/specs/2026-06-18-ood-calibration-eval-design.md` makes
+  exactly this point for the ImageNet OOD suite and it applies unchanged here.
+- **Precompute SVHN features** for the four ladder backbones at res224, into the
+  existing `.cache/features` layout and HF mirror. CIFAR-10/100 at 224 are
+  already covered by the registry.
+- **OOD dumps at the final eval point only.** Fig 2 is a converged-endpoint
+  figure, not a trajectory (Fig 6 is the trajectory one, and it is shift rather
+  than detection), so the log-spaced schedule of 0b.1 governs the ID curve and
+  does not multiply the OOD cost.
+
+**Narrative requirement**, carried from `results-plan.md` §1 Fig 2: this
+reintroduces CIFAR as **in-distribution** data, on DINOv3 features. That is not
+the excised deep-MLP CIFAR study, and the text must say so explicitly — otherwise
+a reviewer who read the submitted version will read the cut as cosmetic.
+
+### Fig 2 scoring — one score function for every arm
+
+⚠ **Deviation from `results-plan.md` §1 Fig 2**, which specifies a *per-arm*
+score: `x̃ᵀΣᵖʳᵉᵈx̃` for IBProbit, MSP/max-logit for AdamW, VBLL's own predictive
+variance. That is confounded — a win under it cannot be attributed to the model
+rather than to the score function, and it makes the weaker claim ("we carry a
+signal you structurally lack") in place of the one §3.7 actually asserts ("our
+predictive is better off-distribution").
+
+IBProbit has a proper normalised predictive (`q-update-spec.md` §5.8:
+`Φ(μₖᵀf/s(f))`, normalised, ε-floored), so MSP and entropy are well-defined for
+it and there is no technical reason to score it differently.
+
+| role | score | arms |
+|---|---|---|
+| **primary** | MSP and predictive entropy on each arm's own normalised predictive | all three, identical functional form |
+| **diagnostic** | native epistemic score (`x̃ᵀΣᵖʳᵉᵈx̃`; VBLL predictive variance) | IBProbit, VBLL — labelled not cross-comparable |
+
+The diagnostic row stays because §5.8 makes a claim *about the score itself* —
+that per-component `q̂` upgrades the floor from `q‖f‖²` to the learned weighted
+norm `Σⱼq̂ⱼfⱼ²`, "strictly a better OOD score than the isotropic version".
+Testing that needs the score directly, and it is an ablation, not the comparison.
+
+Two consequences:
+
+- **Max-logit is not a cross-arm score.** IBProbit's scores are on a probit scale
+  and normalised; AdamW's are unnormalised softmax logits. Only functions of the
+  *normalised* predictive — MSP, entropy — compare across arms. Max-logit stays
+  as an AdamW-side extra.
+- **The ε floor cannot confound detection.** `p_ε = (1−ε̂)p + ε̂/K` is a strictly
+  increasing affine map of MSP, so it preserves per-example ranking exactly and
+  leaves AUROC unchanged. Only the input-dependent part of the moderation can
+  move detection — which is precisely the mechanism under test. Worth one
+  sentence in the paper: it forecloses the reading that the ε machinery is doing
+  the OOD work.
+
+The expected mechanism, stated so it can fail visibly: `s(f)` inflates
+off-manifold → the predictive flattens → MSP falls. If MSP does *not* express the
+epistemic signal, that is a finding about §3.7 worth having before the paper
+claims it, and the diagnostic row is where it would show up.
+
+---
+
+## Phase 0f — Sweep definitions
 
 Under `bllarse_sweeps/`, following the existing `create_configs()` / `run(config)`
 contract consumed by `run_sweep.py` and `run_config.py`.
 
-| file | arm | grid |
-|---|---|---|
-| `probe_adamw_ce.py` | AdamW+CE | backbones × 6 datasets × 25 seeds |
-| `probe_vbll.py` | VBLL | same grid |
-| `fnft_imagenet_adamw_ce.py` | AdamW+CE | ImageNet-1k × 5 seeds |
-| `fnft_imagenet_vbll.py` | VBLL | ImageNet-1k × 5 seeds |
+**The ladder is `dinov3_small` (384), `dinov3_big` (768), `dinov3_large` (1024),
+`dinov3_huge` (1280)** — four models. `dinov3_max` (embed 4096) is out.
+
+| file | arm | grid | figure |
+|---|---|---|---|
+| `probe_adamw_ce.py` | AdamW+CE | 4 backbones × 6 datasets × 25 seeds | Fig 1 |
+| `probe_vbll.py` | VBLL | same grid | Fig 1 |
+| `probe_ood_adamw_ce.py` | AdamW+CE | 4 backbones × {CIFAR-10, CIFAR-100} × 25 seeds | Fig 2 |
+| `probe_ood_vbll.py` | VBLL | same grid | Fig 2 |
+| `fnft_imagenet_adamw_ce.py` | AdamW+CE | ImageNet-1k × 5 seeds | Figs 5–7 |
+| `fnft_imagenet_vbll.py` | VBLL | ImageNet-1k × 5 seeds | Figs 5–7 |
 
 Seeds per `results-plan.md` §0.5: 25 probing, 5 full FT. AdamW+CE+TS is **not** a
 separate sweep — it is post-hoc from the AdamW dumps, refit per dump point
 (0b.3), so it costs no GPU time and adds no array tasks.
 
-Order-of-magnitude, assuming the five-model DINOv3 ladder (the count is a
-deferred decision below): probing is 5 × 6 × 25 × 2 ≈ 1500 array tasks
-(seconds-to-minutes each, on cached features); ImageNet full FT is 10 long runs.
+Sizing: Fig 1 is 4 × 6 × 25 × 2 = 1200 array tasks, Fig 2 is 4 × 2 × 25 × 2 = 400,
+so ~1600 probing tasks (seconds-to-minutes each, on cached features), plus 10
+long ImageNet full-FT runs.
+
+The Fig 2 sweeps are separate files rather than extra datasets in the Fig 1
+sweeps because they differ in what they dump (OOD `score` on a second dataset,
+final point only) rather than only in which dataset they train on.
 `run_sweep.py`'s `--index-offset` / `--num-jobs` chunking and `--max-concurrent`
 cap already handle submitting these against a shared-cluster array-size limit.
 
 ---
 
-## Phase 0f — Smoke test
+## Phase 0g — Smoke test
 
 One config per arm on the cluster, verifying end to end:
 
 1. Apptainer launch under `sbatch --array`, both SIFs;
 2. MLflow parent/child nesting via `MLFLOW_PARENT_RUN_ID`;
 3. logit dumps land at the expected path with the expected shapes and dtypes;
-4. **`metrics.py` recomputes the in-loop scalar metrics from the dumps** to
+4. **the `score` channel and `eps_hat` are present and non-degenerate** for the
+   arms that carry them (0b.1). All-zeros would not break the primary Fig 2,
+   which is built from logits, but it would silently cost the §5.8 ablation;
+5. **`metrics.py` recomputes the in-loop scalar metrics from the dumps** to
    floating-point tolerance. This is the load-bearing check — it is what
    licenses treating the dumps as the source of truth for every later figure.
+
+The smoke test covers one Fig 1 config and one Fig 2 config per arm, since they
+exercise different dump paths.
 
 ---
 
@@ -368,13 +483,26 @@ not after the runs.
 
 ---
 
+## Changes to sync back into `results-plan.md`
+
+Settled here, deviating from or resolving something in the plan document. Listed
+so the two files do not drift apart silently.
+
+| change | where | status |
+|---|---|---|
+| Fig 2 scored by **MSP + entropy uniformly across arms**, native epistemic scores demoted to a diagnostic ablation | §1 Fig 2 (currently specifies per-arm scores) | **deviation** — rationale in Phase 0e above |
+| Fig 1 ladder is `dinov3_small/big/large/huge`; `dinov3_max` (embed 4096) is out | §5.2 (listed as open) | resolved |
+| TS refit at every dumped step rather than once at convergence | §0.2 (schedule unspecified) | refinement; needs a caption note |
+| Max-logit demoted to an AdamW-side extra, not a cross-arm score | §1 Fig 2 | deviation, follows from the scoring change |
+
+---
+
 ## Deferred decisions
 
 Not blocking Phase 0. Listed so they are not silently forgotten.
 
 | decision | source | needed by |
 |---|---|---|
-| Which DINOv3 checkpoints form the Fig 1 ladder; does `dinov3_max` (embed 4096) enter | results-plan §5.2 | Phase 0e sweep definitions |
 | Fig 5/6 reading (a) — OOD as a second axis over the same trajectory — vs (b) — OOD *is* the sample-efficiency measure | results-plan §2 Fig 6 | Phase 1b |
 | ImageNet-C severity: averaged, or per-severity appendix panel | results-plan §5.3 | Phase 1b |
 | Per-component vs shared γ | q-update-spec §12.1 | Phase 2 |
@@ -395,7 +523,7 @@ Not blocking Phase 0. Listed so they are not silently forgotten.
    the caption must say so. The per-step TS refit (0b.3) is on the same grid and
    needs the same caption note.
 3. **Branch consolidation drops something.** `ibprobit-process-noise` is +72
-   commits and the extraction is selective by design. Mitigation: the Phase 0f
+   commits and the extraction is selective by design. Mitigation: the Phase 0g
    smoke test exercises both arms end to end, and `full_finetune_comparison.py`
    has its own tests on that branch (`tests/test_full_finetune_*.py`) which come
    across with it.
