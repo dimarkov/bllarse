@@ -3345,12 +3345,25 @@ from bllarse import evaldump, metrics
 from bllarse.analysis import curves
 
 
-def _write_run(root, uid, steps, *, n=800, k=5, scale=1.0, seed=0):
-    rng = np.random.default_rng(seed)
+def _write_run(root, uid, steps, *, n=2000, k=5):
+    """Dumps whose logits grow steadily more overconfident as training proceeds.
+
+    Labels are SAMPLED from softmax(base), which makes `base` calibrated at T=1,
+    so scaling it by `s` puts the NLL-optimal temperature at `s`. The scale rises
+    with the step, so each dump point has a genuinely different optimal T and a
+    per-step refit is distinguishable from a single fit reused.
+
+    Do NOT use labels = base.argmax(-1) here. That makes the model correct on
+    every point, NLL then falls monotonically as T -> 0, and fit_temperature pins
+    to its clip bound (T = 0.01) at every step -- so all the fitted temperatures
+    come out identical and the refit assertion cannot fail.
+    """
     for step in steps:
+        rng = np.random.default_rng(step)
         base = rng.normal(size=(n, k)).astype(np.float32)
-        labels = base.argmax(axis=-1)
-        logits = base * scale
+        probs = np.exp(base) / np.exp(base).sum(axis=-1, keepdims=True)
+        labels = np.array([rng.choice(k, p=row) for row in probs])
+        logits = base * (1.0 + step / 2.0)
         for split, sl in (("val", slice(0, n // 2)), ("test", slice(n // 2, n))):
             evaldump.write_dump(
                 root, "g", uid, step, logits[sl], labels[sl],
@@ -3368,7 +3381,7 @@ def test_run_curve_has_one_row_per_step_with_all_metrics(tmp_path):
 
 
 def test_temperature_scaling_is_refit_at_every_step(tmp_path):
-    _write_run(tmp_path, "u2", [1, 5, 20], scale=5.0, seed=1)
+    _write_run(tmp_path, "u2", [1, 5, 20])
     plain = curves.run_curve(tmp_path, "g", "u2", temperature_scaled=False)
     scaled = curves.run_curve(tmp_path, "g", "u2", temperature_scaled=True)
     # A per-point refit must reduce NLL at every point, not just the last.
@@ -3381,7 +3394,7 @@ def test_temperature_scaling_is_refit_at_every_step(tmp_path):
 
 
 def test_temperature_scaling_does_not_change_accuracy(tmp_path):
-    _write_run(tmp_path, "u3", [1, 5], scale=5.0, seed=2)
+    _write_run(tmp_path, "u3", [1, 5])
     plain = curves.run_curve(tmp_path, "g", "u3", temperature_scaled=False)
     scaled = curves.run_curve(tmp_path, "g", "u3", temperature_scaled=True)
     for a, b in zip(plain, scaled):
