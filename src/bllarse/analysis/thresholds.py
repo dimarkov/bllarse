@@ -29,6 +29,7 @@ class Targets:
 @dataclass(frozen=True)
 class Crossing:
     step: int | None
+    samples_seen: int | None
     censored: bool
     last_step: int | None
 
@@ -62,15 +63,28 @@ def _meets(row: Mapping[str, Any], targets: Targets) -> bool:
 
 
 def first_crossing(curve: Curve, targets: Targets) -> Crossing:
-    """First step at which ALL THREE targets hold. Censored if never."""
+    """First step at which ALL THREE targets hold. Censored if never.
+
+    `samples_seen` is carried alongside `step` because step is an epoch --
+    samples_seen is the compute axis the sample-efficiency figure actually
+    needs, and it is not always a fixed multiple of step (dataset size can
+    differ per run).
+    """
     if not curve:
-        return Crossing(step=None, censored=True, last_step=None)
+        return Crossing(step=None, samples_seen=None, censored=True, last_step=None)
 
     ordered = sorted(curve, key=lambda row: row["step"])
     for row in ordered:
         if _meets(row, targets):
-            return Crossing(step=row["step"], censored=False, last_step=ordered[-1]["step"])
-    return Crossing(step=None, censored=True, last_step=ordered[-1]["step"])
+            return Crossing(
+                step=row["step"],
+                samples_seen=row["samples_seen"],
+                censored=False,
+                last_step=ordered[-1]["step"],
+            )
+    return Crossing(
+        step=None, samples_seen=None, censored=True, last_step=ordered[-1]["step"]
+    )
 
 
 def crossings_per_seed(

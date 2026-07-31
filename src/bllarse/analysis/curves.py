@@ -30,6 +30,10 @@ def run_curve(
 
     With `temperature_scaled=True`, T is fit on that step's val dump and applied
     to that step's test logits -- a fresh fit per point, never a reused one.
+
+    Each row carries `seed` and `arm` from the dump's own meta, so a caller
+    grouping runs by seed (e.g. for `thresholds.crossings_per_seed`) can read
+    them straight off the row instead of re-parsing the uid string.
     """
     indexed = _by_split(root, group_id, uid)
     if "test" not in indexed:
@@ -54,6 +58,8 @@ def run_curve(
         row = {
             "step": step,
             "samples_seen": test_record.meta["samples_seen"],
+            "seed": test_record.meta["seed"],
+            "arm": test_record.meta["arm"],
             "temperature": temperature,
             **metrics.classification_metrics(logits, labels),
         }

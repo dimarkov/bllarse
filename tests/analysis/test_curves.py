@@ -36,8 +36,19 @@ def test_run_curve_has_one_row_per_step_with_all_metrics(tmp_path):
     _write_run(tmp_path, "u1", [1, 5, 20])
     curve = curves.run_curve(tmp_path, "g", "u1")
     assert [row["step"] for row in curve] == [1, 5, 20]
-    assert set(curve[0]) >= {"step", "samples_seen", "acc", "ece", "nll", "brier"}
+    assert set(curve[0]) >= {"step", "samples_seen", "seed", "arm", "acc", "ece", "nll", "brier"}
     assert curve[0]["samples_seen"] == 100
+
+
+def test_run_curve_carries_seed_and_arm_from_the_dump_meta(tmp_path):
+    """Cross-cutting fix: crossings_per_seed takes Mapping[int, Curve] keyed
+    by seed, but a caller had no way to get at a row's seed short of
+    re-parsing the uid string, since run_curve dropped meta["seed"] and
+    meta["arm"]. Both must now come straight off each row."""
+    _write_run(tmp_path, "u1b", [1, 5])
+    curve = curves.run_curve(tmp_path, "g", "u1b")
+    assert all(row["seed"] == 137 for row in curve)
+    assert all(row["arm"] == "adamw_ce" for row in curve)
 
 
 def test_temperature_scaling_is_refit_at_every_step(tmp_path):
