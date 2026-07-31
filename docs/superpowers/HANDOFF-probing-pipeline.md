@@ -100,8 +100,23 @@ BLLARSE_SIF=$PWD/bllarse-torch.sif uv run python -m bllarse.tools.run_sweep \
     bllarse_sweeps/probe_smoke.py --index-offset 2 --num-jobs 2 --max-concurrent 2
 ```
 
-Full gate-by-gate criteria are in the Task 13 report. Note the MLflow gate
-cannot fire — see blocker 2.
+Success criteria for the smoke sweep, in order:
+
+1. `sacct -u "$USER" --name probe_smoke --format=JobID,State,ExitCode` — all four
+   tasks `COMPLETED`, exit 0.
+2. Dumps exist under `$BLLARSE_EVAL_DUMP_ROOT/probe_smoke/{jax_fig1,jax_fig2,torch_fig1,torch_fig2}/`,
+   with both `_val` and `_test` files per step and one `_ood` file for the `fig2` uids.
+3. The VBLL `score` channel is present **and non-constant** —
+   `np.std(record.score) > 0`. A constant score means the epistemic term is dead
+   and would silently gut the Fig 2 ablation.
+4. `bllarse.metrics.classification_metrics` recomputed from a dump matches the
+   value printed in the job's stdout.
+5. MLflow nesting — **skip**, structurally not exercised; see blocker 2.
+
+Per-task detail, including full command transcripts and measured tolerances, is
+in the (gitignored) working directory
+`.superpowers/sdd/2026-07-30-probing-baseline-pipeline/` — one report per task
+plus `progress.md`. Safe to delete once read.
 
 ---
 
