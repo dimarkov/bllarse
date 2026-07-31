@@ -70,6 +70,16 @@ def aupr(scores_id, scores_ood) -> float:
 
     Step-interpolated (the `sum((R_n - R_{n-1}) * P_n)` form), not trapezoidal,
     which is the standard non-optimistic estimator.
+
+    Ties are resolved by threshold, not by item: every point sharing a score
+    is folded into the same precision/recall step, regardless of which side
+    of the concatenation it came from. A naive `argsort(-scores,
+    kind="mergesort")` over `concat([ood, id])` is stable, so tied OOD points
+    (listed first) always sort ahead of tied ID points -- an all-ties input
+    would then return 1.0, as optimistic as it gets, instead of the ~0.5 an
+    uninformative detector should score. Grouping by distinct threshold value
+    (as sklearn's precision_recall_curve does) fixes this the same way
+    `auroc`'s average-rank tie handling does for AUROC.
     """
     scores_id, scores_ood = _validate(scores_id, scores_ood)
     scores = np.concatenate([scores_ood, scores_id])
@@ -78,10 +88,20 @@ def aupr(scores_id, scores_ood) -> float:
     )
 
     order = np.argsort(-scores, kind="mergesort")
+    scores_sorted = scores[order]
     is_positive = is_positive[order]
 
-    tp = np.cumsum(is_positive)
-    fp = np.cumsum(~is_positive)
+    tp_cum = np.cumsum(is_positive)
+    fp_cum = np.cumsum(~is_positive)
+
+    # Collapse each run of tied scores to a single threshold step: the last
+    # index of every run except the final one (from the sign change in
+    # np.diff), plus the final index itself (always a threshold boundary).
+    distinct = np.nonzero(np.diff(scores_sorted))[0]
+    threshold_idx = np.append(distinct, scores_sorted.size - 1)
+
+    tp = tp_cum[threshold_idx]
+    fp = fp_cum[threshold_idx]
     precision = tp / np.maximum(tp + fp, 1)
     recall = tp / scores_ood.size
 

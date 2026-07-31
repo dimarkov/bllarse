@@ -51,6 +51,15 @@ def test_aupr_baseline_is_positive_rate():
     assert detection.aupr(scores_id, scores_ood) == pytest.approx(0.1, abs=0.03)
 
 
+def test_aupr_handles_ties_as_the_positive_rate_not_perfect():
+    # All scores equal -> no discrimination -> the positive (OOD) base rate,
+    # same as auroc's 0.5 for this input. Before the tie-handling fix, the
+    # stable sort over concat([ood, id]) always ranked tied OOD ahead of tied
+    # ID, so this returned 1.0 -- maximally optimistic despite carrying zero
+    # signal.
+    assert detection.aupr(np.zeros(100), np.zeros(100)) == pytest.approx(0.5)
+
+
 def test_detection_metrics_returns_all_three_keys():
     out = detection.detection_metrics(np.array([0.0, 0.1]), np.array([1.0]))
     assert set(out) == {"auroc", "fpr95", "aupr"}
