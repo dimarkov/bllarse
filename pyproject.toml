@@ -41,3 +41,17 @@ alternatives = [
     "transformers[flax]>=4.35.0",
     "sentencepiece>=0.2.0",
 ]
+vbll = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "vbll>=0.2.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

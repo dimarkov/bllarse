@@ -9,17 +9,31 @@ import torch.nn as nn
 
 import vbll
 
-# Add vendored scaling_mlps to path
+# Vendored scaling_mlps submodule -- belongs to the (retired) full-finetuning
+# experiment. It is deliberately absent on this branch, so the check for it
+# must not run at import time: linear probing on cached features (this
+# module's other consumer) needs no backbone at all, and importing this
+# module must not require a submodule the probing path never touches.
 _SCALING_MLPS_PATH = Path(__file__).parent.parent.parent / "scaling_mlps"
-if not (_SCALING_MLPS_PATH / "models").exists():
-    raise FileNotFoundError(
-        f"Missing scaling_mlps submodule at {_SCALING_MLPS_PATH}. "
-        "Run: git submodule update --init --recursive scripts/vbll_pytorch/scaling_mlps"
-    )
-if str(_SCALING_MLPS_PATH) not in sys.path:
-    sys.path.insert(0, str(_SCALING_MLPS_PATH))
 
-from models.networks import get_model as scaling_get_model, model_list
+
+def _ensure_scaling_mlps():
+    """Make the vendored scaling_mlps package importable, or raise.
+
+    Called lazily from the one function that actually needs the backbone
+    (`load_pretrained_backbone`) rather than at module import time.
+    """
+    if not (_SCALING_MLPS_PATH / "models").exists():
+        raise FileNotFoundError(
+            f"Missing scaling_mlps submodule at {_SCALING_MLPS_PATH}. "
+            "Run: git submodule update --init --recursive scripts/vbll_pytorch/scaling_mlps"
+        )
+    if str(_SCALING_MLPS_PATH) not in sys.path:
+        sys.path.insert(0, str(_SCALING_MLPS_PATH))
+
+    from models.networks import get_model as scaling_get_model, model_list
+
+    return scaling_get_model, model_list
 
 
 # Checkpoint download URLs (from scaling_mlps Google Drive)
@@ -134,6 +148,8 @@ def load_pretrained_backbone(
     Returns:
         Tuple of (backbone model, embedding dimension)
     """
+    scaling_get_model, model_list = _ensure_scaling_mlps()
+
     # Determine num_classes based on checkpoint for model init
     if checkpoint == "in21k":
         num_classes = 11230  # ImageNet21k classes
@@ -249,5 +265,35 @@ def create_vbll_model(
     if freeze_backbone:
         for param in model.backbone.parameters():
             param.requires_grad = False
-    
+
     return model
+
+
+def build_vbll_head(
+    input_dim: int,
+    num_classes: int,
+    *,
+    regularization_weight: float = 1.0,
+    prior_scale: float = 1.0,
+    wishart_scale: float = 0.1,
+    parameterization: str = "diagonal",
+    vbll_type: str = "discriminative",
+):
+    """A bare VBLL classification head, with no backbone.
+
+    Linear probing on cached features needs only this -- the features were
+    already extracted by the JAX side, so there is no PyTorch backbone in the
+    probing path at all and the two arms consume byte-identical inputs.
+    """
+    vbll_class = (
+        vbll.DiscClassification if vbll_type == "discriminative" else vbll.GenClassification
+    )
+    return vbll_class(
+        in_features=input_dim,
+        out_features=num_classes,
+        regularization_weight=regularization_weight,
+        parameterization=parameterization,
+        prior_scale=prior_scale,
+        wishart_scale=wishart_scale,
+        return_ood=True,
+    )
