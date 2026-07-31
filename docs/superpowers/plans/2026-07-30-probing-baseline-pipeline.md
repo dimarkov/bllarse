@@ -3426,6 +3426,22 @@ def test_run_detection_computes_from_id_and_ood_dumps(tmp_path):
     assert out["auroc"] > 0.8, "confident ID vs diffuse OOD must be separable"
 
 
+def test_run_detection_refuses_to_compare_different_checkpoints(tmp_path):
+    """The ood dump is written once, at the final step. If it lands at a
+    different step from the final test dump, the scores come from different
+    checkpoints and any AUROC computed from them is meaningless."""
+    rng = np.random.default_rng(4)
+    for split, step in (("test", 20), ("ood", 5)):
+        base = rng.normal(size=(200, 5)).astype(np.float32)
+        evaldump.write_dump(
+            tmp_path, "g", "u7", step, base, base.argmax(axis=-1),
+            arm="adamw_ce", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=step * 100,
+        )
+    with pytest.raises(ValueError, match="different checkpoints"):
+        curves.run_detection(tmp_path, "g", "u7", metrics.msp_ood_score)
+
+
 def test_run_detection_raises_without_an_ood_dump(tmp_path):
     _write_run(tmp_path, "u6", [1])
     with pytest.raises(ValueError, match="ood"):
@@ -3522,10 +3538,20 @@ def run_detection(
     if "test" not in indexed:
         raise ValueError(f"no test-split dump found for {group_id}/{uid}")
 
-    id_record = indexed["test"][max(indexed["test"])]
-    ood_record = indexed["ood"][max(indexed["ood"])]
+    id_step, ood_step = max(indexed["test"]), max(indexed["ood"])
+    if id_step != ood_step:
+        # Pairing scores from two different checkpoints would produce a
+        # plausible-looking AUROC that means nothing. A partial write or a
+        # changed eval schedule is the likely cause.
+        raise ValueError(
+            f"{group_id}/{uid}: final test dump is at step {id_step} but the "
+            f"final ood dump is at step {ood_step}; detection would compare "
+            f"different checkpoints"
+        )
+
     return detection.detection_metrics(
-        score_fn(id_record.logits), score_fn(ood_record.logits)
+        score_fn(indexed["test"][id_step].logits),
+        score_fn(indexed["ood"][ood_step].logits),
     )
 ```
 
@@ -3535,7 +3561,7 @@ def run_detection(
 uv run pytest tests/analysis/test_curves.py -v
 ```
 
-Expected: 6 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Run the whole suite**
 
