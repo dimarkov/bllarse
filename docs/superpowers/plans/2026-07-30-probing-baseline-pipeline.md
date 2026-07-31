@@ -3174,11 +3174,19 @@ def test_metrics_survive_the_fp16_dump_round_trip(tmp_path):
 
 
 def test_temperature_fit_survives_the_round_trip(tmp_path):
+    # Labels are SAMPLED from softmax(base), so base is calibrated at T=1 and
+    # base*4 has an NLL-optimal temperature of 4. Using labels = logits.argmax(-1)
+    # instead would make the model correct everywhere, pinning fit_temperature to
+    # its clip bound (T = 0.01) on BOTH sides -- the assertion would then compare
+    # 0.01 to 0.01 and pass even if fp16 had destroyed the logits entirely.
     rng = np.random.default_rng(1)
-    logits = (rng.normal(size=(3000, 10)) * 4.0).astype(np.float32)
-    labels = logits.argmax(axis=-1)
+    base = rng.normal(size=(3000, 10)).astype(np.float32)
+    probs = np.exp(base) / np.exp(base).sum(axis=-1, keepdims=True)
+    labels = np.array([rng.choice(10, p=row) for row in probs])
+    logits = base * 4.0
 
     in_loop_T = metrics.fit_temperature(logits, labels)
+    assert 3.0 < in_loop_T < 5.0, f"fixture should give T near 4, got {in_loop_T}"
     path = evaldump.write_dump(
         tmp_path, "g", "u2", step=1, logits=logits, labels=labels,
         arm="adamw_ce", split="val", logit_kind="softmax_logits",
