@@ -77,8 +77,18 @@ def run_detection(
     if "test" not in indexed:
         raise ValueError(f"no test-split dump found for {group_id}/{uid}")
 
-    id_record = indexed["test"][max(indexed["test"])]
-    ood_record = indexed["ood"][max(indexed["ood"])]
+    id_step, ood_step = max(indexed["test"]), max(indexed["ood"])
+    if id_step != ood_step:
+        # Pairing scores from two different checkpoints would produce a
+        # plausible-looking AUROC that means nothing. A partial write or a
+        # changed eval schedule is the likely cause.
+        raise ValueError(
+            f"{group_id}/{uid}: final test dump is at step {id_step} but the "
+            f"final ood dump is at step {ood_step}; detection would compare "
+            f"different checkpoints"
+        )
+
     return detection.detection_metrics(
-        score_fn(id_record.logits), score_fn(ood_record.logits)
+        score_fn(indexed["test"][id_step].logits),
+        score_fn(indexed["ood"][ood_step].logits),
     )

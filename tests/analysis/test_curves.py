@@ -86,6 +86,22 @@ def test_run_detection_computes_from_id_and_ood_dumps(tmp_path):
     assert out["auroc"] > 0.8, "confident ID vs diffuse OOD must be separable"
 
 
+def test_run_detection_refuses_to_compare_different_checkpoints(tmp_path):
+    """The ood dump is written once, at the final step. If it lands at a
+    different step from the final test dump, the scores come from different
+    checkpoints and any AUROC computed from them is meaningless."""
+    rng = np.random.default_rng(4)
+    for split, step in (("test", 20), ("ood", 5)):
+        base = rng.normal(size=(200, 5)).astype(np.float32)
+        evaldump.write_dump(
+            tmp_path, "g", "u7", step, base, base.argmax(axis=-1),
+            arm="adamw_ce", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=step * 100,
+        )
+    with pytest.raises(ValueError, match="different checkpoints"):
+        curves.run_detection(tmp_path, "g", "u7", metrics.msp_ood_score)
+
+
 def test_run_detection_raises_without_an_ood_dump(tmp_path):
     _write_run(tmp_path, "u6", [1])
     with pytest.raises(ValueError, match="ood"):
