@@ -9,7 +9,9 @@ without the JAX stack, and the JAX arm must not pull equimo/mlpox/datasets in
 just to call np.load. `huggingface_hub` is imported lazily for the same reason.
 """
 
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -88,7 +90,20 @@ def load_cached_features(
                 f"NOT regenerate before checking connectivity."
             ) from exc
         local.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(downloaded, local)
+        # The sweep runs several tasks concurrently against the same cold
+        # cache, so a copy straight to `local` risks another task's np.load
+        # observing a half-written file (BadZipFile). Write to a temp file in
+        # the same directory, then os.replace -- atomic on POSIX -- so a
+        # concurrent reader only ever sees the old (absent) or new (complete)
+        # file, never a partial one.
+        fd, tmp_name = tempfile.mkstemp(dir=local.parent, prefix=f".{local.name}.", suffix=".tmp")
+        os.close(fd)
+        try:
+            shutil.copy2(downloaded, tmp_name)
+            os.replace(tmp_name, local)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
         data = np.load(local)
         return data["features"], data["labels"]
 

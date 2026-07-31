@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -135,6 +136,58 @@ def test_classification_matches_the_real_huggingface_hub_hierarchy(tmp_path, mon
         features.load_cached_features(
             tmp_path, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
         )
+
+
+def test_download_writes_via_temp_file_then_atomic_replace(tmp_path, monkeypatch):
+    """The sweep runs several tasks concurrently against a cold cache, so a
+    reader's np.load(local) must never observe a half-written file. Spy on
+    os.replace to confirm the implementation writes a complete temp file in
+    the SAME directory as the target (required for atomicity on POSIX) and
+    only makes it visible under the final name via a single replace call --
+    never via shutil.copy2 straight onto `local`."""
+    remote = tmp_path / "remote.npz"
+    feats = np.ones((2, 3), dtype=np.float32)
+    np.savez(remote, features=feats, labels=np.zeros(2, dtype=int))
+
+    monkeypatch.setattr(features, "_hf_hub_download", lambda repo_id, filename, repo_type: str(remote))
+
+    calls = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        calls.append((Path(src), Path(dst)))
+        assert Path(src).parent == Path(dst).parent, "replace must stay on one filesystem"
+        assert Path(src) != Path(dst), "must write to a distinct temp file, not the final path"
+        with np.load(src) as data:
+            np.testing.assert_array_equal(data["features"], feats)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(features.os, "replace", spy_replace)
+
+    cache = tmp_path / "cache"
+    got_f, _ = features.load_cached_features(
+        cache, "dinov3_small", "fake", 224, "train", hf_repo="r/f"
+    )
+    np.testing.assert_array_equal(got_f, feats)
+    assert len(calls) == 1, "the download path must go through exactly one atomic replace"
+
+
+def test_download_failure_leaves_no_partial_file_at_the_final_path(tmp_path, monkeypatch):
+    remote = tmp_path / "remote.npz"
+    np.savez(remote, features=np.ones((2, 3), dtype=np.float32), labels=np.zeros(2, dtype=int))
+    monkeypatch.setattr(features, "_hf_hub_download", lambda repo_id, filename, repo_type: str(remote))
+
+    def crashing_replace(src, dst):
+        raise RuntimeError("simulated crash before the swap")
+
+    monkeypatch.setattr(features.os, "replace", crashing_replace)
+
+    cache = tmp_path / "cache"
+    local = features.feature_cache_path(cache, "dinov3_small", "fake", 224, "train")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        features.load_cached_features(cache, "dinov3_small", "fake", 224, "train", hf_repo="r/f")
+
+    assert not local.exists(), "a crash before the atomic replace must not leave a partial file"
 
 
 def test_module_imports_without_jax_or_torch():

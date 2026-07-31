@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -53,3 +56,42 @@ def test_load_or_make_rejects_a_cached_split_of_the_wrong_size(tmp_path):
     splits.load_or_make_pinned_split(tmp_path, "cifar10", "test", 500, 0.1)
     with pytest.raises(ValueError, match="size"):
         splits.load_or_make_pinned_split(tmp_path, "cifar10", "test", 600, 0.1)
+
+
+def test_writes_via_temp_file_then_atomic_replace(tmp_path, monkeypatch):
+    """The sweep runs several tasks concurrently against a cold cache, so a
+    reader's np.load(path) must never observe a half-written file. Spy on
+    os.replace to confirm the implementation writes a complete temp file in
+    the SAME directory as the target (required for atomicity on POSIX) and
+    only makes it visible under the final name via a single replace call --
+    never via np.savez(path, ...) straight onto the target."""
+    calls = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        calls.append((Path(src), Path(dst)))
+        assert Path(src).parent == Path(dst).parent, "replace must stay on one filesystem"
+        assert Path(src) != Path(dst), "must write to a distinct temp file, not the final path"
+        with np.load(src) as data:
+            assert "val_idx" in data.files and "test_idx" in data.files
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(splits.os, "replace", spy_replace)
+
+    splits.load_or_make_pinned_split(tmp_path, "cifar10", "test", 500, 0.1)
+    assert len(calls) == 1, "the split write must go through exactly one atomic replace"
+    path = splits.pinned_split_path(tmp_path, "cifar10", "test", 0.1)
+    assert path.exists()
+
+
+def test_write_failure_leaves_no_partial_file_at_the_final_path(tmp_path, monkeypatch):
+    def crashing_replace(src, dst):
+        raise RuntimeError("simulated crash before the swap")
+
+    monkeypatch.setattr(splits.os, "replace", crashing_replace)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        splits.load_or_make_pinned_split(tmp_path, "cifar10", "test", 500, 0.1)
+
+    path = splits.pinned_split_path(tmp_path, "cifar10", "test", 0.1)
+    assert not path.exists(), "a crash before the atomic replace must not leave a partial file"

@@ -8,6 +8,8 @@ derived from the dataset name alone.
 """
 
 import hashlib
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -63,5 +65,19 @@ def load_or_make_pinned_split(
 
     val_idx, test_idx = make_pinned_split(n, val_fraction, dataset)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, val_idx=val_idx, test_idx=test_idx)
+    # The sweep runs several tasks concurrently against the same cold cache,
+    # so a plain np.savez(path, ...) followed by another task's np.load(path)
+    # risks the reader seeing a half-written file (BadZipFile). Write to a
+    # temp file in the same directory, then os.replace -- atomic on POSIX --
+    # so a concurrent reader only ever sees the old (absent) or new (complete)
+    # file, never a partial one. np.savez is given an open file object rather
+    # than the temp path string so it does not append its own ".npz" suffix.
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            np.savez(tmp_file, val_idx=val_idx, test_idx=test_idx)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
     return val_idx, test_idx
