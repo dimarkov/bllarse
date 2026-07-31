@@ -83,7 +83,18 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         head.train()
         perm = torch.randperm(len(x_train))
-        for i in range(len(x_train) // args.batch_size):
+        n_batches = len(x_train) // args.batch_size
+        if n_batches == 0:
+            # Silently clamping to one batch would dump a plausible-looking
+            # but untrained head -- its accuracy/NLL/Brier would be
+            # indistinguishable from a real result after the fact. Fail
+            # loudly instead.
+            raise ValueError(
+                f"--batch-size {args.batch_size} exceeds len(x_train)="
+                f"{len(x_train)}; this would train zero gradient steps per "
+                f"epoch. Lower --batch-size or provide more training data."
+            )
+        for i in range(n_batches):
             idx = perm[i * args.batch_size:(i + 1) * args.batch_size]
             xb, yb = x_train[idx].to(device), y_train[idx].to(device)
             optimizer.zero_grad()

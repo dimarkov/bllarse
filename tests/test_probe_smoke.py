@@ -105,3 +105,34 @@ def test_probe_dumps_ood_scores_when_an_ood_dataset_is_given(fake_features, tmp_
     ood = [r for r in evaldump.iter_dumps(tmp_path / "dumps", "smoke", "smoke_ood")
            if r.meta["split"] == "ood"]
     assert len(ood) == 1, "OOD is dumped at the final point only"
+
+
+def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
+    fake_features, tmp_path
+):
+    """Cross-cutting fix: _ce_epoch computed n_batches = len(feats) //
+    batch_size and looped that many times -- with batch_size > len(feats),
+    n_batches is 0 and the loop silently trains nothing. Every production
+    sweep hard-codes batch_size=512; a dataset-size change alone would then
+    dump an untrained head whose metrics look like a real (if poor) result.
+    This must fail loudly, not clamp to one batch."""
+    import probe
+
+    args = probe.build_argparser().parse_args([
+        "--arm", "adamw_ce",
+        "--model", "dinov3_small",
+        "--dataset", "fake",
+        "--num-classes", "2",
+        "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "smoke",
+        "--uid", "smoke_toobig",
+        "--epochs", "2",
+        "--n-dumps", "2",
+        "--batch-size", "601",  # fake_features has 600 training rows
+        "--seed", "137",
+        "--no-hf-cache",
+    ])
+    with pytest.raises(ValueError, match="batch_size"):
+        probe.main(args)

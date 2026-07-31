@@ -142,3 +142,33 @@ def test_hf_repo_flag_threads_through_every_load_cached_features_call(
     assert len(calls) == 3, "train, eval, and ood loads must all go through load_cached_features"
     expected = None if no_hf_cache else "dimarkov/bllarse-features"
     assert calls == [expected] * 3
+
+
+def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
+    fake_features, tmp_path
+):
+    """Cross-cutting fix: the epoch loop computed len(x_train) // batch_size
+    and looped that many times -- with batch_size > len(x_train) that is 0,
+    and training silently does nothing. Every production sweep hard-codes
+    batch_size=512; a dataset-size change alone would then dump an untrained
+    head whose metrics look like a real (if poor) result. This must fail
+    loudly, not clamp to one batch."""
+    import probing_vbll
+
+    args = probing_vbll.build_argparser().parse_args([
+        "--model", "dinov3_small",
+        "--dataset", "fake",
+        "--num-classes", "2",
+        "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "smoke",
+        "--uid", "vbll_toobig",
+        "--epochs", "2",
+        "--n-dumps", "2",
+        "--batch-size", "601",  # fake_features has 600 training rows
+        "--seed", "137",
+        "--device", "cpu",
+    ])
+    with pytest.raises(ValueError, match="batch-size"):
+        probing_vbll.main(args)

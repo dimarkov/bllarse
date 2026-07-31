@@ -33,6 +33,15 @@ def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, ke
     """One AdamW pass over the features."""
     perm = jr.permutation(key, len(feats))
     n_batches = len(feats) // batch_size
+    if n_batches == 0:
+        # Silently clamping to one batch would dump a plausible-looking but
+        # untrained head -- its accuracy/NLL/Brier would be indistinguishable
+        # from a real result after the fact. Fail loudly instead.
+        raise ValueError(
+            f"batch_size={batch_size} exceeds len(feats)={len(feats)}; this "
+            f"would train zero gradient steps per epoch. Lower --batch-size "
+            f"or provide more training data."
+        )
     for i in range(n_batches):
         idx = perm[i * batch_size:(i + 1) * batch_size]
         fb, yb = jnp.asarray(feats[idx]), jnp.asarray(labels[idx])
