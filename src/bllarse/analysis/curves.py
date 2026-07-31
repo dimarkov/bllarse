@@ -1,0 +1,84 @@
+"""Assemble metric curves from eval dumps. Pure post-hoc -- no training here.
+
+This is where temperature scaling actually happens. Standard TS fits one T at
+convergence, but Figs 5-6 are trajectories, and a once-fit T would be a strawman
+exactly on the early part of the curve where the sample-efficiency claim lives.
+IBProbit recalibrates itself continuously, so the baseline is allowed to as
+well: T is refit on the pinned val split at every dumped step.
+
+That is non-standard and makes the baseline strictly stronger, which is the
+direction a fairness deviation should run. It needs saying in the caption.
+"""
+
+from typing import Any, Callable
+
+from bllarse import detection, evaldump, metrics
+
+
+def _by_split(root, group_id: str, uid: str) -> dict[str, dict[int, Any]]:
+    """Index a run's dumps as {split: {step: record}}."""
+    indexed: dict[str, dict[int, Any]] = {}
+    for record in evaldump.iter_dumps(root, group_id, uid):
+        indexed.setdefault(record.meta["split"], {})[record.meta["step"]] = record
+    return indexed
+
+
+def run_curve(
+    root, group_id: str, uid: str, *, temperature_scaled: bool = False
+) -> list[dict[str, Any]]:
+    """One row per dumped step, on the test split.
+
+    With `temperature_scaled=True`, T is fit on that step's val dump and applied
+    to that step's test logits -- a fresh fit per point, never a reused one.
+    """
+    indexed = _by_split(root, group_id, uid)
+    if "test" not in indexed:
+        raise ValueError(f"no test-split dumps found for {group_id}/{uid}")
+
+    rows = []
+    for step in sorted(indexed["test"]):
+        test_record = indexed["test"][step]
+        logits, labels = test_record.logits, test_record.labels
+        temperature = 1.0
+
+        if temperature_scaled:
+            val_record = indexed.get("val", {}).get(step)
+            if val_record is None:
+                raise ValueError(
+                    f"temperature scaling needs a val dump at step {step} for "
+                    f"{group_id}/{uid}, but none was written"
+                )
+            temperature = metrics.fit_temperature(val_record.logits, val_record.labels)
+            logits = metrics.apply_temperature(logits, temperature)
+
+        row = {
+            "step": step,
+            "samples_seen": test_record.meta["samples_seen"],
+            "temperature": temperature,
+            **metrics.classification_metrics(logits, labels),
+        }
+        rows.append(row)
+    return rows
+
+
+def run_detection(
+    root, group_id: str, uid: str, score_fn: Callable[[Any], Any]
+) -> dict[str, float]:
+    """Detection metrics at the final dumped point.
+
+    `score_fn` maps logits to a score under the project convention that higher
+    means more OOD -- metrics.msp_ood_score or metrics.entropy_ood_score. Passing
+    the same function to both sides is what makes the comparison a controlled
+    one; a per-arm score would confound model with score function.
+    """
+    indexed = _by_split(root, group_id, uid)
+    if "ood" not in indexed:
+        raise ValueError(f"no ood-split dump found for {group_id}/{uid}")
+    if "test" not in indexed:
+        raise ValueError(f"no test-split dump found for {group_id}/{uid}")
+
+    id_record = indexed["test"][max(indexed["test"])]
+    ood_record = indexed["ood"][max(indexed["ood"])]
+    return detection.detection_metrics(
+        score_fn(id_record.logits), score_fn(ood_record.logits)
+    )
