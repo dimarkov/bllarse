@@ -117,3 +117,17 @@ def test_run_detection_raises_without_an_ood_dump(tmp_path):
     _write_run(tmp_path, "u6", [1])
     with pytest.raises(ValueError, match="ood"):
         curves.run_detection(tmp_path, "g", "u6", metrics.msp_ood_score)
+
+
+def test_run_curve_rejects_a_logit_kind_it_cannot_metricise(tmp_path):
+    """run_curve hands dumped arrays straight to classification_metrics, which
+    softmaxes them -- correct for softmax_logits, silently wrong for anything
+    else. A future arm (e.g. IBProbit's 'moderated_score', q-update-spec.md
+    5.8) must be rejected, not mis-metricised."""
+    evaldump.write_dump(
+        tmp_path, "g", "u8", 1, np.zeros((10, 3), dtype=np.float32), np.zeros(10, dtype=int),
+        arm="ibprobit", split="test", logit_kind="moderated_score",
+        seed=137, samples_seen=100,
+    )
+    with pytest.raises(ValueError, match="moderated_score"):
+        curves.run_curve(tmp_path, "g", "u8")

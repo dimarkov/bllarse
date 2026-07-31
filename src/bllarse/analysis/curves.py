@@ -14,6 +14,13 @@ from typing import Any, Callable
 
 from bllarse import detection, evaldump, metrics
 
+# `metrics.classification_metrics` softmaxes the dumped array unconditionally.
+# That is correct for "softmax_logits" (AdamW+CE and VBLL), but a future arm
+# dumping a differently-scaled score under a different logit_kind -- e.g.
+# IBProbit's "moderated_score" (q-update-spec.md 5.8) -- would be silently
+# mis-metricised rather than rejected.
+_METRICISABLE_LOGIT_KINDS = frozenset({"softmax_logits"})
+
 
 def _by_split(root, group_id: str, uid: str) -> dict[str, dict[int, Any]]:
     """Index a run's dumps as {split: {step: record}}."""
@@ -42,6 +49,14 @@ def run_curve(
     rows = []
     for step in sorted(indexed["test"]):
         test_record = indexed["test"][step]
+        logit_kind = test_record.meta["logit_kind"]
+        if logit_kind not in _METRICISABLE_LOGIT_KINDS:
+            raise ValueError(
+                f"{group_id}/{uid} step {step}: run_curve softmaxes the dumped "
+                f"array and only knows how to do that for "
+                f"{sorted(_METRICISABLE_LOGIT_KINDS)}, but found "
+                f"logit_kind={logit_kind!r}"
+            )
         logits, labels = test_record.logits, test_record.labels
         temperature = 1.0
 
