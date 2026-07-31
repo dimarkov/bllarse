@@ -2678,7 +2678,7 @@ Shared clusters usually have no daemon. Build from def-files instead — create
 
 ```
 Bootstrap: docker
-From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu24.04
+From: nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
 
 %post
     # 24.04, not 22.04: 22.04's python3-pip targets python3.10 even when
@@ -2686,6 +2686,12 @@ From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu24.04
     # interpreter -- and neither image provides a bare `python`, which the job
     # script invokes. 24.04 ships python3.12 (satisfies >=3.11) as the default
     # python3, and python-is-python3 supplies /usr/bin/python.
+    #
+    # CUDA 12.9.2, not 12.4.1: nvidia/cuda publishes NO 24.04 image before
+    # 12.9.x. Verified against the Docker Hub tag API -- 12.4.1 exists only for
+    # ubuntu20.04/22.04. Both jax[cuda12] and the torch CUDA wheels ship their
+    # own CUDA redistributables via pip, and `apptainer --nv` binds the host
+    # driver, so the base image's CUDA version is not load-bearing here.
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends python3 python3-pip python-is-python3 git
@@ -2707,7 +2713,7 @@ and `src/slurm/images/bllarse-torch.def`:
 
 ```
 Bootstrap: docker
-From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu24.04
+From: nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
 
 %post
     # See bllarse-jax.def for why 24.04 and python-is-python3.
