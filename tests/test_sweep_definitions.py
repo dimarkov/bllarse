@@ -41,14 +41,16 @@ def test_fig1_sweep_sizes_match_the_plan():
     assert len(get_module_from_source_path(SWEEPS[0]).create_configs()) == 240
 
 
-def test_fig2_sweep_sizes_match_the_plan():
+@pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])
+def test_fig2_sweep_sizes_match_the_plan(path):
     # 4 backbones x 3 (ID, OOD) pairs x 10 seeds.
     # Three pairs, not two ID datasets: CIFAR-10 appears twice, against SVHN
     # (far-OOD) and against CIFAR-100 (near-OOD).
-    assert len(get_module_from_source_path(SWEEPS[2]).create_configs()) == 120
+    assert len(get_module_from_source_path(path).create_configs()) == 120
 
 
-def test_fig2_sweeps_pair_each_id_dataset_with_an_ood_dataset():
-    for c in get_module_from_source_path(SWEEPS[2]).create_configs():
+@pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])
+def test_fig2_sweeps_pair_each_id_dataset_with_an_ood_dataset(path):
+    for c in get_module_from_source_path(path).create_configs():
         assert c["ood_dataset"] in {"svhn", "cifar100"}
         assert c["ood_dataset"] != c["dataset"]
