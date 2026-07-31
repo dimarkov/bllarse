@@ -78,6 +78,22 @@ def run_curve(
             "temperature": temperature,
             **metrics.classification_metrics(logits, labels),
         }
+
+        # Val metrics ride along so the stopping rule can be applied post hoc:
+        # `thresholds.early_stop` takes an argmin over val_nll, and without it
+        # on the row there is nothing to take the argmin of. Scaled by the same
+        # T as the test side when temperature_scaled, so the two are comparable.
+        val_record = indexed.get("val", {}).get(step)
+        if val_record is not None:
+            val_logits = val_record.logits
+            if temperature_scaled:
+                val_logits = metrics.apply_temperature(val_logits, temperature)
+            row.update({
+                f"val_{k}": v
+                for k, v in metrics.classification_metrics(
+                    val_logits, val_record.labels
+                ).items()
+            })
         rows.append(row)
     return rows
 

@@ -24,25 +24,39 @@ import numpy as np
 import optax
 from jax import random as jr, vmap
 
-from bllarse import evaldump, metrics, splits
+from bllarse import evaldump, splits
 from bllarse.features import eval_split_name, load_cached_features
 from bllarse.losses import CrossEntropy
+from bllarse.mlflow_utils import child_run
+from bllarse.reporting import report_step
 
 
-def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, key):
-    """One AdamW pass over the features."""
-    perm = jr.permutation(key, len(feats))
-    n_batches = len(feats) // batch_size
+def steps_per_epoch(n_train: int, batch_size: int) -> int:
+    """Optimiser steps in one pass. Drop-remainder, so every step sees exactly
+    `batch_size` samples -- which is what makes samples_seen exact."""
+    n_batches = n_train // batch_size
     if n_batches == 0:
         # Silently clamping to one batch would dump a plausible-looking but
         # untrained head -- its accuracy/NLL/Brier would be indistinguishable
         # from a real result after the fact. Fail loudly instead.
         raise ValueError(
-            f"batch_size={batch_size} exceeds len(feats)={len(feats)}; this "
-            f"would train zero gradient steps per epoch. Lower --batch-size "
-            f"or provide more training data."
+            f"batch_size={batch_size} exceeds n_train={n_train}; this would "
+            f"train zero gradient steps per epoch. Lower --batch-size or "
+            f"provide more training data."
         )
-    for i in range(n_batches):
+    return n_batches
+
+
+def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, key):
+    """One AdamW pass, yielding (head, opt_state) after every optimiser step.
+
+    A generator rather than a whole-epoch call because the dump schedule is now
+    indexed on steps: an epoch of ImageNet is 2,502 steps, and dumping only at
+    epoch boundaries would put the first measurement 1.28M samples in -- past
+    the entire early regime the sample-efficiency claim lives in.
+    """
+    perm = jr.permutation(key, len(feats))
+    for i in range(steps_per_epoch(len(feats), batch_size)):
         idx = perm[i * batch_size:(i + 1) * batch_size]
         fb, yb = jnp.asarray(feats[idx]), jnp.asarray(labels[idx])
 
@@ -54,7 +68,7 @@ def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, ke
             grads, opt_state, eqx.filter(head, eqx.is_array)
         )
         head = eqx.apply_updates(head, updates)
-    return head, opt_state
+        yield head, opt_state
 
 
 def _logits_for(head, loss_fn, feats, labels, chunk=4096):
@@ -99,43 +113,66 @@ def main(args):
     optimizer = optax.adamw(args.learning_rate, weight_decay=args.weight_decay)
     opt_state = optimizer.init(eqx.filter(head, eqx.is_array))
 
-    schedule = set(evaldump.dump_schedule(args.epochs, n_dumps=args.n_dumps).tolist())
-    print(f"[probe] {args.uid}: {args.epochs} epochs, dumping at {sorted(schedule)}")
+    per_epoch = steps_per_epoch(len(train_f), args.batch_size)
+    total_steps = args.epochs * per_epoch
+    schedule = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
+    print(
+        f"[probe] {args.uid}: {args.epochs} epochs x {per_epoch} steps "
+        f"= {total_steps} steps ({total_steps * args.batch_size} samples), "
+        f"{len(schedule)} dumps"
+    )
 
-    for epoch in range(1, args.epochs + 1):
-        key, epoch_key = jr.split(key)
-        head, opt_state = _ce_epoch(
-            head, opt_state, optimizer, loss_fn,
-            train_f, train_l, args.batch_size, epoch_key,
-        )
-        if epoch not in schedule:
-            continue
+    with child_run(vars(args), run_name=args.uid, tags={
+        "arm": args.arm, "group_id": args.group_id, "uid": args.uid,
+        "dump_dir": str(Path(args.dump_root) / args.group_id / args.uid),
+    }) as run:
+        run.log_params({"steps_per_epoch": per_epoch, "total_steps": total_steps})
 
-        logits = _logits_for(head, loss_fn, eval_f, eval_l)
-        for split_name, idx in (("val", val_idx), ("test", test_idx)):
-            evaldump.write_dump(
-                args.dump_root, args.group_id, args.uid, epoch,
-                logits[idx], eval_l[idx],
-                arm=args.arm, split=split_name, logit_kind="softmax_logits",
-                seed=args.seed, samples_seen=epoch * len(train_f),
+        step = 0
+        for epoch in range(1, args.epochs + 1):
+            key, epoch_key = jr.split(key)
+            for head, opt_state in _ce_epoch(
+                head, opt_state, optimizer, loss_fn,
+                train_f, train_l, args.batch_size, epoch_key,
+            ):
+                step += 1
+                if step not in schedule:
+                    continue
+
+                # Exact: drop-remainder means every step is exactly batch_size.
+                samples_seen = step * args.batch_size
+                logits = _logits_for(head, loss_fn, eval_f, eval_l)
+                for split_name, idx in (("val", val_idx), ("test", test_idx)):
+                    evaldump.write_dump(
+                        args.dump_root, args.group_id, args.uid, step,
+                        logits[idx], eval_l[idx],
+                        arm=args.arm, split=split_name, logit_kind="softmax_logits",
+                        seed=args.seed, samples_seen=samples_seen,
+                    )
+                scalars = report_step(
+                    run, step, samples_seen, epoch,
+                    logits[test_idx], eval_l[test_idx],
+                    logits[val_idx], eval_l[val_idx],
+                )
+                print(
+                    f"[probe] step {step} (epoch {epoch}, {samples_seen} samples): "
+                    + " ".join(f"{k}={v:.4f}" for k, v in scalars.items())
+                )
+
+        # OOD dump: final point only. Fig 2 is a converged-endpoint figure.
+        if args.ood_dataset:
+            ood_f, ood_l = load_cached_features(
+                args.cache_dir, args.model, args.ood_dataset, img_size,
+                eval_split_name(args.ood_dataset), hf_repo=hf_repo,
             )
-        scalars = metrics.classification_metrics(logits[test_idx], eval_l[test_idx])
-        print(f"[probe] epoch {epoch}: " + " ".join(f"{k}={v:.4f}" for k, v in scalars.items()))
-
-    # OOD dump: final point only. Fig 2 is a converged-endpoint figure.
-    if args.ood_dataset:
-        ood_f, ood_l = load_cached_features(
-            args.cache_dir, args.model, args.ood_dataset, img_size,
-            eval_split_name(args.ood_dataset), hf_repo=hf_repo,
-        )
-        ood_logits = _logits_for(head, loss_fn, ood_f, ood_l)
-        evaldump.write_dump(
-            args.dump_root, args.group_id, args.uid, args.epochs,
-            ood_logits, ood_l,
-            arm=args.arm, split="ood", logit_kind="softmax_logits",
-            seed=args.seed, samples_seen=args.epochs * len(train_f),
-        )
-        print(f"[probe] wrote OOD dump for {args.ood_dataset} ({len(ood_f)} samples)")
+            ood_logits = _logits_for(head, loss_fn, ood_f, ood_l)
+            evaldump.write_dump(
+                args.dump_root, args.group_id, args.uid, total_steps,
+                ood_logits, ood_l,
+                arm=args.arm, split="ood", logit_kind="softmax_logits",
+                seed=args.seed, samples_seen=total_steps * args.batch_size,
+            )
+            print(f"[probe] wrote OOD dump for {args.ood_dataset} ({len(ood_f)} samples)")
 
 
 def build_argparser():
@@ -161,6 +198,9 @@ def build_argparser():
     p.add_argument("--label-smooth", type=float, default=0.0)
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=137)
+    p.add_argument("--enable-mlflow", action="store_true")
+    p.add_argument("--mlflow-experiment", default=None)
+    p.add_argument("--mlflow-tracking-uri", default=None)
     return p
 
 

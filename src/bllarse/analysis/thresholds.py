@@ -94,3 +94,62 @@ def crossings_per_seed(
     averaging first would let one fast seed manufacture an early crossing that no
     individual run achieved."""
     return {seed: first_crossing(curve, targets) for seed, curve in curves_by_seed.items()}
+
+
+@dataclass(frozen=True)
+class StoppingPoint:
+    step: int
+    samples_seen: int
+    criterion: str
+    value: float
+    row: Mapping[str, Any]
+    at_last_step: bool
+
+
+def early_stop(curve: Curve, criterion: str = "val_nll") -> StoppingPoint:
+    """The dumped point that minimises `criterion` on the held-out val split.
+
+    Early stopping is applied POST HOC rather than during training. The dumps
+    hold the whole trajectory, so the stopping rule is a function of the curve,
+    not of the run: it can be changed, or swapped for a different criterion,
+    without re-running a single job, and -- more importantly -- the identical
+    rule is provably applied to every arm, which a per-arm patience heuristic
+    inside each training script could not guarantee.
+
+    Selection is on val, reporting is on test, and the two are disjoint by
+    construction (bllarse.splits), so this does not leak.
+
+    `at_last_step` flags a minimum at the final dumped point: the curve was
+    still improving when the budget ran out, so this is a truncation rather
+    than a converged optimum, and the run is not evidence about where the
+    optimum is.
+    """
+    if not curve:
+        raise ValueError("curve is empty; nothing to select")
+    missing = [row["step"] for row in curve if criterion not in row]
+    if missing:
+        raise ValueError(
+            f"criterion {criterion!r} is absent from {len(missing)} of "
+            f"{len(curve)} rows (first at step {missing[0]}). run_curve only "
+            f"emits val_* metrics when a val dump exists at that step."
+        )
+
+    ordered = sorted(curve, key=lambda row: row["step"])
+    best = min(ordered, key=lambda row: row[criterion])
+    return StoppingPoint(
+        step=best["step"],
+        samples_seen=best["samples_seen"],
+        criterion=criterion,
+        value=best[criterion],
+        row=best,
+        at_last_step=best["step"] == ordered[-1]["step"],
+    )
+
+
+def early_stop_per_seed(
+    curves: Mapping[int, Curve], criterion: str = "val_nll"
+) -> dict[int, StoppingPoint]:
+    """`early_stop` per seed. Stopping is per run, exactly as it would have been
+    live -- taking it on the seed-mean curve would understate the variance the
+    error bars are supposed to show."""
+    return {seed: early_stop(curve, criterion) for seed, curve in curves.items()}

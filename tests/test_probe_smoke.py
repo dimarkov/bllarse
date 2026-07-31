@@ -136,3 +136,62 @@ def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
     ])
     with pytest.raises(ValueError, match="batch_size"):
         probe.main(args)
+
+
+def _run(fake_features, tmp_path, uid, *, epochs, batch_size, n_dumps):
+    import probe
+
+    args = probe.build_argparser().parse_args([
+        "--arm", "adamw_ce", "--model", "dinov3_small", "--dataset", "fake",
+        "--num-classes", "2", "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "sched", "--uid", uid,
+        "--epochs", str(epochs), "--n-dumps", str(n_dumps),
+        "--batch-size", str(batch_size), "--seed", "137", "--no-hf-cache",
+    ])
+    probe.main(args)
+    return [r for r in evaldump.iter_dumps(tmp_path / "dumps", "sched", uid)
+            if r.meta["split"] == "test"]
+
+
+def test_dumps_are_indexed_on_optimiser_steps_not_epochs(fake_features, tmp_path):
+    """The schedule used to run over epochs, so on ImageNet the first dump
+    landed 1.28M samples in -- past the entire early regime the
+    sample-efficiency claim is about. Steps put the first dump at one batch."""
+    # 600 rows / 100 = 6 steps per epoch, 10 epochs = 60 steps.
+    records = _run(fake_features, tmp_path, "steps", epochs=10, batch_size=100, n_dumps=8)
+    steps = sorted(r.meta["step"] for r in records)
+
+    assert steps[0] == 1, "first dump must be after a single optimiser step"
+    assert steps[-1] == 60, "last dump must be the final step, not the final epoch"
+    # If this were still epoch-indexed every step would be a multiple of 6.
+    assert any(step % 6 != 0 for step in steps), f"no mid-epoch dump in {steps}"
+
+
+def test_samples_seen_is_exact(fake_features, tmp_path):
+    """Drop-remainder means every step is exactly batch_size samples. The old
+    epoch * len(train_f) overcounted by the dropped tail -- 2.6% on
+    oxford_pets -- which biased the compute axis the figures are plotted on."""
+    records = _run(fake_features, tmp_path, "exact", epochs=10, batch_size=100, n_dumps=8)
+    for record in records:
+        assert record.meta["samples_seen"] == record.meta["step"] * 100
+
+
+def test_the_samples_axis_is_comparable_across_batch_sizes(fake_features, tmp_path):
+    """The reason the schedule moved to samples: two runs with different batch
+    sizes must be placeable on one x-axis. Same sample budget, different batch
+    size -> same final samples_seen, different step counts."""
+    coarse = _run(fake_features, tmp_path, "bs100", epochs=10, batch_size=100, n_dumps=8)
+    fine = _run(fake_features, tmp_path, "bs50", epochs=10, batch_size=50, n_dumps=8)
+
+    coarse_final = max(r.meta["samples_seen"] for r in coarse)
+    fine_final = max(r.meta["samples_seen"] for r in fine)
+    assert coarse_final == 6000   # 10 epochs x 6 steps x 100
+    assert fine_final == 6000     # 10 epochs x 12 steps x 50
+    assert coarse_final == fine_final
+
+    # Same sample budget, genuinely different step grids -- so `step` is NOT
+    # comparable across the two and `samples_seen` is, which is the point.
+    assert max(r.meta["step"] for r in coarse) == 60
+    assert max(r.meta["step"] for r in fine) == 120

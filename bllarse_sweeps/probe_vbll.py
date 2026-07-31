@@ -22,6 +22,8 @@ DATASETS = {
 SEEDS = list(range(137, 147))
 
 BASE = dict(
+    enable_mlflow=True,
+    mlflow_experiment="bllarse-probing",
     epochs=40,
     n_dumps=40,
     batch_size=512,

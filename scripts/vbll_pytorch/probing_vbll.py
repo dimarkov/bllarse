@@ -18,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from bllarse import evaldump, splits
 from bllarse.features import eval_split_name, load_cached_features
+from bllarse.mlflow_utils import child_run
+from bllarse.reporting import report_step
 from vbll_experiments.models import build_vbll_head
 
 
@@ -78,58 +80,85 @@ def main(args):
 
     x_train = torch.from_numpy(train_f).float()
     y_train = torch.from_numpy(train_l).long()
-    schedule = set(evaldump.dump_schedule(args.epochs, n_dumps=args.n_dumps).tolist())
-    print(f"[vbll] {args.uid}: {args.epochs} epochs, dumping at {sorted(schedule)}")
 
-    for epoch in range(1, args.epochs + 1):
-        head.train()
-        perm = torch.randperm(len(x_train))
-        n_batches = len(x_train) // args.batch_size
-        if n_batches == 0:
-            # Silently clamping to one batch would dump a plausible-looking
-            # but untrained head -- its accuracy/NLL/Brier would be
-            # indistinguishable from a real result after the fact. Fail
-            # loudly instead.
-            raise ValueError(
-                f"--batch-size {args.batch_size} exceeds len(x_train)="
-                f"{len(x_train)}; this would train zero gradient steps per "
-                f"epoch. Lower --batch-size or provide more training data."
+    n_batches = len(x_train) // args.batch_size
+    if n_batches == 0:
+        # Silently clamping to one batch would dump a plausible-looking but
+        # untrained head -- its accuracy/NLL/Brier would be indistinguishable
+        # from a real result after the fact. Fail loudly instead.
+        raise ValueError(
+            f"--batch-size {args.batch_size} exceeds len(x_train)="
+            f"{len(x_train)}; this would train zero gradient steps per epoch. "
+            f"Lower --batch-size or provide more training data."
+        )
+    total_steps = args.epochs * n_batches
+    schedule = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
+    print(
+        f"[vbll] {args.uid}: {args.epochs} epochs x {n_batches} steps "
+        f"= {total_steps} steps ({total_steps * args.batch_size} samples), "
+        f"{len(schedule)} dumps"
+    )
+
+    with child_run(vars(args), run_name=args.uid, tags={
+        "arm": "vbll", "group_id": args.group_id, "uid": args.uid,
+        "dump_dir": str(Path(args.dump_root) / args.group_id / args.uid),
+    }) as run:
+        run.log_params({"steps_per_epoch": n_batches, "total_steps": total_steps})
+
+        step = 0
+        for epoch in range(1, args.epochs + 1):
+            head.train()
+            perm = torch.randperm(len(x_train))
+            for i in range(n_batches):
+                idx = perm[i * args.batch_size:(i + 1) * args.batch_size]
+                xb, yb = x_train[idx].to(device), y_train[idx].to(device)
+                optimizer.zero_grad()
+                head(xb).train_loss_fn(yb).backward()
+                optimizer.step()
+
+                step += 1
+                if step not in schedule:
+                    continue
+
+                # Exact: drop-remainder means every step is exactly batch_size.
+                samples_seen = step * args.batch_size
+                logits, score = _forward(head, eval_f, device)
+                # _forward leaves the head in eval mode. Evaluating mid-epoch
+                # rather than at the epoch boundary means the remaining steps
+                # of this epoch would otherwise train in eval mode.
+                head.train()
+                for split_name, sp_idx in (("val", val_idx), ("test", test_idx)):
+                    evaldump.write_dump(
+                        args.dump_root, args.group_id, args.uid, step,
+                        logits[sp_idx], eval_l[sp_idx],
+                        arm="vbll", split=split_name, logit_kind="softmax_logits",
+                        seed=args.seed, samples_seen=samples_seen,
+                        score=score[sp_idx], score_kind="predictive_variance",
+                    )
+                scalars = report_step(
+                    run, step, samples_seen, epoch,
+                    logits[test_idx], eval_l[test_idx],
+                    logits[val_idx], eval_l[val_idx],
+                )
+                print(
+                    f"[vbll] step {step} (epoch {epoch}, {samples_seen} samples): "
+                    + " ".join(f"{k}={v:.4f}" for k, v in scalars.items())
+                )
+
+        if args.ood_dataset:
+            ood_f, ood_l = load_cached_features(
+                args.cache_dir, args.model, args.ood_dataset, args.img_size,
+                eval_split_name(args.ood_dataset), hf_repo=hf_repo,
             )
-        for i in range(n_batches):
-            idx = perm[i * args.batch_size:(i + 1) * args.batch_size]
-            xb, yb = x_train[idx].to(device), y_train[idx].to(device)
-            optimizer.zero_grad()
-            head(xb).train_loss_fn(yb).backward()
-            optimizer.step()
-
-        if epoch not in schedule:
-            continue
-
-        logits, score = _forward(head, eval_f, device)
-        for split_name, idx in (("val", val_idx), ("test", test_idx)):
+            ood_logits, ood_score = _forward(head, ood_f, device)
             evaldump.write_dump(
-                args.dump_root, args.group_id, args.uid, epoch,
-                logits[idx], eval_l[idx],
-                arm="vbll", split=split_name, logit_kind="softmax_logits",
-                seed=args.seed, samples_seen=epoch * len(train_f),
-                score=score[idx], score_kind="predictive_variance",
+                args.dump_root, args.group_id, args.uid, total_steps,
+                ood_logits, ood_l,
+                arm="vbll", split="ood", logit_kind="softmax_logits",
+                seed=args.seed, samples_seen=total_steps * args.batch_size,
+                score=ood_score, score_kind="predictive_variance",
             )
-        print(f"[vbll] epoch {epoch}: dumped {len(val_idx)} val / {len(test_idx)} test")
-
-    if args.ood_dataset:
-        ood_f, ood_l = load_cached_features(
-            args.cache_dir, args.model, args.ood_dataset, args.img_size,
-            eval_split_name(args.ood_dataset), hf_repo=hf_repo,
-        )
-        ood_logits, ood_score = _forward(head, ood_f, device)
-        evaldump.write_dump(
-            args.dump_root, args.group_id, args.uid, args.epochs,
-            ood_logits, ood_l,
-            arm="vbll", split="ood", logit_kind="softmax_logits",
-            seed=args.seed, samples_seen=args.epochs * len(train_f),
-            score=ood_score, score_kind="predictive_variance",
-        )
-        print(f"[vbll] wrote OOD dump for {args.ood_dataset} ({len(ood_f)} samples)")
+            print(f"[vbll] wrote OOD dump for {args.ood_dataset} ({len(ood_f)} samples)")
 
 
 def build_argparser():
@@ -166,6 +195,9 @@ def build_argparser():
     )
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=137)
+    p.add_argument("--enable-mlflow", action="store_true")
+    p.add_argument("--mlflow-experiment", default=None)
+    p.add_argument("--mlflow-tracking-uri", default=None)
     return p
 
 

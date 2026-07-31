@@ -56,19 +56,21 @@ def test_fig2_sweeps_pair_each_id_dataset_with_an_ood_dataset(path):
         assert c["ood_dataset"] != c["dataset"]
 
 
-def test_probe_smoke_does_not_claim_or_enable_mlflow():
-    """probe_smoke.py's docstring used to claim it exercises "MLflow
-    nesting", but neither scripts/alternatives/probe.py nor
-    scripts/vbll_pytorch/probing_vbll.py reference MLflow, and
-    run_config._config_uses_mlflow only fires when a config sets
-    enable_mlflow=True -- which none of probe_smoke's configs do. Guard both
-    facts: the docstring must not repeat the stale claim, and no config here
-    may silently start requesting a gate that was never wired through."""
-    mod = get_module_from_source_path("bllarse_sweeps/probe_smoke.py")
-    doc = (mod.__doc__ or "").lower()
-    # The exact stale claim this docstring used to make. Mentioning MLflow to
-    # explain why it is NOT exercised is fine (and present); claiming it IS
-    # exercised, as part of an "Exercises: ..." list, is the regression.
-    assert "exercises: apptainer launch, mlflow nesting" not in doc
-    for c in mod.create_configs():
-        assert not c.get("enable_mlflow", False)
+def test_every_probe_sweep_enables_mlflow():
+    """Inverted from its original form. This test used to assert probe_smoke did
+    NOT enable MLflow, because neither arm referenced it -- true until both arms
+    grew a child_run and every sweep was switched on. It stays as the guard on
+    the other direction: a sweep that quietly loses enable_mlflow would run
+    ~720 unattended array tasks whose only signal is dump-file presence.
+
+    probe_smoke keeps it too, so the cluster smoke test exercises the MLflow
+    path (including cross-process parent attachment) before the real sweeps do.
+    """
+    for name in ("probe_smoke", "probe_adamw_ce", "probe_vbll",
+                 "probe_ood_adamw_ce", "probe_ood_vbll"):
+        mod = get_module_from_source_path(f"bllarse_sweeps/{name}.py")
+        configs = mod.create_configs()
+        assert configs, name
+        for config in configs:
+            assert config.get("enable_mlflow") is True, f"{name}: {config.get('uid')}"
+            assert config.get("mlflow_experiment"), f"{name}: no experiment name"

@@ -21,6 +21,8 @@ PAIRS = [
 SEEDS = list(range(137, 147))
 
 BASE = dict(
+    enable_mlflow=True,
+    mlflow_experiment="bllarse-probing",
     arm="adamw_ce",
     epochs=40,
     n_dumps=40,

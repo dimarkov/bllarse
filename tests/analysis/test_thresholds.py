@@ -84,3 +84,69 @@ def test_crossing_carries_samples_seen_not_just_step():
     result = thresholds.first_crossing(curve, targets)
     assert result.step == 4
     assert result.samples_seen == 400  # samples_seen = step * 100, per _curve
+
+
+def _val_curve(rows):
+    """(step, val_nll) -> rows carrying the keys early_stop needs."""
+    return [dict(step=s, samples_seen=s * 100, val_nll=v) for s, v in rows]
+
+
+def test_early_stop_picks_the_val_nll_minimum_not_the_endpoint():
+    """The whole point: an overfitting run's best checkpoint is interior, and
+    reporting the endpoint would understate it."""
+    curve = _val_curve([(1, 2.0), (10, 0.8), (100, 0.5), (1000, 0.9), (2000, 1.4)])
+    sp = thresholds.early_stop(curve)
+    assert sp.step == 100
+    assert sp.samples_seen == 10_000
+    assert sp.value == pytest.approx(0.5)
+    assert sp.at_last_step is False
+
+
+def test_early_stop_flags_a_minimum_at_the_last_dumped_point():
+    """Monotone-decreasing val NLL means the budget ran out before the optimum.
+    Measured for real: a dinov3_small probe on oxford_pets was still improving
+    at 300 epochs. Reporting that as 'the early-stopping point' without the flag
+    would misrepresent a truncation as a converged choice."""
+    curve = _val_curve([(1, 3.0), (10, 2.0), (100, 1.0), (1000, 0.4)])
+    sp = thresholds.early_stop(curve)
+    assert sp.step == 1000
+    assert sp.at_last_step is True
+
+
+def test_early_stop_selects_on_val_but_the_row_carries_test_metrics():
+    curve = [
+        dict(step=1, samples_seen=100, val_nll=1.0, acc=0.50, nll=1.1),
+        dict(step=2, samples_seen=200, val_nll=0.4, acc=0.80, nll=0.5),
+        dict(step=3, samples_seen=300, val_nll=0.7, acc=0.79, nll=0.8),
+    ]
+    sp = thresholds.early_stop(curve)
+    assert sp.step == 2
+    assert sp.row["acc"] == pytest.approx(0.80)
+
+
+def test_early_stop_rejects_a_curve_without_the_criterion():
+    """run_curve omits val_* when no val dump exists at a step. Silently
+    falling back to the endpoint would be indistinguishable from a real
+    selection after the fact."""
+    curve = [dict(step=1, samples_seen=100, acc=0.5)]
+    with pytest.raises(ValueError, match="absent from 1 of 1 rows"):
+        thresholds.early_stop(curve)
+
+
+def test_early_stop_accepts_an_alternative_criterion():
+    curve = [
+        dict(step=1, samples_seen=100, val_nll=0.4, val_brier=0.9),
+        dict(step=2, samples_seen=200, val_nll=0.9, val_brier=0.2),
+    ]
+    assert thresholds.early_stop(curve, "val_nll").step == 1
+    assert thresholds.early_stop(curve, "val_brier").step == 2
+
+
+def test_early_stop_per_seed_is_per_run_not_on_the_mean_curve():
+    curves = {
+        137: _val_curve([(1, 2.0), (10, 0.5), (100, 0.9)]),
+        138: _val_curve([(1, 2.0), (10, 1.2), (100, 0.3)]),
+    }
+    stops = thresholds.early_stop_per_seed(curves)
+    assert stops[137].step == 10
+    assert stops[138].step == 100

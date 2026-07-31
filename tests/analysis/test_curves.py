@@ -131,3 +131,41 @@ def test_run_curve_rejects_a_logit_kind_it_cannot_metricise(tmp_path):
     )
     with pytest.raises(ValueError, match="moderated_score"):
         curves.run_curve(tmp_path, "g", "u8")
+
+
+def test_run_curve_emits_val_metrics_for_post_hoc_stopping(tmp_path):
+    """early_stop takes an argmin over val_nll, so the curve has to carry it."""
+    _write_run(tmp_path, "r", [1, 2, 4])
+    rows = curves.run_curve(tmp_path, "g", "r")
+    for row in rows:
+        for key in ("val_acc", "val_ece", "val_nll", "val_brier"):
+            assert key in row, key
+        # Distinct splits, so the two sides must not be the same numbers.
+        assert row["val_nll"] != row["nll"]
+
+
+def test_val_metrics_are_scaled_by_the_same_temperature_as_test(tmp_path):
+    """A val curve left unscaled while test is scaled would make the stopping
+    criterion and the reported metric disagree about what run they describe."""
+    _write_run(tmp_path, "r", [1, 2, 4])
+    raw = curves.run_curve(tmp_path, "g", "r", temperature_scaled=False)
+    ts = curves.run_curve(tmp_path, "g", "r", temperature_scaled=True)
+    for raw_row, ts_row in zip(raw, ts):
+        assert ts_row["temperature"] != pytest.approx(1.0)
+        # T is fit on val, so val NLL under that T is the minimum attainable.
+        assert ts_row["val_nll"] <= raw_row["val_nll"] + 1e-6
+
+
+def test_run_curve_omits_val_metrics_when_no_val_dump_exists(tmp_path):
+    """Rather than inventing them -- early_stop then raises, which is the
+    intended loud failure."""
+    rng = np.random.default_rng(0)
+    logits = rng.normal(size=(200, 5)).astype(np.float32)
+    labels = rng.integers(0, 5, size=200)
+    evaldump.write_dump(
+        tmp_path, "g", "testonly", 1, logits, labels,
+        arm="adamw_ce", split="test", logit_kind="softmax_logits",
+        seed=137, samples_seen=512,
+    )
+    row = curves.run_curve(tmp_path, "g", "testonly")[0]
+    assert "val_nll" not in row

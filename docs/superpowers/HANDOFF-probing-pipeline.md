@@ -26,31 +26,50 @@ At the configured `batch_size=512, epochs=40`, total gradient steps per dataset:
 | food101 | 75,750 | 147 | 5,880 |
 | imagenet1k | 1,281,167 | 2,502 | 100,080 |
 
-A 357× spread across panels of one figure. For calibration, a VBLL head needed
-~600 steps to reach 0.944 on cached CIFAR-10 features in a direct measurement,
-so the two smallest datasets are plausibly under-trained.
+A 357× spread across panels of one figure. **Now measured, and worse than
+"plausibly under-trained":** a `dinov3_small` probe on oxford_pets, run to 300
+epochs (2,100 steps) with the sweep's own hyperparameters, was *still improving
+monotonically at the last step* — val NLL never turned up, so there is no
+overfitting to stop early:
 
-Options: keep fixed epochs; switch to a fixed gradient-step budget; or early-stop
-on the pinned val split. The third is probably right — Fig 1 is a
-converged-endpoint comparison and the sample-efficiency claim lives in Fig 5 —
-and `ood_evaluation.train_ce_head` already has patience-based early stopping to
-model on. It changes `scripts/alternatives/probe.py`, so it is your call.
+| point | test acc | test NLL | val NLL |
+|---|---:|---:|---:|
+| step 295 (≈ the configured 40-epoch budget) | 0.7865 | 0.6923 | 0.6025 |
+| step 2,100 (300 epochs) | 0.8692 | 0.4431 | 0.3574 |
 
-The table is reproduced as a comment in `bllarse_sweeps/probe_adamw_ce.py`.
+**The configured budget costs 8.3 accuracy points on oxford_pets alone**, and
+that is a floor — the curve had not converged at 300 epochs either.
 
-### 2. There is no experiment tracking
+So the fix is not early stopping (nothing overfits within any budget tried);
+it is that 40 epochs is simply too few for the small datasets. Options, in
+increasing cost: raise `epochs` per dataset so every panel converges; switch to
+a fixed gradient-step budget large enough for the smallest dataset; or raise the
+learning rate for the small panels. The stopping machinery is now in place
+either way (`analysis.thresholds.early_stop`), and it will flag any run that
+truncates — `at_last_step=True` is exactly the signal above.
 
-Verified: `grep -c mlflow` returns 0 for both `scripts/alternatives/probe.py` and
-`scripts/vbll_pytorch/probing_vbll.py`; no production sweep sets
-`enable_mlflow`; `run_sweep.py`'s parent-run machinery keys off that flag and is
-therefore dormant.
+Still your call, because it changes the sweep grid and therefore the cost.
 
-Spec §0b.1 ("Storage") calls for MLflow to receive the dump path plus scalar
-metrics. This is a gap between spec and plan, not a defect in any task.
+### 2. ~~There is no experiment tracking~~ — done
 
-Figures are unaffected — every number comes from dumps. Job observability is
-not: across ~720 array tasks the only signal is SLURM logs and dump-file
-presence. Decide before Phase 1a.
+Both arms open a nested MLflow run per config (`bllarse.mlflow_utils.child_run`),
+all five sweeps set `enable_mlflow=True`, and the experiment is
+`bllarse-probing`. Verified against a real sqlite-backed tracking server:
+
+- params: the full config plus `steps_per_epoch` / `total_steps`
+- tags: `arm`, `group_id`, `uid`, and **`dump_dir`** — spec §0b.1's requirement
+  that MLflow carry the dump path
+- metrics per dumped step: `test_{acc,ece,nll,brier}`, `val_{...}`,
+  `temperature`, `test_ts_{...}`, plus `samples_seen` and `epoch` as metrics so
+  MLflow can plot against the sample axis directly
+- cross-process nesting confirmed: the parent is created by `run_sweep.py` in
+  the submitting process, so children attach via an explicit
+  `mlflow.parentRunId` tag rather than `start_run(nested=True)`, which cannot
+  work across array tasks. A child run was queried back by parent id.
+
+Tracking failures degrade to untracked rather than killing the job — which is
+not hypothetical: MLflow now **raises** on a `file://` store ("maintenance
+mode"), and that was caught by the fallback during testing, not by a test.
 
 ### 3. Two backbones have no cached features at all
 
@@ -174,8 +193,10 @@ plus `progress.md`. Safe to delete once read.
 | `bllarse.splits` | pinned val/test partitions, derived from dataset name alone |
 | `bllarse.evaldump` | fp16 dump writer/reader, log-spaced schedule |
 | `bllarse.features` | framework-free cached-feature loader, used by both arms |
-| `bllarse.analysis.thresholds` | joint acc/NLL/Brier threshold protocol |
-| `bllarse.analysis.curves` | dumps → metric curves, with per-dump-point TS refit |
+| `bllarse.analysis.thresholds` | joint acc/NLL/Brier threshold protocol, **post-hoc early stopping** |
+| `bllarse.analysis.curves` | dumps → metric curves (test **and val**), with per-dump-point TS refit |
+| `bllarse.reporting` | per-step scalars, shared by both arms so neither has its own metric code |
+| `bllarse.mlflow_utils.child_run` | nested per-config MLflow run; no-op when off or unreachable |
 | `scripts/alternatives/probe.py` | JAX probing arm |
 | `scripts/vbll_pytorch/probing_vbll.py` | PyTorch VBLL probing arm |
 | `bllarse_sweeps/probe_*.py` | 720 configs across four sweeps |
@@ -196,6 +217,8 @@ was found and removed.
 | Fig 1 ladder is small/big/large/huge; `dinov3_max` out | §5.2 | resolved |
 | TS refit at every dumped step rather than once at convergence | §0.2 | refinement; needs a caption note |
 | Max-logit demoted to an AdamW-side extra | §1 Fig 2 | deviation |
+| Dumps indexed on **optimiser steps**, not epochs; `samples_seen` exact and logged as the comparison axis | §0.2 | refinement |
+| Early stopping applied **post hoc** from val NLL over the dumped grid, never live | §0.4 | deviation; needs a methods sentence |
 
 ---
 
@@ -204,9 +227,16 @@ was found and removed.
 - **`crossings_per_seed` has no production caller.** Exercised by hand on real
   smoke dumps (above), so the interface is confirmed; what is still missing is
   a committed figure-building script that walks a whole sweep. Future work.
-- **`samples_seen` overcounts** by the dropped remainder batch — 2.6% on
-  oxford_pets, 0.06% on imagenet1k. Symmetric across arms, so no comparison
-  bias, but the compute axis is not exactly comparable across panels.
+- **Dump storage is 332 GiB** across the four production sweeps at
+  `n_dumps=40`, computed from the real eval-set sizes: 162 GiB per Fig 1 sweep
+  (ImageNet alone is 3.7 GiB per run × 80 runs) and 3.8 GiB per Fig 2 sweep.
+  Budget `$SCRATCH` accordingly. Raising `n_dumps` scales this linearly —
+  per-*step* dumping was considered and is not affordable (ImageNet would be
+  ~9 TB per run).
+- **Log spacing puts the coarsest resolution late**, which is where a val-NLL
+  minimum would sit. Consecutive late points differ by ~13% of the budget at
+  `n_dumps=40`. Acceptable because the curve is flat near a minimum, but it
+  bounds how precisely `early_stop` can locate one.
 - **`segmentation.py` and `sample_efficiency.py` are broken** by a stale equimo
   import, inherited from the extracted code. Off the probing path.
 - **Both images pin `mlpox` and `blrax` to `@main`**, a floating ref, while the
