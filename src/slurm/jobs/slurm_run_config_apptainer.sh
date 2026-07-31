@@ -45,19 +45,32 @@ if [[ -n "${BLLARSE_EVAL_DUMP_ROOT:-}" ]]; then
   bind_args+=(--bind "$BLLARSE_EVAL_DUMP_ROOT:$BLLARSE_EVAL_DUMP_ROOT")
 fi
 
+# Only forward variables that are actually set. `--env VAR=` (an explicit
+# empty value) is NOT the same as omitting VAR: os.environ.get("VAR", default)
+# returns '' rather than falling back to `default`, so an unset-but-passed
+# BLLARSE_EVAL_DUMP_ROOT silently redirects every dump into the repo root
+# (outside the eval_dumps/ .gitignore entry), an unset-but-passed HF_HOME
+# makes every task re-resolve and re-download its cache, and an
+# unset-but-passed HF_TOKEN sends an empty Authorization header. Each `[[ ]]`
+# check below is a no-op (not an error) under `set -e` when it evaluates
+# false, so this is safe under `set -euo pipefail`.
+env_args=(
+  --env "BLLARSE_REPO_ROOT=$BLLARSE_REPO_ROOT"
+  --env "BLLARSE_SWEEP_SOURCE=$BLLARSE_SWEEP_SOURCE"
+  --env "CONFIG_IDX=$CONFIG_IDX"
+  --env "PYTHONPATH=${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+)
+[[ -n "${HF_TOKEN:-}" ]] && env_args+=(--env "HF_TOKEN=$HF_TOKEN")
+[[ -n "${HF_HOME:-}" ]] && env_args+=(--env "HF_HOME=$HF_HOME")
+[[ -n "${BLLARSE_EVAL_DUMP_ROOT:-}" ]] && env_args+=(--env "BLLARSE_EVAL_DUMP_ROOT=$BLLARSE_EVAL_DUMP_ROOT")
+[[ -n "${MLFLOW_TRACKING_URI:-}" ]] && env_args+=(--env "MLFLOW_TRACKING_URI=$MLFLOW_TRACKING_URI")
+[[ -n "${MLFLOW_TRACKING_USERNAME:-}" ]] && env_args+=(--env "MLFLOW_TRACKING_USERNAME=$MLFLOW_TRACKING_USERNAME")
+[[ -n "${MLFLOW_TRACKING_PASSWORD:-}" ]] && env_args+=(--env "MLFLOW_TRACKING_PASSWORD=$MLFLOW_TRACKING_PASSWORD")
+[[ -n "${MLFLOW_PARENT_RUN_ID:-}" ]] && env_args+=(--env "MLFLOW_PARENT_RUN_ID=$MLFLOW_PARENT_RUN_ID")
+[[ -n "${MLFLOW_EXPERIMENT_NAME:-}" ]] && env_args+=(--env "MLFLOW_EXPERIMENT_NAME=$MLFLOW_EXPERIMENT_NAME")
+
 exec apptainer exec --nv \
-  --env "BLLARSE_REPO_ROOT=$BLLARSE_REPO_ROOT" \
-  --env "BLLARSE_SWEEP_SOURCE=$BLLARSE_SWEEP_SOURCE" \
-  --env "CONFIG_IDX=$CONFIG_IDX" \
-  --env "PYTHONPATH=${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}" \
-  --env "HF_TOKEN=${HF_TOKEN:-}" \
-  --env "HF_HOME=${HF_HOME:-}" \
-  --env "BLLARSE_EVAL_DUMP_ROOT=${BLLARSE_EVAL_DUMP_ROOT:-}" \
-  --env "MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI:-}" \
-  --env "MLFLOW_TRACKING_USERNAME=${MLFLOW_TRACKING_USERNAME:-}" \
-  --env "MLFLOW_TRACKING_PASSWORD=${MLFLOW_TRACKING_PASSWORD:-}" \
-  --env "MLFLOW_PARENT_RUN_ID=${MLFLOW_PARENT_RUN_ID:-}" \
-  --env "MLFLOW_EXPERIMENT_NAME=${MLFLOW_EXPERIMENT_NAME:-}" \
+  "${env_args[@]}" \
   "${bind_args[@]}" \
   "$sif" \
   python -m bllarse.tools.run_config "$BLLARSE_SWEEP_SOURCE" "$CONFIG_IDX"
