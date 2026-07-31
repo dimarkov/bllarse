@@ -1,7 +1,12 @@
 """One config per arm and per figure, for shaking out the cluster path.
 
-Not a results sweep. Exercises: Apptainer launch, MLflow nesting, dump paths,
-and both the Fig 1 (no OOD) and Fig 2 (with OOD) code paths.
+Not a results sweep. Exercises: Apptainer launch, dump paths, and both the
+Fig 1 (no OOD) and Fig 2 (with OOD) code paths, for both the JAX (adamw_ce)
+and VBLL (PyTorch) arms. Does NOT exercise MLflow nesting: neither
+scripts/alternatives/probe.py nor scripts/vbll_pytorch/probing_vbll.py
+reference MLflow, and none of the configs below set `enable_mlflow`, so
+run_config's MLflow-nesting gate (bllarse.tools.run_config._config_uses_mlflow)
+never fires for this sweep.
 """
 
 from bllarse.tools.adapters import run_script_from_config

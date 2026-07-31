@@ -54,3 +54,21 @@ def test_fig2_sweeps_pair_each_id_dataset_with_an_ood_dataset(path):
     for c in get_module_from_source_path(path).create_configs():
         assert c["ood_dataset"] in {"svhn", "cifar100"}
         assert c["ood_dataset"] != c["dataset"]
+
+
+def test_probe_smoke_does_not_claim_or_enable_mlflow():
+    """probe_smoke.py's docstring used to claim it exercises "MLflow
+    nesting", but neither scripts/alternatives/probe.py nor
+    scripts/vbll_pytorch/probing_vbll.py reference MLflow, and
+    run_config._config_uses_mlflow only fires when a config sets
+    enable_mlflow=True -- which none of probe_smoke's configs do. Guard both
+    facts: the docstring must not repeat the stale claim, and no config here
+    may silently start requesting a gate that was never wired through."""
+    mod = get_module_from_source_path("bllarse_sweeps/probe_smoke.py")
+    doc = (mod.__doc__ or "").lower()
+    # The exact stale claim this docstring used to make. Mentioning MLflow to
+    # explain why it is NOT exercised is fine (and present); claiming it IS
+    # exercised, as part of an "Exercises: ..." list, is the regression.
+    assert "exercises: apptainer launch, mlflow nesting" not in doc
+    for c in mod.create_configs():
+        assert not c.get("enable_mlflow", False)
