@@ -994,6 +994,20 @@ def test_labels_and_logits_must_agree_in_length(tmp_path):
         )
 
 
+def test_writes_at_the_same_step_do_not_clobber_each_other(tmp_path):
+    """A run writes val and test at every scheduled step, and ood at the last.
+    Keying the filename on step alone collapsed all three into one file."""
+    for split in ("val", "test", "ood"):
+        evaldump.write_dump(
+            tmp_path, "grp", "uid_splits", step=7,
+            logits=np.zeros((4, 2)), labels=np.zeros(4, dtype=int),
+            arm="adamw_ce", split=split, logit_kind="softmax_logits",
+            seed=1, samples_seen=64,
+        )
+    got = sorted(r.meta["split"] for r in evaldump.iter_dumps(tmp_path, "grp", "uid_splits"))
+    assert got == ["ood", "test", "val"], f"writes clobbered each other: {got}"
+
+
 def test_iter_dumps_returns_steps_in_order(tmp_path):
     for step in (13, 1, 5):
         evaldump.write_dump(
@@ -1149,7 +1163,10 @@ def write_dump(
 
     directory = dump_dir(root, group_id, uid)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"step_{int(step):07d}.npz"
+    # The split MUST be in the filename. A run writes val and test at the same
+    # step (and ood at the final one); keying on step alone silently collapses
+    # them to whichever was written last.
+    path = directory / f"step_{int(step):07d}_{split}.npz"
     np.savez_compressed(path, **payload)
     return path
 
@@ -1177,7 +1194,7 @@ def iter_dumps(root, group_id: str, uid: str) -> Iterator[DumpRecord]:
 uv run pytest tests/test_evaldump.py -v
 ```
 
-Expected: 15 passed (the invariants are parametrised over eight size pairs).
+Expected: 16 passed (the invariants are parametrised over eight size pairs).
 
 - [ ] **Step 5: Commit**
 
@@ -1927,7 +1944,9 @@ def test_probe_writes_dumps_and_learns(fake_features, tmp_path):
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "smoke",
         "--uid", "smoke_0",
-        "--epochs", "8",
+        # 600 train rows at --batch-size 512 is ONE gradient step per epoch, so
+        # epochs here are Adam steps, not passes. 8 would be 8 steps.
+        "--epochs", "1000",
         "--n-dumps", "5",
         "--seed", "137",
         "--no-hf-cache",

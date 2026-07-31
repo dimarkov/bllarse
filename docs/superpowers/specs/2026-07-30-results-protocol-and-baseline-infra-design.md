@@ -105,7 +105,7 @@ records which, as a metadata field, so no post-hoc consumer has to guess.
 **Format.** `float16`, one file per (run, eval point):
 
 ```
-$BLLARSE_EVAL_DUMP_ROOT/{group_id}/{uid}/step_{step:07d}.npz
+$BLLARSE_EVAL_DUMP_ROOT/{group_id}/{uid}/step_{step:07d}_{split}.npz
   logits  (N, K) float16
   labels  (N,)   int16
   score   (N,)   float32   # native epistemic score; diagnostic, IBProbit and VBLL only
