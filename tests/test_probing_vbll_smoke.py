@@ -96,3 +96,49 @@ def test_vbll_probe_writes_dumps_and_learns(fake_features, tmp_path):
     from bllarse import metrics
     final = [r for r in records if r.meta["split"] == "test"][-1]
     assert metrics.accuracy(final.logits, final.labels) > 0.9
+
+
+@pytest.mark.parametrize("no_hf_cache", [False, True])
+def test_hf_repo_flag_threads_through_every_load_cached_features_call(
+    fake_features, tmp_path, monkeypatch, no_hf_cache
+):
+    """Cross-cutting fix: probing_vbll.py must expose --hf-repo/--no-hf-cache
+    and thread hf_repo through the train, eval, and OOD load_cached_features
+    call sites -- matching scripts/alternatives/probe.py. Before this fix, the
+    VBLL arm had no way to fetch features from the Hub at all, so any cluster
+    node without a pre-staged .cache/features would fail with
+    FileNotFoundError on every VBLL task while the JAX arm succeeded."""
+    import probing_vbll
+
+    calls = []
+    real_load = probing_vbll.load_cached_features
+
+    def spy(cache_dir, model, dataset, img_size, split, hf_repo=None):
+        calls.append(hf_repo)
+        return real_load(cache_dir, model, dataset, img_size, split, hf_repo=hf_repo)
+
+    monkeypatch.setattr(probing_vbll, "load_cached_features", spy)
+
+    argv = [
+        "--model", "dinov3_small",
+        "--dataset", "fake",
+        "--ood-dataset", "fake",
+        "--num-classes", "2",
+        "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "smoke",
+        "--uid", "vbll_hf",
+        "--epochs", "1",
+        "--n-dumps", "2",
+        "--seed", "137",
+        "--device", "cpu",
+    ]
+    if no_hf_cache:
+        argv.append("--no-hf-cache")
+    args = probing_vbll.build_argparser().parse_args(argv)
+    probing_vbll.main(args)
+
+    assert len(calls) == 3, "train, eval, and ood loads must all go through load_cached_features"
+    expected = None if no_hf_cache else "dimarkov/bllarse-features"
+    assert calls == [expected] * 3

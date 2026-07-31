@@ -51,12 +51,13 @@ def _forward(head, feats, device, chunk=4096):
 def main(args):
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    hf_repo = None if args.no_hf_cache else args.hf_repo
 
     train_f, train_l = load_cached_features(
-        args.cache_dir, args.model, args.dataset, args.img_size, "train"
+        args.cache_dir, args.model, args.dataset, args.img_size, "train", hf_repo=hf_repo
     )
     eval_f, eval_l = load_cached_features(
-        args.cache_dir, args.model, args.dataset, args.img_size, "test"
+        args.cache_dir, args.model, args.dataset, args.img_size, "test", hf_repo=hf_repo
     )
     val_idx, test_idx = splits.load_or_make_pinned_split(
         args.split_cache_dir, args.dataset, "test", len(eval_f), args.val_fraction
@@ -105,7 +106,7 @@ def main(args):
 
     if args.ood_dataset:
         ood_f, ood_l = load_cached_features(
-            args.cache_dir, args.model, args.ood_dataset, args.img_size, "test"
+            args.cache_dir, args.model, args.ood_dataset, args.img_size, "test", hf_repo=hf_repo
         )
         ood_logits, ood_score = _forward(head, ood_f, device)
         evaldump.write_dump(
@@ -128,6 +129,8 @@ def build_argparser():
     p.add_argument("--cache-dir", default=".cache/features")
     p.add_argument("--split-cache-dir", default=".cache/splits")
     p.add_argument("--dump-root", default=os.environ.get("BLLARSE_EVAL_DUMP_ROOT", "eval_dumps"))
+    p.add_argument("--hf-repo", default="dimarkov/bllarse-features")
+    p.add_argument("--no-hf-cache", action="store_true")
     p.add_argument("--group-id", default="probe_vbll")
     p.add_argument("--uid", default="vbll_0")
     p.add_argument("--epochs", type=int, default=40)
