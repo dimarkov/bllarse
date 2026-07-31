@@ -11,7 +11,7 @@ from typing import Any
 
 from bllarse.tools.module import get_module_from_source_path
 
-DEFAULT_JOB_SCRIPT = Path("src/slurm/jobs/slurm_run_config_docker.sh")
+DEFAULT_JOB_SCRIPT = Path("src/slurm/jobs/slurm_run_config_apptainer.sh")
 
 
 def _config_value(config: Any, key: str, default: Any = None) -> Any:

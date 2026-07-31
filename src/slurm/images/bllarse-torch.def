@@ -1,0 +1,6 @@
+Bootstrap: docker
+From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+%post
+    apt-get update && apt-get install -y python3.11 python3-pip git && rm -rf /var/lib/apt/lists/*
+    pip install --no-cache-dir torch torchvision "vbll>=0.2.0" mlflow numpy tqdm
