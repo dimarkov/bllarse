@@ -21,37 +21,6 @@ from bllarse.features import load_cached_features
 from vbll_experiments.models import build_vbll_head
 
 
-def _fit_standardizer(train_f, eps=1e-6):
-    """Per-feature (mean, std) from the training split, std floored at `eps`.
-
-    VBLL's Jensen bound adds a term to the pre-softmax logits proportional to
-    each class's predictive variance, which is itself a weighted sum of
-    per-feature posterior variances scaled by x**2 (see
-    vbll.layers.classification.DiscClassification.jensen_bound /
-    logit_predictive). Cached backbone features are not guaranteed to arrive
-    on a comparable per-dimension scale, and any single large-magnitude
-    dimension makes that term blow up quadratically, which stalls training:
-    verified directly against this script's own smoke-test fixture (a 16-dim
-    Gaussian blob with one feature offset by 6.0) -- unstandardized, VBLL
-    training plateaus at ~0.70 test accuracy even after 10,000 epochs (the
-    gradient on that feature's posterior variance dwarfs the gradient on its
-    mean), while standardized it reaches 1.0 by epoch 1000 with everything
-    else unchanged. AdamW+CE has no such term and needs no such fix, which is
-    why this lives here rather than in the shared bllarse.features.
-
-    Fit on train only, then applied everywhere (train/val/test/OOD alike) --
-    an OOD dataset standardized by its own statistics would have that
-    distribution shift erased before the head ever saw it.
-    """
-    mean = train_f.mean(axis=0)
-    std = np.maximum(train_f.std(axis=0), eps)
-    return mean, std
-
-
-def _apply_standardizer(feats, mean, std):
-    return ((feats.astype(np.float64) - mean) / std).astype(np.float32)
-
-
 def _forward(head, feats, device, chunk=4096):
     """Return (logits, epistemic_score) as numpy arrays.
 
@@ -92,10 +61,6 @@ def main(args):
     val_idx, test_idx = splits.load_or_make_pinned_split(
         args.split_cache_dir, args.dataset, "test", len(eval_f), args.val_fraction
     )
-
-    feat_mean, feat_std = _fit_standardizer(train_f)
-    train_f = _apply_standardizer(train_f, feat_mean, feat_std)
-    eval_f = _apply_standardizer(eval_f, feat_mean, feat_std)
 
     head = build_vbll_head(
         train_f.shape[-1], args.num_classes,
@@ -142,7 +107,6 @@ def main(args):
         ood_f, ood_l = load_cached_features(
             args.cache_dir, args.model, args.ood_dataset, args.img_size, "test"
         )
-        ood_f = _apply_standardizer(ood_f, feat_mean, feat_std)
         ood_logits, ood_score = _forward(head, ood_f, device)
         evaldump.write_dump(
             args.dump_root, args.group_id, args.uid, args.epochs,
@@ -175,7 +139,15 @@ def build_argparser():
     p.add_argument("--prior-scale", type=float, default=1.0)
     p.add_argument("--wishart-scale", type=float, default=0.1)
     p.add_argument("--parameterization", default="diagonal")
-    p.add_argument("--vbll-type", default="discriminative")
+    p.add_argument(
+        "--vbll-type", default="discriminative", choices=["discriminative"],
+        help=(
+            "Only 'discriminative' is supported: GenClassification.logit_predictive "
+            "returns a plain tensor (not a distribution with .covariance_diagonal) "
+            "in the installed vbll version, so _forward's score computation would "
+            "raise AttributeError at score time rather than failing loudly here."
+        ),
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=137)
     return p
