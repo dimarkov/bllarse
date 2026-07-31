@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from bllarse import evaldump, splits
-from bllarse.features import load_cached_features
+from bllarse.features import eval_split_name, load_cached_features
 from vbll_experiments.models import build_vbll_head
 
 
@@ -57,7 +57,8 @@ def main(args):
         args.cache_dir, args.model, args.dataset, args.img_size, "train", hf_repo=hf_repo
     )
     eval_f, eval_l = load_cached_features(
-        args.cache_dir, args.model, args.dataset, args.img_size, "test", hf_repo=hf_repo
+        args.cache_dir, args.model, args.dataset, args.img_size,
+        eval_split_name(args.dataset), hf_repo=hf_repo,
     )
     val_idx, test_idx = splits.load_or_make_pinned_split(
         args.split_cache_dir, args.dataset, "test", len(eval_f), args.val_fraction
@@ -117,7 +118,8 @@ def main(args):
 
     if args.ood_dataset:
         ood_f, ood_l = load_cached_features(
-            args.cache_dir, args.model, args.ood_dataset, args.img_size, "test", hf_repo=hf_repo
+            args.cache_dir, args.model, args.ood_dataset, args.img_size,
+            eval_split_name(args.ood_dataset), hf_repo=hf_repo,
         )
         ood_logits, ood_score = _forward(head, ood_f, device)
         evaldump.write_dump(

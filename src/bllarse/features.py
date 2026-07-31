@@ -32,6 +32,18 @@ def _hub_status(exc: BaseException) -> int | None:
     return status if isinstance(status, int) else None
 
 
+# Datasets whose held-out split is not called "test" upstream. precompute_features.py
+# names the cache file after the dataset's own split (vit_classification's
+# DATASET_CONFIGS[...]["test_split"]), so an arm that hardcodes "test" raises
+# FileNotFoundError on exactly these -- which is two of Fig 1's six datasets.
+_EVAL_SPLIT = {"food101": "validation", "imagenet1k": "validation"}
+
+
+def eval_split_name(dataset: str) -> str:
+    """On-disk name of `dataset`'s held-out split. Not always "test"."""
+    return _EVAL_SPLIT.get(dataset, "test")
+
+
 def feature_cache_path(cache_dir, model: str, dataset: str, img_size: int, split: str) -> Path:
     """Local cache path, matching precompute_features.py's layout exactly."""
     return Path(cache_dir) / f"{model}_{dataset}_res{img_size}_{split}.npz"

@@ -25,7 +25,7 @@ import optax
 from jax import random as jr, vmap
 
 from bllarse import evaldump, metrics, splits
-from bllarse.features import load_cached_features
+from bllarse.features import eval_split_name, load_cached_features
 from bllarse.losses import CrossEntropy
 
 
@@ -76,7 +76,8 @@ def main(args):
         args.cache_dir, args.model, args.dataset, img_size, "train", hf_repo=hf_repo
     )
     eval_f, eval_l = load_cached_features(
-        args.cache_dir, args.model, args.dataset, img_size, "test", hf_repo=hf_repo
+        args.cache_dir, args.model, args.dataset, img_size,
+        eval_split_name(args.dataset), hf_repo=hf_repo,
     )
 
     # Pinned split: val is for post-hoc temperature scaling, test for reporting.
@@ -124,7 +125,8 @@ def main(args):
     # OOD dump: final point only. Fig 2 is a converged-endpoint figure.
     if args.ood_dataset:
         ood_f, ood_l = load_cached_features(
-            args.cache_dir, args.model, args.ood_dataset, img_size, "test", hf_repo=hf_repo
+            args.cache_dir, args.model, args.ood_dataset, img_size,
+            eval_split_name(args.ood_dataset), hf_repo=hf_repo,
         )
         ood_logits = _logits_for(head, loss_fn, ood_f, ood_l)
         evaldump.write_dump(

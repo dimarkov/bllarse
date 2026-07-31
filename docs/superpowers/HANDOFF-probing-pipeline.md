@@ -54,21 +54,66 @@ presence. Decide before Phase 1a.
 
 ### 3. Two backbones have no cached features at all
 
-`dinov3_small` and `dinov3_huge` have features; **`dinov3_big` and
-`dinov3_large` have none, for any dataset**. The four-model ladder needs
-extraction for 2 backbones × 6 datasets × 2 splits, including ImageNet-1k at
-512px (1.28M images per backbone). Compute-budget decision, gates Phase 1a.
+`dinov3_small` and `dinov3_huge` are **fully covered for all four production
+sweeps** — 0 missing files, verified by enumerating every config. `dinov3_big`
+and `dinov3_large` have only SVHN; between them they need 32 more feature
+files:
 
-SVHN is done: all four backbones × 2 splits at res224, cached and mirrored to
-`dimarkov/bllarse-features`.
+| backbone | missing | what |
+|---|---:|---|
+| `dinov3_big` | 16 | oxford_pets, food101, flowers102, stanford_cars, dtd, imagenet1k @res512 (train+eval) · cifar10, cifar100 @res224 (train+test) |
+| `dinov3_large` | 16 | same |
+
+ImageNet-1k at 512px is 1.28M images per backbone and dominates that cost.
+This is a compute-budget decision, but it **no longer gates Phase 1a** — see
+"Half the ladder is runnable today" below.
+
+---
+
+## Verified locally on 2026-07-31
+
+The whole chain was run end-to-end on this workstation, on real cached
+features, bypassing only Apptainer and SLURM:
+
+- `python -m bllarse.tools.run_config bllarse_sweeps/probe_smoke.py 1` — the
+  exact command the job script execs inside the container. AdamW arm, cifar10 +
+  svhn OOD, 4 epochs: acc 0.9296 → 0.9466, 7 dumps written (3 val, 3 test,
+  1 ood).
+- VBLL arm, same config on CPU: 7 dumps, score channel present and
+  **non-constant** (std 1.67e-3) — smoke criterion 3 passes.
+- `analysis.curves.run_curve(temperature_scaled=True)`: ECE 0.198 → 0.0062,
+  T refit per point (0.423, 0.553, 0.672).
+- `analysis.curves.run_detection` on both arms × both scores: AdamW AUROC
+  0.969 (MSP) / 0.981 (entropy), VBLL 0.959 / 0.971.
+- `thresholds.make_targets` → `first_crossing` → `crossings_per_seed` on those
+  curves. This closes the "no production caller" item below.
+
+Still unexercised: the Apptainer build, `--nv` GPU passthrough, and sbatch
+array submission. `--dry-run` emits the expected
+`sbatch --export=ALL --array=0-59%20 ...`.
+
+### Half the ladder is runnable today
+
+`dinov3_small` and `dinov3_huge` need no new features, and each sweep orders
+its configs `product(MODELS, DATASETS, SEEDS)` with MODELS outermost, so each
+backbone is a **contiguous index range** — submittable with `--index-offset`
+alone, no sweep edits:
+
+| sweep | `dinov3_small` | `dinov3_huge` |
+|---|---|---|
+| `probe_adamw_ce`, `probe_vbll` | `--index-offset 0 --num-jobs 60` | `--index-offset 180 --num-jobs 60` |
+| `probe_ood_adamw_ce`, `probe_ood_vbll` | `--index-offset 0 --num-jobs 30` | `--index-offset 90 --num-jobs 30` |
+
+360 of the 720 configs. Pass `--job-name` per submission, otherwise both
+chunks of a sweep share a name and `sacct --name` cannot tell them apart.
 
 ---
 
 ## Cluster runbook
 
-Nothing here has been executed — this machine has no `apptainer` and no SLURM.
-**Treat the first build as unverified**: the base image tag was wrong twice
-before being corrected against the Docker Hub API.
+The container path has **not** been executed — this machine has no `apptainer`
+and no SLURM. **Treat the first build as unverified**: the base image tag was
+wrong twice before being corrected against the Docker Hub API.
 
 ```bash
 # 1. Capability check
@@ -156,17 +201,17 @@ was found and removed.
 
 ## Known-open, deliberately
 
-- **`crossings_per_seed` has no production caller.** The interface is complete
-  and unit-tested; nothing yet builds `Mapping[int, Curve]` from dumps. Spec
-  §0b.4 anticipated this ("cannot be exercised end-to-end until Phase 1
-  produces a baseline"). A figure-building script is future work.
+- **`crossings_per_seed` has no production caller.** Exercised by hand on real
+  smoke dumps (above), so the interface is confirmed; what is still missing is
+  a committed figure-building script that walks a whole sweep. Future work.
 - **`samples_seen` overcounts** by the dropped remainder batch — 2.6% on
   oxford_pets, 0.06% on imagenet1k. Symmetric across arms, so no comparison
   bias, but the compute axis is not exactly comparable across panels.
 - **`segmentation.py` and `sample_efficiency.py` are broken** by a stale equimo
   import, inherited from the extracted code. Off the probing path.
-- **Four test-collection errors** from a `blrax` version drift
-  (`blrax.optim.evon` missing). Pre-existing; blocks Plan B, not Plan A.
+- **Both images pin `mlpox` and `blrax` to `@main`**, a floating ref, while the
+  dev venv pins blrax to `c37b1a83`. Neither is on the probing path, so Figs
+  1–4 are unaffected — but pin them before Plan B, which does use blrax.
 - **VBLL logits are normalised log-probs**, the JAX arm's are raw. Verified not
   to bias any metric (all are shift-invariant, and `softmax(log p) == p`); the
   residue is unmatched fp16 rounding, sub-1e-3.

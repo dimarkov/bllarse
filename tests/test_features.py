@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -202,3 +203,29 @@ def test_module_imports_without_jax_or_torch():
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "clean" in result.stdout
+
+
+def test_eval_split_name_tracks_the_upstream_split_names():
+    """precompute_features.py writes the held-out file under the dataset's own
+    split name, so the two datasets whose upstream split is 'validation' must
+    not be looked up as 'test'. Guarded against silent drift from
+    vit_classification's DATASET_CONFIGS."""
+    assert features.eval_split_name("food101") == "validation"
+    assert features.eval_split_name("imagenet1k") == "validation"
+    for dataset in ("cifar10", "cifar100", "svhn", "dtd", "oxford_pets",
+                    "flowers102", "stanford_cars"):
+        assert features.eval_split_name(dataset) == "test"
+
+
+def test_eval_split_name_matches_dataset_configs():
+    """The mapping above is a copy of vit_classification's DATASET_CONFIGS.
+    Parse that file's test_split entries and assert the copy is still faithful,
+    without importing it (it pulls in equimo/jax)."""
+    src = Path(__file__).resolve().parents[1] / "scripts/alternatives/vit_classification.py"
+    text = src.read_text()
+    body = text[text.index("DATASET_CONFIGS"):]
+    entries = re.findall(r'^\s{4}"(\w+)":\s*\{', body, flags=re.M)
+    splits_found = re.findall(r'"test_split":\s*"(\w+)"', body)
+    assert len(entries) == len(splits_found), (entries, splits_found)
+    for dataset, split in zip(entries, splits_found):
+        assert features.eval_split_name(dataset) == split, dataset
