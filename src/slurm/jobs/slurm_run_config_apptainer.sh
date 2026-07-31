@@ -24,6 +24,11 @@ if [[ ! -f "$sif" ]]; then
   exit 2
 fi
 
+if [[ -z "${BLLARSE_SWEEP_SOURCE:-}" ]]; then
+  echo "[bllarse] ERROR: BLLARSE_SWEEP_SOURCE is not set; run_sweep.py should have exported it." >&2
+  exit 2
+fi
+
 echo "[bllarse] task=${SLURM_ARRAY_TASK_ID} offset=${INDEX_OFFSET} config=${CONFIG_IDX} sif=${sif}"
 
 # Apptainer binds $HOME, $PWD and /tmp by default and preserves UID/GID, so the

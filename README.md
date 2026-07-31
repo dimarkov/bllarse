@@ -47,9 +47,24 @@ python -m bllarse.tools.run_sweep \
   --job-name finetuning_demo
 ```
 
-The default job uses `scripts/start_docker_sbatch.sh` and expects an image
-named `bllarse-dev` on each allocated node. Override the image and Docker
-shared-memory allocation when needed:
+The default job runs under Apptainer (`src/slurm/jobs/slurm_run_config_apptainer.sh`),
+since the target cluster forbids the Docker daemon. Point it at a built `.sif`
+via `BLLARSE_SIF`; the JAX arms (AdamW+CE, IBProbit) and the VBLL/PyTorch arm
+use separate images (`bllarse-jax.sif`, `bllarse-torch.sif` — see
+`src/slurm/images/*.def`) because they pin conflicting CUDA/cuDNN versions:
+
+```bash
+export BLLARSE_SIF=/path/to/bllarse-jax.sif
+```
+
+The workstation's `~/.cache/huggingface` is a symlink to external storage that
+won't exist on the cluster, so the HF cache path is overridable via
+`BLLARSE_HF_HOME` (bound into the container and exported as `HF_HOME` when set).
+
+On this workstation, or anywhere a Docker daemon is available, use
+`--job-script src/slurm/jobs/slurm_run_config_docker.sh` instead; it expects
+an image named `bllarse-dev` on each allocated node. Override the image and
+Docker shared-memory allocation when needed:
 
 ```bash
 export BLLARSE_DOCKER_IMAGE=bllarse-dev
@@ -57,8 +72,8 @@ export BLLARSE_DOCKER_SHM_SIZE=16g
 ```
 
 Use `--job-script src/slurm/jobs/slurm_run_config.sh` to run directly in the
-host virtual environment instead. `--dry-run` validates the sweep and prints
-the `sbatch` command without submitting it.
+host virtual environment instead (no container). `--dry-run` validates the
+sweep and prints the `sbatch` command without submitting it.
 
 Large sweeps can be split while preserving the original config indices:
 
