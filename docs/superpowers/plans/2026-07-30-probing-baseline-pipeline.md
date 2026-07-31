@@ -2678,12 +2678,22 @@ Shared clusters usually have no daemon. Build from def-files instead — create
 
 ```
 Bootstrap: docker
-From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu24.04
 
 %post
-    apt-get update && apt-get install -y python3.11 python3-pip git && rm -rf /var/lib/apt/lists/*
-    pip install --no-cache-dir uv
-    pip install --no-cache-dir "jax[cuda12]" equinox optax "tfp-nightly[jax]" \
+    # 24.04, not 22.04: 22.04's python3-pip targets python3.10 even when
+    # python3.11 is installed alongside it, so the deps land in the wrong
+    # interpreter -- and neither image provides a bare `python`, which the job
+    # script invokes. 24.04 ships python3.12 (satisfies >=3.11) as the default
+    # python3, and python-is-python3 supplies /usr/bin/python.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends python3 python3-pip python-is-python3 git
+    rm -rf /var/lib/apt/lists/*
+    # PEP 668 marks the system Python externally managed. Inside a
+    # single-purpose container that is exactly the environment we want.
+    pip install --no-cache-dir --break-system-packages \
+        "jax[cuda12]" equinox optax "tfp-nightly[jax]" \
         datasets equimo augmax mlflow python-dotenv tqdm \
         "mlpox @ git+https://github.com/dimarkov/mlpox.git@main" \
         "blrax @ git+https://github.com/dimarkov/blrax.git@main"
@@ -2697,11 +2707,18 @@ and `src/slurm/images/bllarse-torch.def`:
 
 ```
 Bootstrap: docker
-From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+From: nvidia/cuda:12.4.1-cudnn-runtime-ubuntu24.04
 
 %post
-    apt-get update && apt-get install -y python3.11 python3-pip git && rm -rf /var/lib/apt/lists/*
-    pip install --no-cache-dir torch torchvision "vbll>=0.2.0" mlflow numpy tqdm
+    # See bllarse-jax.def for why 24.04 and python-is-python3.
+    # Note this image takes the DEFAULT (CUDA) torch wheels -- unlike the dev
+    # venv, which pins CPU torch so it can coexist with jax[cuda] locally.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends python3 python3-pip python-is-python3 git
+    rm -rf /var/lib/apt/lists/*
+    pip install --no-cache-dir --break-system-packages \
+        torch torchvision "vbll>=0.2.0" mlflow numpy tqdm
 ```
 
 ```bash
@@ -2712,7 +2729,15 @@ apptainer build bllarse-torch.sif src/slurm/images/bllarse-torch.def
 Building may require `--fakeroot` or a remote builder depending on site policy;
 `apptainer build --help` lists what is permitted.
 
-Verify GPU visibility inside the container before submitting anything:
+Before anything else, verify the interpreter and the package landing site — a
+mismatch here fails every job and is the most likely build defect:
+
+```bash
+apptainer exec bllarse-jax.sif python -c "import sys; print(sys.version)"
+apptainer exec bllarse-jax.sif python -c "import jax, equinox, optax; print('jax', jax.__version__)"
+```
+
+Then verify GPU visibility:
 
 ```bash
 apptainer exec --nv bllarse-jax.sif python -c "import jax; print(jax.devices())"
