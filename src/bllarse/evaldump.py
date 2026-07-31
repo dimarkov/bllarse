@@ -130,7 +130,14 @@ def write_dump(
 
     directory = dump_dir(root, group_id, uid)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"step_{int(step):07d}.npz"
+    # `split` is part of the filename, not just `step`: a single training run
+    # dumps val and test from the same forward pass at every scheduled step,
+    # and OOD lands on the same step number as the final val/test point. All
+    # of them share one uid directory, so step alone is not a unique key --
+    # without the split suffix, the second write_dump call at a given step
+    # would silently clobber the first (e.g. the val dump lost under the test
+    # dump written right after it).
+    path = directory / f"step_{int(step):07d}_{split}.npz"
     np.savez_compressed(path, **payload)
     return path
 

@@ -97,6 +97,25 @@ def test_labels_and_logits_must_agree_in_length(tmp_path):
         )
 
 
+def test_write_dump_keeps_multiple_splits_at_the_same_step_separate(tmp_path):
+    """A single run dumps val and test (and, at the final step, ood) from the
+    same forward pass at the same step number. step alone must not be the
+    on-disk key, or the second write silently clobbers the first."""
+    for split in ("val", "test", "ood"):
+        evaldump.write_dump(
+            tmp_path, "grp", "uid5", step=9,
+            logits=np.full((4, 2), fill_value=hash(split) % 7, dtype=np.float32),
+            labels=np.zeros(4, dtype=int),
+            arm="adamw_ce", split=split, logit_kind="softmax_logits",
+            seed=1, samples_seen=9 * 8,
+        )
+    records = list(evaldump.iter_dumps(tmp_path, "grp", "uid5"))
+    splits = {rec.meta["split"] for rec in records}
+    assert splits == {"val", "test", "ood"}, (
+        f"expected all three splits to survive at the same step, got {splits}"
+    )
+
+
 def test_iter_dumps_returns_steps_in_order(tmp_path):
     for step in (13, 1, 5):
         evaldump.write_dump(
