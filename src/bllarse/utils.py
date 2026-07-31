@@ -6,19 +6,13 @@ from tensorflow_probability.substrates.jax.stats import (
 )
 import optax
 
-try:
-    import mlflow
-
-    no_mlflow = False
-except Exception:
-    mlflow = None
-    no_mlflow = True
 import numpy as onp
 
 from typing import Mapping, Optional
 
+from blrax.optim import scale_by_evon, scale_by_ivon
 from blrax.utils import noisy_value_and_grad
-from bllarse.losses import Classical, CrossEntropy
+from bllarse.losses import Classical
 
 import augmax
 from math import prod
@@ -105,6 +99,66 @@ def extract_features(nnet, x):
     return vmap(nnet)(x)
 
 
+def bayes_optimizer(
+    opt_name: str,
+    learning_rate,
+    *,
+    head_learning_rate=None,
+    param_labels=None,
+    clip_radius: float = float("inf"),
+    **conf,
+):
+    """Construct a blrax IVON/EVON optimizer, optionally with a separate head lr.
+
+    optax.multi_transform cannot wrap ivon/evon directly: blrax locates the
+    bayesian state at opt_state[0] (posterior sampling, hessian stash), and a
+    wrapper would bury it inside inner_states. Instead the chain is built flat --
+    scale_by_ivon/evon first, then clip, then the learning-rate stage -- so the
+    state stays first. With ``head_learning_rate`` the lr stage becomes per-part
+    (labels 'backbone'/'head' via ``param_labels``); this only rescales the mean
+    update, while the posterior scale (hess/ess/weight_decay) and the hessian
+    EMA are lr-independent and therefore untouched.
+
+    Without ``head_learning_rate`` the result is identical to blrax's
+    ``ivon(learning_rate, clip_radius=..., **conf)`` / ``evon(...)``.
+
+    Args:
+        opt_name: 'ivon' or 'evon'.
+        learning_rate: Scalar or optax schedule for the backbone (all params if
+            no head lr is given).
+        head_learning_rate: Optional scalar or schedule for the 'head' part.
+        param_labels: Pytree of 'backbone'/'head' labels (or a callable), as
+            accepted by optax.multi_transform. Required with head_learning_rate.
+        clip_radius: Maximal absolute update of the first moment (inf disables).
+        conf: Forwarded to scale_by_ivon / scale_by_evon (ess, hess_init, ...).
+    """
+    if opt_name == "ivon":
+        transform = scale_by_ivon(**conf)
+    elif opt_name == "evon":
+        transform = scale_by_evon(**conf)
+    else:
+        raise ValueError(f"unknown bayesian optimizer '{opt_name}'")
+
+    stages = [transform]
+    if clip_radius < float("inf"):
+        stages.append(optax.clip(clip_radius))
+    if head_learning_rate is None:
+        stages.append(optax.scale_by_learning_rate(learning_rate))
+    else:
+        if param_labels is None:
+            raise ValueError("head_learning_rate requires param_labels")
+        stages.append(
+            optax.multi_transform(
+                {
+                    "backbone": optax.scale_by_learning_rate(learning_rate),
+                    "head": optax.scale_by_learning_rate(head_learning_rate),
+                },
+                param_labels,
+            )
+        )
+    return optax.chain(*stages)
+
+
 def run_training(
     key,
     pretrained_nnet,
@@ -122,7 +176,8 @@ def run_training(
     batch_size: int = 32,
     num_update_iters: int = 32,
     mc_samples: int = 1,
-    log_to_mlflow: bool = False,
+    grad_estimator: str = "sampling",
+    log_to_mlflow=False,
     epoch_offset: int = 0,
     sequential_update: bool = False,
     reset_loss_per_epoch: bool = False,
@@ -151,8 +206,12 @@ def run_training(
     batch_size : Batch size
     num_update_iters : Number of CAVI/PG iterations per batch (Bayesian only)
     mc_samples : MC samples for stochastic gradient estimation
-    log_to_mlflow : Whether to log to MLflow
-    epoch_offset : Epoch offset to keep logging steps aligned across chunks
+    grad_estimator : blrax gradient estimator for IVON/EVON optimizers:
+        'sampling' (default, reparameterized posterior samples) or 'hutchinson'
+        (gradient at the mean + Hutchinson diagonal-Hessian estimate; ignores
+        mc_samples). Ignored by non-bayesian optimizers.
+    log_to_mlflow : Whether to log metrics to MLflow
+    epoch_offset : Epoch number offset for MLflow step indexing
     sequential_update : If True, perform two-pass training per epoch (loss update, then network update)
     reset_loss_per_epoch : If True, reset loss model parameters at the start of each epoch
 
@@ -274,6 +333,7 @@ def run_training(
                 aug_imgs,
                 batch_labels,
                 mc_samples=mc_samples,
+                estimator=grad_estimator,
             )
 
             updates, opt_state = optimizer.update(grads, opt_state, current_params)
@@ -289,11 +349,6 @@ def run_training(
     # Evaluation
     def evaluate(loss_params, net_params, images, labels):
         loss_fn = eqx.combine(loss_params, loss_static)
-        # Report a genuine held-out NLL: drop label smoothing so the reported
-        # nll is comparable across different --label-smooth values. The trained
-        # temperature (beta) is preserved.
-        if isinstance(loss_fn, CrossEntropy):
-            loss_fn = eqx.tree_at(lambda m: m.alpha, loss_fn, 0.0)
         nnet = get_nnet(net_params)
         return evaluate_model(
             data_augmentation, loss_fn, nnet, images, labels, loss_type=loss_type
@@ -395,7 +450,7 @@ def run_training(
         }
 
         # Held-out validation NLL for epoch selection (same metric definition as
-        # the reported test nll: label-smoothing-free for CrossEntropy).
+        # the reported test nll).
         if val_ds is not None:
             _, val_nll, _ = evaluate(
                 updated_loss_params, updated_params, val_ds["image"], val_ds["label"]
@@ -411,23 +466,23 @@ def run_training(
         epoch_body, init, epoch_keys
     )
 
-    if log_to_mlflow and not no_mlflow:
+    if log_to_mlflow:
         try:
+            import mlflow
+        except ImportError:
+            pass
+        else:
             metrics_np = jtu.map(lambda x: onp.asarray(x), metrics_seq)
             for ep in range(num_epochs):
-                step = epoch_offset + ep + 1
                 log_dict = {
                     "loss": float(metrics_np["loss"][ep]),
                     "nll": float(metrics_np["nll"][ep]),
                     "acc": float(metrics_np["acc"][ep]),
                     "ece": float(metrics_np["ece"][ep]),
-                    "epoch": float(step),
                 }
                 if "val_nll" in metrics_np:
                     log_dict["val_nll"] = float(metrics_np["val_nll"][ep])
-                mlflow.log_metrics(log_dict, step=step)
-        except Exception as exc:
-            print(f"[bllarse] MLflow logging failed: {exc}")
+                mlflow.log_metrics(log_dict, step=epoch_offset + ep + 1)
 
     trained_loss_model = eqx.combine(final_loss_params, loss_static)
     trained_nnet = get_nnet(final_params)

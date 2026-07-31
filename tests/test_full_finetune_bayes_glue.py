@@ -46,9 +46,15 @@ def _args(optimizer, estimator, hess_every=1, precond_every=1):
     return argparse.Namespace(
         optimizer=optimizer, estimator=estimator, bayes_lr=1e-2,
         ivon_weight_decay=1e-4, ivon_hess_init=1.0, ivon_b2=0.999,
-        evon_b2=0.95, evon_b3=0.95, precond_every=precond_every,
+        evon_b1=0.9, evon_b2=0.95, evon_b3=0.95, ivon_b1=0.95,
+        bayes_head_lr=None, precond_every=precond_every,
         hess_every=hess_every, hess_clip_ratio=10.0,
         max_precond_dim=10000, one_sided=False,
+        # Added by ibprobit-process-noise's tip commit (1630974 "add clip
+        # radius"), which introduced args.clip_radius in
+        # full_finetune_comparison.make_bayes_optimizer without updating this
+        # Namespace. Value matches the argparse default.
+        clip_radius=1e-2,
     )
 
 
