@@ -125,9 +125,19 @@ def make_objective(
     budgets: Mapping[str, Mapping[str, int]],
     dump_root: Any,
     group_id: str,
+    patience: int | None = None,
+    warmup_dumps: int = objective_mod.DEFAULT_WARMUP_DUMPS,
+    min_relative_improvement: float = objective_mod.DEFAULT_MIN_RELATIVE_IMPROVEMENT,
     **config_kw: Any,
 ) -> Callable[[optuna.Trial], float]:
-    """The optuna objective closure for one study."""
+    """The optuna objective closure for one study.
+
+    `patience` is the search-only counterpart to MedianPruner: the pruner
+    kills trials that are LOSING, `patience` stops trials that have FINISHED
+    CONVERGING, so the 30k-step cap becomes a true maximum rather than a fixed
+    price every trial pays. It applies to both tuning seeds -- unlike
+    `on_dump`/pruning below, which is deliberately first-seed-only.
+    """
 
     def run_trial(trial: optuna.Trial) -> float:
         params = space.suggest(trial, arm, dataset)
@@ -146,13 +156,31 @@ def make_objective(
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-        return objective_mod.evaluate(
+        stopped_at: dict[int, int] = {}
+
+        def on_converged(seed: int, dump_index: int, step: int) -> None:
+            stopped_at[seed] = dump_index
+
+        value = objective_mod.evaluate(
             arm, config,
             dump_root=dump_root,
             group_id=group_id,
             uid=f"trial{trial.number:05d}",
             on_dump=on_dump,
+            patience=patience,
+            warmup_dumps=warmup_dumps,
+            min_relative_improvement=min_relative_improvement,
+            on_converged=on_converged,
         )
+
+        # Recorded so a campaign can be audited afterwards for how much
+        # patience actually saved, and to notice if it is misfiring.
+        trial.set_user_attr("patience_stopped", bool(stopped_at))
+        trial.set_user_attr(
+            "patience_stopped_at_dump",
+            {str(seed): dump_index for seed, dump_index in stopped_at.items()},
+        )
+        return value
 
     return run_trial
 
@@ -173,6 +201,21 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--split-cache-dir", default=".cache/splits")
     p.add_argument("--mlflow-experiment", default="bllarse-probing-tuning")
     p.add_argument("--no-mlflow", action="store_true")
+    p.add_argument(
+        "--patience", type=int, default=None,
+        help="Consecutive no-improvement dumps that stop a trial's run early. "
+             "Default: disabled, i.e. every trial trains to the full step cap "
+             "(today's behaviour).",
+    )
+    p.add_argument(
+        "--warmup-dumps", type=int, default=objective_mod.DEFAULT_WARMUP_DUMPS,
+        help="Minimum dumps seen before --patience is allowed to fire.",
+    )
+    p.add_argument(
+        "--min-relative-improvement", type=float,
+        default=objective_mod.DEFAULT_MIN_RELATIVE_IMPROVEMENT,
+        help="Relative val_nll decrease required to reset the patience counter.",
+    )
     return p
 
 
@@ -188,6 +231,9 @@ def main() -> None:
             budgets=budgets,
             dump_root=args.dump_root,
             group_id=group_id,
+            patience=args.patience,
+            warmup_dumps=args.warmup_dumps,
+            min_relative_improvement=args.min_relative_improvement,
             cache_dir=args.cache_dir,
             split_cache_dir=args.split_cache_dir,
             enable_mlflow=not args.no_mlflow,
