@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -68,16 +69,40 @@ class _NullRun:
         pass
 
 
+def _clean_params(params: Mapping[str, Any]) -> Dict[str, str]:
+    # MLflow rejects a param over 500 chars and freezes params after the
+    # first write, so stringify defensively and log once per key.
+    return {k: str(v)[:500] for k, v in params.items()}
+
+
 class _LiveRun:
     active = True
 
     def __init__(self, mlflow_module: Any) -> None:
         self._mlflow = mlflow_module
+        # Once the tracking backend starts rejecting calls it usually stays
+        # broken for the rest of the run (a dead connection, a full disk on
+        # the server, ...), and a training loop can call log_metrics on the
+        # order of hundreds of times. Printing the same "continuing
+        # untracked" line at every single one of those would drown the real
+        # training log for no extra information, so we report the failure
+        # once per run and go quiet after that -- the dumps are still the
+        # source of truth regardless.
+        self._warned = False
+
+    def _report(self, action: str, exc: Exception) -> None:
+        if not self._warned:
+            print(
+                f"[bllarse] MLflow {action} failed "
+                f"({type(exc).__name__}: {exc}); continuing untracked."
+            )
+            self._warned = True
 
     def log_params(self, params: Mapping[str, Any]) -> None:
-        # MLflow rejects a param over 500 chars and freezes params after the
-        # first write, so stringify defensively and log once per key.
-        self._mlflow.log_params({k: str(v)[:500] for k, v in params.items()})
+        try:
+            self._mlflow.log_params(_clean_params(params))
+        except Exception as exc:  # pragma: no cover - network dependent
+            self._report("log_params", exc)
 
     def log_metrics(self, metrics: Mapping[str, float], step: int | None = None) -> None:
         clean = {
@@ -85,11 +110,18 @@ class _LiveRun:
             for k, v in metrics.items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         }
-        if clean:
+        if not clean:
+            return
+        try:
             self._mlflow.log_metrics(clean, step=step)
+        except Exception as exc:  # pragma: no cover - network dependent
+            self._report("log_metrics", exc)
 
     def set_tags(self, tags: Mapping[str, Any]) -> None:
-        self._mlflow.set_tags({k: str(v)[:500] for k, v in tags.items()})
+        try:
+            self._mlflow.set_tags(_clean_params(tags))
+        except Exception as exc:  # pragma: no cover - network dependent
+            self._report("set_tags", exc)
 
 
 def resolve_experiment_id(mlflow_module: Any, name: str) -> str:
@@ -157,14 +189,64 @@ def child_run(config: Mapping[str, Any], *, run_name: str, tags: Mapping[str, An
     if parent_run_id:
         all_tags["mlflow.parentRunId"] = parent_run_id
 
+    # Setup: everything up to and including the initial log_params call is
+    # guarded together, exactly as before -- any failure here degrades the
+    # whole run to untracked. This is deliberately NOT a `with` statement:
+    # the body has to run *outside* any `except` block that could see its
+    # exception, or a body exception thrown into this generator would be
+    # caught here and the generator would try to yield a second time, which
+    # CPython turns into "RuntimeError: generator didn't stop after throw()"
+    # -- destroying the real exception (this was the bug). So start_run's
+    # context manager is driven by hand: __enter__ during setup, __exit__
+    # during teardown, with the body's yield in between, guarded by nothing.
+    run_ctx = None
     try:
         if tracking_uri:
             mlflow.set_tracking_uri(tracking_uri)
         experiment_id = resolve_experiment_id(mlflow, experiment)
-        with mlflow.start_run(experiment_id=experiment_id, run_name=run_name, tags=all_tags):
-            run = _LiveRun(mlflow)
-            run.log_params(config)
-            yield run
+        run_ctx = mlflow.start_run(experiment_id=experiment_id, run_name=run_name, tags=all_tags)
+        run_ctx.__enter__()
+        mlflow.log_params(_clean_params(config))
     except Exception as exc:  # pragma: no cover - network dependent
         print(f"[bllarse] MLflow run failed ({type(exc).__name__}: {exc}); continuing untracked.")
+        if run_ctx is not None:
+            # start_run succeeded but something after it (log_params, ...)
+            # did not -- close out the half-opened run as failed rather than
+            # leaving it stuck RUNNING on the server forever. Best effort:
+            # this is already the "tracking is broken" path.
+            try:
+                run_ctx.__exit__(type(exc), exc, exc.__traceback__)
+            except Exception:
+                pass
         yield _NullRun()
+        return
+
+    run = _LiveRun(mlflow)
+    try:
+        # Body: an exception here (including optuna.TrialPruned) must reach
+        # the caller as itself. Nothing above this line can be an `except`
+        # that wraps this `yield`.
+        yield run
+    except BaseException:
+        # Teardown on the failure path: record the run as failed/errored
+        # (mirrors what `with start_run(...):` would have marked it), then
+        # re-raise the SAME exception object untouched. A teardown failure
+        # here must not replace or mask it.
+        try:
+            run_ctx.__exit__(*sys.exc_info())
+        except Exception as exc:  # pragma: no cover - network dependent
+            print(
+                f"[bllarse] MLflow end_run failed ({type(exc).__name__}: {exc}); "
+                "continuing untracked."
+            )
+        raise
+    else:
+        # Teardown on the success path: mark the run finished. A failure
+        # here is a tracking-only problem and must not raise.
+        try:
+            run_ctx.__exit__(None, None, None)
+        except Exception as exc:  # pragma: no cover - network dependent
+            print(
+                f"[bllarse] MLflow end_run failed ({type(exc).__name__}: {exc}); "
+                "continuing untracked."
+            )

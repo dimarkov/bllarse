@@ -203,3 +203,152 @@ def test_non_numeric_metrics_are_dropped_not_raised(monkeypatch):
     with mlflow_utils.child_run({"enable_mlflow": True}, run_name="x") as run:
         run.log_metrics({"good": 1.0, "bad": None, "flag": True, "text": "x"}, step=1)
     assert logged == [{"good": 1.0}]
+
+
+class _FakeRun:
+    """Models the object mlflow.start_run() returns: a context manager that
+    records what it was exited with, the way the real ActiveRun marks the
+    run FINISHED on a clean exit and FAILED/errored otherwise."""
+
+    def __init__(self):
+        self.exit_args = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.exit_args = (exc_type, exc, tb)
+        return False  # never swallow -- exactly like the real ActiveRun
+
+
+class _FakeClient:
+    def get_experiment_by_name(self, name):
+        return SimpleNamespace(experiment_id="0")
+
+
+def test_a_body_exception_propagates_as_itself_when_mlflow_is_enabled(monkeypatch):
+    """The bug this whole file exists to catch: @contextmanager throws the
+    body's exception INTO the generator at the `yield` point. The old code
+    caught it with `except Exception: ... yield _NullRun()`, and yielding a
+    second time after catching a thrown exception makes CPython raise
+    RuntimeError("generator didn't stop after throw()") instead -- the real
+    exception (here, what would be optuna.TrialPruned in production) is
+    destroyed. enable_mlflow=True is what every production sweep config
+    uses, so this path is the one that matters."""
+
+    class Sentinel(Exception):
+        pass
+
+    class FakeMlflow:
+        MlflowClient = _FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            return _FakeRun()
+
+        def log_params(self, params):
+            pass
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow())
+    sentinel = Sentinel("prune me")
+    with pytest.raises(Sentinel) as excinfo:
+        with mlflow_utils.child_run({"enable_mlflow": True}, run_name="x"):
+            raise sentinel
+    # Not just the same type -- the same object, unchanged.
+    assert excinfo.value is sentinel
+
+
+def test_the_run_is_recorded_as_failed_not_finished_when_the_body_raises(monkeypatch):
+    """`mlflow.start_run(...)` used as a context manager marks the run
+    FINISHED on clean exit and FAILED when the body raises. child_run must
+    preserve that distinction even though it can no longer use a plain
+    `with` statement (see the bug this file is named for) -- a crashed or
+    pruned run must never show up as a normal FINISHED one."""
+
+    created = {}
+
+    class FakeMlflow:
+        MlflowClient = _FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            created["run"] = _FakeRun()
+            return created["run"]
+
+        def log_params(self, params):
+            pass
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow())
+
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        with mlflow_utils.child_run({"enable_mlflow": True}, run_name="x"):
+            raise Boom("crashed")
+
+    exc_type, exc, _ = created["run"].exit_args
+    assert exc_type is Boom
+    assert isinstance(exc, Boom)
+
+
+def test_a_setup_failure_after_start_run_still_degrades_to_a_no_op_run(monkeypatch, capsys):
+    """A failure between a successful start_run() and the first log_params
+    (still "setup") must degrade to untracked like every other setup
+    failure -- not raise, and not leave the half-opened run stuck RUNNING
+    on the server forever."""
+
+    created = {}
+
+    class FakeMlflow:
+        MlflowClient = _FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            created["run"] = _FakeRun()
+            return created["run"]
+
+        def log_params(self, params):
+            raise RuntimeError("tracking backend rejected the params")
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow())
+    with mlflow_utils.child_run({"enable_mlflow": True}, run_name="x") as run:
+        assert run.active is False
+
+    assert "continuing untracked" in capsys.readouterr().out
+    # The half-opened run must be closed out as failed, not left dangling.
+    assert created["run"].exit_args[0] is RuntimeError
+
+
+def test_a_broken_log_metrics_call_during_the_body_does_not_propagate(monkeypatch, capsys):
+    """The per-call tolerance that used to live in the outer catch-all now
+    has to live in _LiveRun itself: a tracking outage discovered mid-run
+    (not at setup) must still not cost a GPU job."""
+
+    class FakeMlflow:
+        MlflowClient = _FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            return _FakeRun()
+
+        def log_params(self, params):
+            pass
+
+        def log_metrics(self, metrics, step=None):
+            raise RuntimeError("tracking backend hiccup")
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow())
+    with mlflow_utils.child_run({"enable_mlflow": True}, run_name="x") as run:
+        assert run.active is True
+        run.log_metrics({"acc": 1.0}, step=1)  # must not raise
+
+    assert "continuing untracked" in capsys.readouterr().out
