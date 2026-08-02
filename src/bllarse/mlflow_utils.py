@@ -114,7 +114,7 @@ class _LiveRun:
             return
         try:
             self._mlflow.log_metrics(clean, step=step)
-        except Exception as exc:  # pragma: no cover - network dependent
+        except Exception as exc:
             self._report("log_metrics", exc)
 
     def set_tags(self, tags: Mapping[str, Any]) -> None:

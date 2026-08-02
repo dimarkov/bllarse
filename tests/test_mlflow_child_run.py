@@ -352,3 +352,76 @@ def test_a_broken_log_metrics_call_during_the_body_does_not_propagate(monkeypatc
         run.log_metrics({"acc": 1.0}, step=1)  # must not raise
 
     assert "continuing untracked" in capsys.readouterr().out
+
+
+class _ExplodingExitRun:
+    """Models start_run() succeeding but end_run (the __exit__ side) failing
+    -- e.g. the tracking server drops the connection mid-flush. Used to pin
+    both teardown branches, the highest-risk part of the diff: a future edit
+    that widened the teardown try to `BaseException` or moved the bare
+    `raise` inside it would silently start swallowing exceptions again, with
+    nothing here to catch it."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        raise RuntimeError("end_run failed: connection reset")
+
+
+def test_a_teardown_failure_on_a_clean_exit_is_caught_and_reported(monkeypatch, capsys):
+    """No body exception in flight: __exit__ (end_run) itself raising must
+    degrade to "continuing untracked", not propagate out of an otherwise
+    successful run."""
+
+    class FakeMlflow:
+        MlflowClient = _FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            return _ExplodingExitRun()
+
+        def log_params(self, params):
+            pass
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow())
+    with mlflow_utils.child_run({"enable_mlflow": True}, run_name="x") as run:
+        assert run.active is True
+
+    assert "continuing untracked" in capsys.readouterr().out
+
+
+def test_a_teardown_failure_while_a_body_exception_is_in_flight_does_not_mask_it(
+    monkeypatch, capsys
+):
+    """A body exception is in flight AND __exit__ (end_run) itself raises.
+    The caller must still receive the ORIGINAL body exception, as its own
+    object and type -- not the teardown failure, and not the generic
+    RuntimeError this whole file is named for."""
+
+    class FakeMlflow:
+        MlflowClient = _FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            return _ExplodingExitRun()
+
+        def log_params(self, params):
+            pass
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow())
+
+    class Sentinel(Exception):
+        pass
+
+    sentinel = Sentinel("prune me")
+    with pytest.raises(Sentinel) as excinfo:
+        with mlflow_utils.child_run({"enable_mlflow": True}, run_name="x"):
+            raise sentinel
+
+    assert excinfo.value is sentinel
+    assert "continuing untracked" in capsys.readouterr().out
