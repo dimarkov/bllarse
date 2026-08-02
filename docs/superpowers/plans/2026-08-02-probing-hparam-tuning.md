@@ -80,8 +80,8 @@ Apptainer on MPCDF Raven, SLURM, MLflow.
 | Path | Change |
 |---|---|
 | `scripts/vbll_pytorch/src/vbll_experiments/models.py:272-299` | `build_vbll_head` gains `cov_rank` |
-| `scripts/vbll_pytorch/probing_vbll.py` | `--cov-rank`, `head_params`, `on_dump` |
-| `scripts/alternatives/probe.py` | `head_params`, `on_dump` |
+| `scripts/vbll_pytorch/probing_vbll.py` | `--cov-rank`, `head_param_count`, `on_dump` |
+| `scripts/alternatives/probe.py` | `head_param_count`, `on_dump` |
 | `src/bllarse/tools/adapters.py` | Public `load_script_module` |
 | `bllarse_sweeps/probe_adamw_ce.py` | Drop `imagenet1k`; read tuned lookup |
 | `bllarse_sweeps/probe_vbll.py` | Drop `imagenet1k`; read tuned lookup |
@@ -271,7 +271,7 @@ git commit -m "feat(vbll): make cov_rank reachable from the probing path"
 
 ---
 
-### Task 2: Log `head_params` from both arms
+### Task 2: Log `head_param_count` from both arms
 
 The appendix Pareto front plots calibration against head parameter count. That
 count must come off the run, not be recomputed by a plotting script — a
@@ -284,8 +284,8 @@ recomputation is a second implementation of the thing being compared.
 
 **Interfaces:**
 - Consumes: Task 1's `build_vbll_head(..., cov_rank=...)`.
-- Produces: `probe.head_params(head) -> int` and
-  `probing_vbll.head_params(head) -> int`. Both scripts log `head_params` in
+- Produces: `probe.head_param_count(head) -> int` and
+  `probing_vbll.head_param_count(head) -> int`. Both scripts log `head_param_count` in
   their `run.log_params({...})` call.
 
 - [ ] **Step 1: Write the failing test for the JAX arm**
@@ -301,7 +301,7 @@ def test_head_params_counts_every_array_leaf():
 
     head = eqx.nn.Linear(16, 3, key=jr.PRNGKey(0))
     # 16*3 weights + 3 biases
-    assert probe.head_params(head) == 51
+    assert probe.head_param_count(head) == 51
 
 
 def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypatch):
@@ -344,7 +344,7 @@ def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypat
     probe.main(args)
 
     # 16 feature dims x 2 classes + 2 biases
-    assert logged["head_params"] == 34
+    assert logged["head_param_count"] == 34
 ```
 
 - [ ] **Step 2: Write the failing test for the VBLL arm**
@@ -359,22 +359,22 @@ def test_head_params_counts_every_head_parameter():
 
     head = build_vbll_head(32, 5, parameterization="diagonal")
     expected = sum(p.numel() for p in head.parameters())
-    assert probing_vbll.head_params(head) == expected
+    assert probing_vbll.head_param_count(head) == expected
     assert expected > 0
 
 
 def test_head_params_grows_with_cov_rank():
     """Ties Task 1's plumbing to the number the appendix actually plots: if
-    cov_rank stopped reaching the head, head_params would go flat across the
+    cov_rank stopped reaching the head, head_param_count would go flat across the
     Pareto front's six ranks and the front would look like a vertical line."""
     from vbll_experiments.models import build_vbll_head
 
     import probing_vbll
 
-    r2 = probing_vbll.head_params(
+    r2 = probing_vbll.head_param_count(
         build_vbll_head(32, 5, parameterization="lowrank", cov_rank=2)
     )
-    r8 = probing_vbll.head_params(
+    r8 = probing_vbll.head_param_count(
         build_vbll_head(32, 5, parameterization="lowrank", cov_rank=8)
     )
     assert r8 > r2
@@ -384,20 +384,20 @@ def test_head_params_grows_with_cov_rank():
 
 ```bash
 apptainer exec --nv --env PYTHONPATH=$PWD/src bllarse-jax.sif \
-  python -m pytest tests/test_probe_smoke.py -k head_params -v
+  python -m pytest tests/test_probe_smoke.py -k head_param_count -v
 apptainer exec --nv \
   --env PYTHONPATH=$PWD/src:$PWD/scripts/vbll_pytorch/src bllarse-torch.sif \
-  python -m pytest tests/test_probing_vbll_smoke.py -k head_params -v
+  python -m pytest tests/test_probing_vbll_smoke.py -k head_param_count -v
 ```
 
-Expected: FAIL — `AttributeError: module 'probe' has no attribute 'head_params'`.
+Expected: FAIL — `AttributeError: module 'probe' has no attribute 'head_param_count'`.
 
 - [ ] **Step 4: Implement in the JAX arm**
 
 In `scripts/alternatives/probe.py`, add after the `steps_per_epoch` function:
 
 ```python
-def head_params(head) -> int:
+def head_param_count(head) -> int:
     """Trainable parameter count of the head.
 
     Logged per run because Fig-appendix's rank/cost Pareto front plots
@@ -426,7 +426,7 @@ Then extend the existing `run.log_params` call in `main`:
         run.log_params({
             "steps_per_epoch": per_epoch,
             "total_steps": total_steps,
-            "head_params": head_params(head),
+            "head_param_count": head_param_count(head),
         })
 ```
 
@@ -435,8 +435,8 @@ Then extend the existing `run.log_params` call in `main`:
 In `scripts/vbll_pytorch/probing_vbll.py`, add after the `_forward` function:
 
 ```python
-def head_params(head) -> int:
-    """Trainable parameter count of the head. See probe.head_params -- both arms
+def head_param_count(head) -> int:
+    """Trainable parameter count of the head. See probe.head_param_count -- both arms
     must report this identically or the Pareto front's cost axis is not a single
     axis."""
     return int(sum(p.numel() for p in head.parameters()))
@@ -448,7 +448,7 @@ Then extend the existing `run.log_params` call in `main`:
         run.log_params({
             "steps_per_epoch": n_batches,
             "total_steps": total_steps,
-            "head_params": head_params(head),
+            "head_param_count": head_param_count(head),
         })
 ```
 
@@ -469,7 +469,7 @@ Expected: PASS.
 ```bash
 git add scripts/alternatives/probe.py scripts/vbll_pytorch/probing_vbll.py \
         tests/test_probe_smoke.py tests/test_probing_vbll_smoke.py
-git commit -m "feat(probe): log head_params from both arms"
+git commit -m "feat(probe): log head_param_count from both arms"
 ```
 
 ---
@@ -2902,7 +2902,7 @@ the cost of any calibration gain is visible rather than asserted.
 
 **Interfaces:**
 - Consumes: `tuning.tuned_config` (Task 10); `--cov-rank` (Task 1);
-  `head_params` logging (Task 2).
+  `head_param_count` logging (Task 2).
 - Produces: 3 datasets x 6 ranks x 3 seeds = 54 configs, VBLL only.
 
 - [ ] **Step 1: Write the failing test**
@@ -2989,7 +2989,7 @@ Two caveats belong in the appendix text:
     front is therefore a lower bound on what each rank could achieve, not a
     tuned comparison. Re-tuning per rank would multiply the cost by the number
     of ranks and is not justified for an appendix.
-  - The cost axis is the logged `head_params`, read off each run, not a count
+  - The cost axis is the logged `head_param_count`, read off each run, not a count
     recomputed by the plotting script.
 """
 

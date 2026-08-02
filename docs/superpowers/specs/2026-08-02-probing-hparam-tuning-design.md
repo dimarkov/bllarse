@@ -185,7 +185,7 @@ tuned config.
   `probing_vbll.py`. **Lowrank is currently unreachable from the probing path** —
   `build_vbll_head` does not accept the argument and the script has no flag — so
   stage 5's Pareto front cannot be produced without this.
-- Log `head_params` from both arms, so cost is a recorded quantity rather than
+- Log `head_param_count` from both arms, so cost is a recorded quantity rather than
   something a plotting script recomputes.
 - Add `optuna` to both `.def` images; rebuild.
 - Remove `imagenet1k` from `probe_vbll.py` and `probe_adamw_ce.py`.
@@ -260,7 +260,7 @@ Two honest caveats to state in the appendix text:
   The front is therefore a lower bound on what each rank could achieve, not a
   tuned comparison. Re-tuning per rank would multiply the cost by the number of
   ranks and is not justified for an appendix.
-- Head parameter count must be logged (`head_params`) by both arms so the front
+- Head parameter count must be logged (`head_param_count`) by both arms so the front
   is derivable from runs rather than recomputed by hand in a plotting script.
 
 Cost: 3 datasets x 6 ranks x 3 seeds = 54 runs, VBLL only. Negligible next to
