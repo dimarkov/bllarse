@@ -50,3 +50,50 @@ def test_tiny_training_sets_raise_rather_than_returning_an_unusable_cap():
     a ladder the spec does not describe."""
     with pytest.raises(ValueError, match="too small"):
         space.batch_cap(32)
+
+
+class _FakeTrial:
+    """Records what `suggest` asks for without depending on optuna.
+
+    `space.suggest` takes `trial: Any` specifically so this module -- and its
+    tests -- never need optuna installed; neither container image has it yet.
+    """
+
+    def __init__(self):
+        self.floats: dict[str, tuple[float, float, bool]] = {}
+        self.categoricals: dict[str, list] = {}
+
+    def suggest_float(self, name, low, high, *, log=False):
+        self.floats[name] = (low, high, log)
+        return low
+
+    def suggest_categorical(self, name, choices):
+        self.categoricals[name] = list(choices)
+        return choices[0]
+
+
+def test_learning_rate_lower_bound_is_1em3_not_1em4():
+    """Pinned per the pilot: at lr=1e-4, every dataset on both arms had its
+    val_nll minimum sitting at or within a hair of the final dumped step
+    (still improving 1.5-2.6 nats over the last quarter of the run) --
+    nowhere near converged at 4,000 steps. lr=3e-2 converged early everywhere
+    (minima at steps 5-904, mildly overfitting past the optimum) and beat
+    1e-4 on all 7 datasets on both arms. Sizing the campaign's budget so
+    1e-4 converges would have multiplied its compute 5-12x for a rate the
+    data shows is not competitive anywhere, so the floor is 1e-3 -- an
+    evidence-backed decision, not an arbitrary default, and this test is here
+    so it cannot silently drift back to 1e-4.
+    """
+    trial = _FakeTrial()
+    space.suggest(trial, "adamw_ce", "dtd")
+    assert trial.floats["learning_rate"] == (1e-3, 3e-2, True)
+
+
+@pytest.mark.parametrize("arm", ["adamw_ce", "vbll"])
+def test_suggest_works_with_a_duck_typed_trial(arm):
+    """`suggest` must work with any object shaped like a trial -- not
+    specifically optuna.Trial -- since optuna is not installed in either
+    container image yet."""
+    trial = _FakeTrial()
+    params = space.suggest(trial, arm, "dtd")
+    assert params["learning_rate"] == 1e-3

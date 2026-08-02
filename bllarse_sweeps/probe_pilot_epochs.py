@@ -30,7 +30,7 @@ PILOT_STEPS = 4_000
 PILOT_BATCH = 512
 PILOT_SEED = 200  # a tuning seed, never a reported one
 
-LEARNING_RATES = [1e-4, 3e-2]  # the extremes of the tuning range
+LEARNING_RATES = [1e-3, 3e-2]  # the extremes of the tuning range
 
 SCRIPTS = {
     "adamw_ce": "scripts/alternatives/probe.py",

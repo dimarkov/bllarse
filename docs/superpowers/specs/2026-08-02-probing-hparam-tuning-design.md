@@ -97,7 +97,7 @@ optimised by AdamW.
 
 | Param | Arms | Distribution | Range |
 |---|---|---|---|
-| `learning_rate` | both | log-uniform | `1e-4` … `3e-2` |
+| `learning_rate` | both | log-uniform | `1e-3` … `3e-2` |
 | `weight_decay` | both | log-uniform | `1e-5` … `1e-1` |
 | `batch_size` | both | categorical, powers of 2 | 64 … dataset cap |
 | `prior_scale` | VBLL | log-uniform | `1e-2` … `1e2` |
@@ -105,6 +105,18 @@ optimised by AdamW.
 
 `parameterization` is **fixed to `diagonal`** and `cov_rank` is not searched —
 see "Why `cov_rank` is not a tuned axis". VBLL therefore has 5 free axes, not 7.
+
+The lower bound was originally `1e-4`, and the pilot (below) killed it: at
+`lr=1e-4`, every dataset on both arms had its `val_nll` minimum sitting at or
+within a hair of the final dumped step, still improving 1.5-2.6 nats over just
+the final quarter of the dump grid — nowhere near converged at 4,000 steps.
+`lr=3e-2`, by contrast, converged early everywhere (minima at steps 5-904,
+with a mildly overfitting negative final-quarter delta — the shape of a real
+interior minimum), and beat `lr=1e-4` on all 7 datasets on both arms (e.g.
+stanford_cars CE: 2.322 vs 0.389; food101 CE: 0.663 vs 0.196). Sizing the
+campaign's step budget so `1e-4` converges would have multiplied its compute
+5-12x to accommodate a rate the data shows is not competitive anywhere, so the
+range's floor moved to `1e-3` instead.
 
 ### batch_size caps
 
@@ -196,7 +208,7 @@ Both arms were still improving at the final dump at 40 epochs (CE `val_nll`
 0.1895 → 0.1806, VBLL 2.8315 → 2.8264 between steps 4707 and 5880), so
 `at_last_step` is true and 40 epochs truncates.
 
-Run the LR extremes (`1e-4`, `3e-2`) x 7 datasets x 2 arms at a generous epoch
+Run the LR extremes (`1e-3`, `3e-2`) x 7 datasets x 2 arms at a generous epoch
 cap. Raise the per-dataset budget until `at_last_step` is false for >=90% of
 pilot configs, subject to a ceiling so a pathological LR cannot drive the budget
 without bound. Budgets are per dataset — food101 and dtd differ 21x in

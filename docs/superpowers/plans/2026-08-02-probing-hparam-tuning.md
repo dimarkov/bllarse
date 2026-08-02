@@ -787,8 +787,15 @@ def suggest(trial: Any, arm: str, dataset: str) -> dict[str, Any]:
     if arm not in ("adamw_ce", "vbll"):
         raise ValueError(f"unknown arm {arm!r}")
 
+    # Lower bound raised from 1e-4 to 1e-3 after the pilot: at lr=1e-4, every
+    # dataset on both arms still had its val_nll minimum sitting at or within
+    # a hair of the final dumped step (still improving 1.5-2.6 nats over the
+    # last quarter of the run), while lr=3e-2 converged early everywhere
+    # (minima at steps 5-904, mildly overfitting past the optimum). 1e-4 lost
+    # to 3e-2 on all 7 datasets on both arms, so keeping it in the range would
+    # only inflate the pilot's step budget for a rate the data rules out.
     params: dict[str, Any] = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 3e-2, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 3e-2, log=True),
         "weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-1, log=True),
         "batch_size": trial.suggest_categorical("batch_size", batch_sizes(dataset)),
     }
@@ -844,7 +851,7 @@ PILOT_STEPS = 4_000
 PILOT_BATCH = 512
 PILOT_SEED = 200  # a tuning seed, never a reported one
 
-LEARNING_RATES = [1e-4, 3e-2]  # the extremes of the tuning range
+LEARNING_RATES = [1e-3, 3e-2]  # the extremes of the tuning range
 
 SCRIPTS = {
     "adamw_ce": "scripts/alternatives/probe.py",
