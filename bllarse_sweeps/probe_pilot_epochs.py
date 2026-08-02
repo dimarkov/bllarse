@@ -21,12 +21,17 @@ from bllarse.tuning import space
 
 GROUP_ID = "probe_pilot_epochs"
 
-# 4,000 steps at the pilot batch size. Generous by construction: the current
-# 40-epoch food101 run is 5,880 steps at batch 512 and the argmin sits at the
-# last one, but the small datasets are 280 steps under the same setting -- so
-# the pilot's job is to be long enough that the argmin lands strictly inside it
-# for every dataset. budgets.py reports it loudly if that fails.
-PILOT_STEPS = 4_000
+# 12,000 steps at the pilot batch size. At the previous limit of 4,000, six of
+# 28 pilot runs still had their val_nll minimum at the final dumped step—all at
+# lr=1e-3, the slow end of the learning-rate search range. The worst was
+# stanford_cars on the AdamW+CE arm, still improving by 1.63 nats over the
+# final quarter of the dump grid. The fast end (lr=3e-2) converges by step 904
+# at the latest, making the budget question entirely about how long the slow
+# end needs. We chose 3x to overshoot rather than iterate. Note: a larger
+# PILOT_STEPS does not directly inflate per-trial cost, since derive_budgets
+# caps each dataset's budget at --ceiling-steps. The pilot is a measurement;
+# the ceiling bounds cost.
+PILOT_STEPS = 12_000
 PILOT_BATCH = 512
 PILOT_SEED = 200  # a tuning seed, never a reported one
 
