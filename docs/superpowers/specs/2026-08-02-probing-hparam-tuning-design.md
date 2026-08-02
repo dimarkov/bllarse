@@ -256,18 +256,27 @@ Measured on Raven, `dinov3_huge`, food101, 40 epochs (5,880 steps):
 
 | Arm | Wall per run |
 |---|---:|
-| AdamW+CE | **460 s** |
-| VBLL | **101 s** |
+| AdamW+CE | **101.9 s** |
+| VBLL | **101.4 s** |
 
-The AdamW+CE arm is 4.5x *slower* than VBLL for identical step counts, so CE
-drives the budget. Why is not yet understood — plausibly JIT recompilation or
-per-dump metric cost — and is worth investigating, since it dominates.
+The two arms are at parity. They were not: AdamW+CE originally took **460 s**,
+4.5x VBLL, because `probe.py`'s optimiser step ran in JAX's op-by-op eager mode
+— it was the only JAX training script in the repo with no `jit`. At these shapes
+the un-jitted step cost 58.5 ms against 2.2 ms jitted (26x), i.e. 344 s of the
+460 s. Hoisting the step into an `eqx.filter_jit`ed `_ce_step` brought the run
+to 101.9 s with **every reported metric bit-identical** (`test_acc=0.9541`,
+`test_ece=0.0340`, `test_nll=0.1879`, `temperature=0.7668`). Fixed before this
+campaign, so no tuning result depends on the slow path.
 
 With all 14 studies submitted concurrently (4 workers each = 56 GPU tasks), the
-critical path is CE/food101 at roughly 4 h, before pruning savings. Raising the
-epoch budget in stage 1 scales this proportionally; a 2–3x increase puts the
-campaign in the 8–12 h range. These are projections from one measured
-datapoint per arm, not measurements of the campaign itself.
+critical path is now food101 at roughly **1 h** per arm before pruning savings,
+down from ~4 h. Raising the epoch budget in stage 1 scales this proportionally;
+a 2–3x increase puts the campaign in the 2–3 h range. These are projections from
+one measured datapoint per arm, not measurements of the campaign itself.
+
+`_logits_for` remains un-jitted. It is the same root cause but a separate,
+smaller cost — 40 eval passes against 5,880 training steps — and was left alone
+rather than bundled into the fix. Worth measuring before changing.
 
 ## Risks
 
@@ -280,8 +289,8 @@ datapoint per arm, not measurements of the campaign itself.
 
 ## Open questions
 
-- Why is the JAX arm 4.5x slower than the torch arm? Resolving it could cut the
-  dominant cost several-fold, but it is not a blocker.
+- Is `_logits_for` worth jitting too? Same root cause, unmeasured share of the
+  remaining ~100 s. Measure before changing.
 - Should `prior_scale`/`wishart_scale` be parameterised relative to `D*C` rather
   than absolutely? The evidence says the good value scales with problem size, so
   an absolute range must be wide enough to cover all seven datasets. Tuning per

@@ -195,3 +195,51 @@ def test_the_samples_axis_is_comparable_across_batch_sizes(fake_features, tmp_pa
     # comparable across the two and `samples_seen` is, which is the point.
     assert max(r.meta["step"] for r in coarse) == 60
     assert max(r.meta["step"] for r in fine) == 120
+
+
+def test_ce_step_is_jitted_and_matches_the_eager_computation():
+    """The AdamW step must be compiled, and compiling it must not change the maths.
+
+    Measured on an A100 at the Fig-1 working shapes (D=1280, C=101, batch=512),
+    the un-jitted step cost 58.5 ms against 2.2 ms jitted -- 26x, which was
+    343 s of the 460 s a food101 run took. probe.py was the only JAX training
+    script in the repo with no jit at all; every sibling uses eqx.filter_jit.
+
+    The equivalence half of this test is the point: a speedup that perturbs the
+    update is not a speedup, it is a silent change to every published number.
+    """
+    import equinox as eqx
+    import jax.numpy as jnp
+    import optax
+    from jax import random as jr, vmap
+
+    import probe
+    from bllarse.losses import CrossEntropy
+
+    D, C, BS = 16, 3, 8
+    key = jr.PRNGKey(0)
+    key, hk, fk = jr.split(key, 3)
+    head = eqx.nn.Linear(D, C, key=hk)
+    loss_fn = CrossEntropy(0.0, C)
+    optimizer = optax.adamw(1e-3, weight_decay=1e-4)
+    opt_state = optimizer.init(eqx.filter(head, eqx.is_array))
+    fb = jr.normal(fk, (BS, D))
+    yb = jr.randint(fk, (BS,), 0, C)
+
+    # The step is jitted: equinox exposes .lower() only on wrapped callables.
+    assert hasattr(probe._ce_step, "lower"), "_ce_step is not wrapped in eqx.filter_jit"
+
+    def eager(head, opt_state):
+        def loss(h):
+            return loss_fn(vmap(h)(fb), yb).mean()
+        grads = eqx.filter_grad(loss)(head)
+        updates, opt_state = optimizer.update(
+            grads, opt_state, eqx.filter(head, eqx.is_array)
+        )
+        return eqx.apply_updates(head, updates), opt_state
+
+    want_head, _ = eager(head, opt_state)
+    got_head, _ = probe._ce_step(head, opt_state, optimizer, loss_fn, fb, yb)
+
+    assert jnp.allclose(got_head.weight, want_head.weight, atol=1e-6)
+    assert jnp.allclose(got_head.bias, want_head.bias, atol=1e-6)

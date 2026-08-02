@@ -47,6 +47,34 @@ def steps_per_epoch(n_train: int, batch_size: int) -> int:
     return n_batches
 
 
+@eqx.filter_jit
+def _ce_step(head, opt_state, optimizer, loss_fn, fb, yb):
+    """One AdamW step. Hoisted out of the epoch loop so it can be compiled ONCE.
+
+    Inlined in the loop this ran in JAX's op-by-op eager mode: every primitive
+    dispatched separately from Python with no fusion. Measured on an A100 at the
+    Fig-1 working shapes (D=1280, C=101, batch=512), that cost 58.5 ms/step
+    against 2.2 ms jitted -- 26x, or 343 s of the 460 s a 5,880-step food101 run
+    took. probe.py was the only JAX training script in the repo without a jit;
+    vit_classification, sample_efficiency and full_finetune_comparison all use
+    eqx.filter_jit.
+
+    `optimizer` and `loss_fn` are passed rather than closed over: filter_jit
+    traces their array leaves (CrossEntropy.beta) and holds the rest static, so
+    the signature stays explicit and the function stays importable for testing.
+    Shapes are constant across steps because steps_per_epoch drops the
+    remainder, so this compiles once per run, not once per step.
+    """
+    def loss(h):
+        return loss_fn(vmap(h)(fb), yb).mean()
+
+    grads = eqx.filter_grad(loss)(head)
+    updates, opt_state = optimizer.update(
+        grads, opt_state, eqx.filter(head, eqx.is_array)
+    )
+    return eqx.apply_updates(head, updates), opt_state
+
+
 def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, key):
     """One AdamW pass, yielding (head, opt_state) after every optimiser step.
 
@@ -59,15 +87,7 @@ def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, ke
     for i in range(steps_per_epoch(len(feats), batch_size)):
         idx = perm[i * batch_size:(i + 1) * batch_size]
         fb, yb = jnp.asarray(feats[idx]), jnp.asarray(labels[idx])
-
-        def loss(h):
-            return loss_fn(vmap(h)(fb), yb).mean()
-
-        grads = eqx.filter_grad(loss)(head)
-        updates, opt_state = optimizer.update(
-            grads, opt_state, eqx.filter(head, eqx.is_array)
-        )
-        head = eqx.apply_updates(head, updates)
+        head, opt_state = _ce_step(head, opt_state, optimizer, loss_fn, fb, yb)
         yield head, opt_state
 
 
