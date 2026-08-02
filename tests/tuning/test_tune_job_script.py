@@ -49,3 +49,31 @@ def test_it_passes_a_patience_of_20_by_default():
     text = SCRIPT.read_text()
     assert "--patience" in text
     assert "BLLARSE_TUNE_PATIENCE:-20" in text
+
+
+def test_it_disables_cuda_graph_command_buffers_for_the_jax_arm():
+    """13/14 tuning studies died on large-batch trials (batch 8192, 2048) with
+    `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED: operation not permitted when stream
+    is capturing` inside jit__ce_step, followed by a fatal cublasLtMatmul
+    INTERNAL error -- XLA's CUDA-graph command-buffer capture colliding with
+    `XLA_PYTHON_CLIENT_ALLOCATOR=platform` (set in bllarse-jax.def). The flag
+    must be present in the script's live `apptainer exec` invocation, not just
+    mentioned in a comment, and it must be unconditional -- it is harmless for
+    the torch/VBLL image, which never touches XLA."""
+    text = SCRIPT.read_text()
+
+    # Strip comment lines so a mention in prose (e.g. this file's own header
+    # explaining the fix) cannot satisfy the assertion -- the flag must appear
+    # in code that actually runs.
+    live_lines = [
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    ]
+    live_text = "\n".join(live_lines)
+
+    assert '--env "XLA_FLAGS=--xla_gpu_enable_command_buffer="' in live_text
+    # Must land in the unconditional part of env_args() -- not behind one of
+    # the `[[ -n ... ]] &&` guards used for optional vars below it -- so split
+    # on comment-stripped text where parens genuinely close the array.
+    assert "env_args=(" in live_text
+    env_args_block = live_text.split("env_args=(", 1)[1].split(")", 1)[0]
+    assert "XLA_FLAGS=--xla_gpu_enable_command_buffer=" in env_args_block

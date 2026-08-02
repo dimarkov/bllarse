@@ -225,6 +225,14 @@ def main() -> None:
     study = open_study(args.arm, args.dataset, args.storage_dir)
     group_id = f"tune_{args.arm}_{args.dataset}"
 
+    def log_failed_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        # Printed unconditionally on any non-COMPLETE, non-PRUNED outcome so a
+        # study that is quietly failing every trial is visible in the SLURM log
+        # instead of looking like ordinary slow progress.
+        if trial.state == optuna.trial.TrialState.FAIL:
+            print(f"[tune] WARNING: trial {trial.number} FAILED "
+                  f"(arm={args.arm} dataset={args.dataset})")
+
     study.optimize(
         make_objective(
             args.arm, args.dataset,
@@ -240,6 +248,20 @@ def main() -> None:
             mlflow_experiment=args.mlflow_experiment,
         ),
         n_trials=args.n_trials,
+        # `catch=(Exception,)`, not the default (propagate): this is exactly
+        # how 13/56 worker tasks died on the CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED
+        # crash -- each one abandoned the 15+ trials it still had left. A
+        # caught trial is recorded FAILED and the worker moves on. Scoped to
+        # `Exception`, deliberately NOT `BaseException`: optuna.TrialPruned is
+        # itself an Exception subclass but must reach Optuna's own handling
+        # inside `study.optimize`, not be caught here and misrecorded as a
+        # failure -- Optuna special-cases TrialPruned before this `catch` tuple
+        # is consulted. `KeyboardInterrupt`/`SystemExit` derive from
+        # BaseException, not Exception, so this scope already excludes them
+        # without needing to say so explicitly -- a Ctrl-C or job-timeout SIGTERM
+        # still tears the worker down instead of being swallowed as a failure.
+        catch=(Exception,),
+        callbacks=[log_failed_trial],
     )
     print(f"[tune] {study.study_name}: {len(study.trials)} trials, "
           f"best={study.best_value:.5f} params={study.best_params}")

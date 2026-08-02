@@ -67,6 +67,20 @@ fi
 env_args=(
   --env "BLLARSE_REPO_ROOT=$repo_root"
   --env "PYTHONPATH=${repo_root}/src:${repo_root}/scripts/vbll_pytorch/src${PYTHONPATH:+:${PYTHONPATH}}"
+  # Unconditional, not arm-gated: it is harmless on the torch/VBLL image, which
+  # never touches XLA for training. On the JAX arm, large-batch trials (seen at
+  # batch 8192 and 2048 -- exactly what TPE explores) crashed workers with
+  # `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED: operation not permitted when stream
+  # is capturing` inside jit__ce_step, followed by
+  # `cuda_command_buffer.cc:862] CUDA error: Failed to destroy CUDA graph` and
+  # a fatal cublasLtMatmul INTERNAL error -- i.e. XLA's CUDA-graph
+  # command-buffer capture colliding with `XLA_PYTHON_CLIENT_ALLOCATOR=platform`
+  # set in bllarse-jax.def's %environment. The empty value disables command
+  # buffers entirely; this was verified live on a GPU node against the exact
+  # failing config (food101, batch 8192, lr 0.028) before being added here. Do
+  # NOT remove this "since it looks like a no-op flag" -- without it, large
+  # batches on the JAX arm reliably kill the worker process mid-trial.
+  --env "XLA_FLAGS=--xla_gpu_enable_command_buffer="
 )
 [[ -n "${HF_TOKEN:-}" ]] && env_args+=(--env "HF_TOKEN=$HF_TOKEN")
 [[ -n "${HF_HOME:-}" ]] && env_args+=(--env "HF_HOME=$HF_HOME")
