@@ -7,6 +7,7 @@ SWEEPS = [
     "bllarse_sweeps/probe_vbll.py",
     "bllarse_sweeps/probe_ood_adamw_ce.py",
     "bllarse_sweeps/probe_ood_vbll.py",
+    "bllarse_sweeps/probe_pilot_epochs.py",
 ]
 
 LADDER = {"dinov3_small", "dinov3_big", "dinov3_large", "dinov3_huge"}
