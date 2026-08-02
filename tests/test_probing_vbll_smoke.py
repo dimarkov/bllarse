@@ -230,3 +230,50 @@ def test_head_params_grows_with_cov_rank():
         build_vbll_head(32, 5, parameterization="lowrank", cov_rank=8)
     )
     assert r8 > r2
+
+
+def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypatch):
+    """The Pareto front plots calibration against head size. Recomputing that
+    size in the plotting script would be a second implementation of the exact
+    quantity being compared, and it would silently disagree the moment a head
+    gains a parameter. This test ensures the VBLL arm actually logs it."""
+    import contextlib
+
+    import probing_vbll
+
+    logged = {}
+
+    class Recorder:
+        active = False
+
+        def log_params(self, params):
+            logged.update(params)
+
+        def log_metrics(self, metrics, step=None):
+            pass
+
+        def set_tags(self, tags):
+            pass
+
+    @contextlib.contextmanager
+    def fake_child_run(config, *, run_name, tags=None):
+        yield Recorder()
+
+    monkeypatch.setattr(probing_vbll, "child_run", fake_child_run)
+
+    args = probing_vbll.build_argparser().parse_args([
+        "--model", "dinov3_small", "--dataset", "fake",
+        "--num-classes", "2", "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "hp", "--uid", "vbll_hp_0",
+        "--epochs", "2", "--n-dumps", "2", "--seed", "137", "--device", "cpu",
+    ])
+    probing_vbll.main(args)
+
+    # Verify the key is present and has a reasonable value
+    assert "head_param_count" in logged, "head_param_count must be logged"
+    assert isinstance(logged["head_param_count"], int)
+    # 16 feature dims x 2 classes x 2 (mean + logdiag) + 2 biases + 2 frozen noise_mean
+    # For diagonal: W_mean (16*2=32) + W_logdiag (16*2=32) + bias (2) + noise_mean (2)
+    assert logged["head_param_count"] == 68

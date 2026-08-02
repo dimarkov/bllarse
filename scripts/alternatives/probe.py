@@ -49,13 +49,19 @@ def steps_per_epoch(n_train: int, batch_size: int) -> int:
 
 
 def head_param_count(head) -> int:
-    """Trainable parameter count of the head.
+    """Total parameter count of the head (memory cost, trainable or frozen).
 
-    Logged per run because Fig-appendix's rank/cost Pareto front plots
-    calibration against head size: VBLL costs D*C*(2+r) and IBProbit costs
-    D*(D-1)/2, independent of C, so the ranks that match IBProbit's budget
-    differ by two orders of magnitude across one figure's panels. Reading the
-    count off the run keeps that axis a recorded quantity.
+    Counts every stored parameter the head holds, including any frozen parameters,
+    because the Pareto front plots calibration against *memory cost*, not just
+    trainable degrees of freedom. (For the adamw_ce arm, all parameters are
+    trainable, so this is the number that appears in the figures. Both arms must
+    report this identically or the Pareto front's cost axis is not a single axis.)
+
+    Logged per run because Fig-appendix's rank/cost Pareto front plots calibration
+    against head size: VBLL costs D*C*(2+r) and IBProbit costs D*(D-1)/2,
+    independent of C, so the ranks that match IBProbit's budget differ by two
+    orders of magnitude across one figure's panels. Reading the count off the run
+    keeps that axis a recorded quantity.
     """
     return int(
         sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(head, eqx.is_array)))

@@ -51,9 +51,17 @@ def _forward(head, feats, device, chunk=4096):
 
 
 def head_param_count(head) -> int:
-    """Trainable parameter count of the head. See probe.head_param_count -- both arms
-    must report this identically or the Pareto front's cost axis is not a single
-    axis."""
+    """Total parameter count of the head (memory cost, trainable or frozen).
+
+    Counts every stored parameter, including vbll's frozen noise_mean (C elements),
+    because the Pareto front plots calibration against *memory cost*, not just
+    trainable degrees of freedom. This is why the count differs from a trainable-only
+    tally: a frozen parameter still occupies memory on the device.
+
+    Both arms must report this identically or the Pareto front's cost axis is not a
+    single axis. See probe.head_param_count for the parallel implementation and
+    motivation.
+    """
     return int(sum(p.numel() for p in head.parameters()))
 
 
