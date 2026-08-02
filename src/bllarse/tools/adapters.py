@@ -45,7 +45,7 @@ def _resolve_repo_root(script_path: str | Path) -> Path:
     return Path.cwd().resolve()
 
 
-def _resolve_script_path(script_path: str | Path) -> Path:
+def resolve_script_path(script_path: str | Path) -> Path:
     requested = Path(script_path).expanduser()
     if requested.is_absolute():
         resolved = requested.resolve()
@@ -60,6 +60,21 @@ def _resolve_script_path(script_path: str | Path) -> Path:
             "Set BLLARSE_REPO_ROOT when launching outside the repository."
         )
     return resolved
+
+
+def load_script_module(script_path: str | Path) -> Any:
+    """Import a training script as a module, resolving repo-relative paths.
+
+    Public because the tuning objective needs `main(args, on_dump=...)`, which
+    run_script_from_config cannot express -- and duplicating the resolution
+    would duplicate its knowledge of BLLARSE_REPO_ROOT and the scripts/ prefix.
+    """
+    return get_module_from_source_path(resolve_script_path(script_path))
+
+
+def parse_config(module: Any, config: Mapping[str, Any]) -> Namespace:
+    """Parse a config mapping with a script's own argparser."""
+    return module.build_argparser().parse_args(config_to_argv(config))
 
 
 def run_training_from_config(config: Mapping[str, Any]) -> None:
@@ -77,10 +92,8 @@ def run_script_from_config(
     config: Mapping[str, Any],
 ) -> None:
     """Parse a config with a script's CLI and invoke its main function."""
-    module = get_module_from_source_path(_resolve_script_path(script_path))
-    build_argparser: Callable[[], Any] = module.build_argparser
-    parser = build_argparser()
-    args: Namespace = parser.parse_args(config_to_argv(config))
+    module = load_script_module(script_path)
+    args = parse_config(module, config)
 
     train_main = module.main
     if not hasattr(module, "build_configs"):
