@@ -172,3 +172,33 @@ def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
     ])
     with pytest.raises(ValueError, match="batch-size"):
         probing_vbll.main(args)
+
+
+def test_cov_rank_reaches_the_head_and_changes_its_size():
+    """Lowrank was unreachable from the probing path: build_vbll_head did not
+    accept cov_rank, so `--parameterization lowrank` silently built whatever
+    rank vbll defaults to. The appendix Pareto front sweeps rank 2..64 and
+    would have produced six identical curves."""
+    from vbll_experiments.models import build_vbll_head
+
+    def n_params(**kw):
+        head = build_vbll_head(32, 5, **kw)
+        return sum(p.numel() for p in head.parameters())
+
+    diag = n_params(parameterization="diagonal")
+    r2 = n_params(parameterization="lowrank", cov_rank=2)
+    r4 = n_params(parameterization="lowrank", cov_rank=4)
+
+    assert diag < r2 < r4, (
+        f"cov_rank is not reaching the head: diagonal={diag} r2={r2} r4={r4}"
+    )
+
+
+def test_cov_rank_flag_is_exposed_by_the_probing_cli():
+    import probing_vbll
+
+    args = probing_vbll.build_argparser().parse_args([
+        "--model", "dinov3_small", "--dataset", "fake", "--num-classes", "2",
+        "--parameterization", "lowrank", "--cov-rank", "4",
+    ])
+    assert args.cov_rank == 4

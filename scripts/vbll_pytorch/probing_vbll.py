@@ -72,6 +72,7 @@ def main(args):
         prior_scale=args.prior_scale,
         wishart_scale=args.wishart_scale,
         parameterization=args.parameterization,
+        cov_rank=args.cov_rank,
         vbll_type=args.vbll_type,
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -184,6 +185,14 @@ def build_argparser():
     p.add_argument("--prior-scale", type=float, default=1.0)
     p.add_argument("--wishart-scale", type=float, default=0.1)
     p.add_argument("--parameterization", default="diagonal")
+    p.add_argument(
+        "--cov-rank", type=int, default=2,
+        help="Rank of the lowrank posterior. Inert unless "
+             "--parameterization lowrank. Head parameters scale as "
+             "D*C*(2+cov_rank), so this is a memory dial, not a free knob -- "
+             "which is why the figures fix diagonal and only the appendix "
+             "Pareto front varies it.",
+    )
     p.add_argument(
         "--vbll-type", default="discriminative", choices=["discriminative"],
         help=(
