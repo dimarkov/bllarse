@@ -1,7 +1,7 @@
 # Hyperparameter tuning for the probing arms
 
 **Date:** 2026-08-02
-**Status:** design, awaiting review
+**Status:** design, approved
 **Scope:** VBLL and AdamW+CE linear probing (Fig 1 and Fig 2). Full-network
 finetuning is explicitly out of scope and will be retuned separately.
 
@@ -110,18 +110,34 @@ see "Why `cov_rank` is not a tuned axis". VBLL therefore has 5 free axes, not 7.
 
 `probing_vbll.py` raises when `len(x_train) // batch_size == 0` (deliberately,
 commit `1650e54`), and a batch near `n_train` makes epochs degenerate under
-drop-remainder. Cap at `n_train // 4` rounded down to a power of two, so every
-config gets at least 4 steps per epoch.
+drop-remainder. Cap at `n_train // 2` rounded down to a power of two, so every
+config gets at least 2 steps per epoch.
 
-| dataset | figure | res | n_train | batch cap |
-|---|---|---:|---:|---:|
-| oxford_pets | 1 | 512 | 3,680 | 512 |
-| dtd | 1 | 512 | 3,760 | 512 |
-| flowers102 | 1 | 512 | 7,169 | 1024 |
-| stanford_cars | 1 | 512 | 8,144 | 2048 |
-| food101 | 1 | 512 | 75,750 | 16384 |
-| cifar10 | 2 | 224 | 50,000 | 8192 |
-| cifar100 | 2 | 224 | 50,000 | 8192 |
+| dataset | figure | res | n_train | batch cap | steps/epoch at cap |
+|---|---|---:|---:|---:|---:|
+| oxford_pets | 1 | 512 | 3,680 | 1024 | 3 |
+| dtd | 1 | 512 | 3,760 | 1024 | 3 |
+| flowers102 | 1 | 512 | 7,169 | 2048 | 3 |
+| stanford_cars | 1 | 512 | 8,144 | 2048 | 3 |
+| food101 | 1 | 512 | 75,750 | 32768 | 2 |
+| cifar10 | 2 | 224 | 50,000 | 16384 | 3 |
+| cifar100 | 2 | 224 | 50,000 | 16384 | 3 |
+
+The floor is 2 rather than 4 steps per epoch so that `1024` is reachable on
+`dtd` and `oxford_pets`, the two smallest training sets. IBProbit is expected to
+favour larger batches, and the batch axis has to span the same ladder for every
+arm or a cross-arm comparison is confounded by the search space rather than by
+the methods. A floor of 4 would have excluded 1024 on exactly the datasets where
+IBProbit's preference is most likely to bite.
+
+Two steps per epoch is still a meaningful epoch: the permutation is redrawn each
+epoch, so consecutive epochs see different partitions of the training set.
+
+The rule is applied uniformly, which also doubles the caps on the larger
+datasets. That is deliberate — special-casing the small datasets would make the
+`batch_size` axis a per-dataset judgement call rather than a mechanical
+consequence of `n_train`. TPE will not spend many trials at the top of the
+ladder if large batches do not pay.
 
 The `batch_size` axis therefore differs per dataset. Studies remain comparable
 on every other axis but not on this one; that is inherent to the constraint.
