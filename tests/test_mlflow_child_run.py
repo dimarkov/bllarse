@@ -7,6 +7,7 @@ observability.
 """
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,14 +60,30 @@ def test_parent_run_id_is_attached_as_a_tag(monkeypatch):
         def __exit__(self, *exc):
             return False
 
+    class FakeClient:
+        """Models the two calls resolve_experiment_id makes."""
+
+        def get_experiment_by_name(self, name):
+            seen["experiment"] = name
+            return SimpleNamespace(experiment_id="exp-id-7")
+
+        def create_experiment(self, name):  # pragma: no cover - must not happen
+            raise AssertionError("experiment exists; must not be re-created")
+
     class FakeMlflow:
+        MlflowClient = FakeClient
+
         def set_tracking_uri(self, uri):
             seen["uri"] = uri
 
-        def set_experiment(self, name):
-            seen["experiment"] = name
+        def set_experiment(self, name):  # pragma: no cover - must not be used
+            raise AssertionError(
+                "set_experiment does not activate a newly created experiment; "
+                "child_run must resolve the id and pass experiment_id instead"
+            )
 
-        def start_run(self, run_name=None, tags=None):
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            seen["experiment_id"] = experiment_id
             seen["run_name"] = run_name
             seen["tags"] = tags
             return FakeRun()
@@ -91,8 +108,61 @@ def test_parent_run_id_is_attached_as_a_tag(monkeypatch):
     assert seen["tags"]["mlflow.parentRunId"] == "parent123"
     assert seen["tags"]["arm"] == "vbll"
     assert seen["experiment"] == "exp"
+    # The run must be filed by resolved id, not by whatever experiment happened
+    # to be active -- see resolve_experiment_id in mlflow_utils.
+    assert seen["experiment_id"] == "exp-id-7"
     assert seen["params"]["seed"] == "137"
     assert seen["metrics"] == [(7, {"acc": 0.5})]
+
+
+def test_a_missing_experiment_is_created_and_its_id_used(monkeypatch):
+    """mlflow.set_experiment() creates a missing experiment but does NOT make it
+    active, so the next start_run() silently lands in the previously active one
+    (Default, on a fresh process). Observed against the real tracking server:
+    set_experiment("brand_new") resolved id 7 while the run landed in id 5.
+    The sweep parent then sits in a different experiment from its children and
+    the UI shows no nesting at all. Pin the resolve-then-pass-id behaviour.
+    """
+    seen = {}
+
+    class FakeClient:
+        def get_experiment_by_name(self, name):
+            return None if "created" not in seen else SimpleNamespace(
+                experiment_id="new-id-9"
+            )
+
+        def create_experiment(self, name):
+            seen["created"] = name
+            return "new-id-9"
+
+    class FakeMlflow:
+        MlflowClient = FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            seen["experiment_id"] = experiment_id
+
+            class R:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return R()
+
+        def log_params(self, params):
+            pass
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow())
+    config = {"enable_mlflow": True, "mlflow_experiment": "brand_new"}
+    with mlflow_utils.child_run(config, run_name="x") as run:
+        assert run.active is True
+
+    assert seen["created"] == "brand_new"
+    assert seen["experiment_id"] == "new-id-9"
 
 
 def test_non_numeric_metrics_are_dropped_not_raised(monkeypatch):
@@ -109,10 +179,11 @@ def test_non_numeric_metrics_are_dropped_not_raised(monkeypatch):
         def set_tracking_uri(self, uri):
             pass
 
-        def set_experiment(self, name):
-            pass
+        class MlflowClient:
+            def get_experiment_by_name(self, name):
+                return SimpleNamespace(experiment_id="0")
 
-        def start_run(self, run_name=None, tags=None):
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
             class R:
                 def __enter__(self):
                     return self

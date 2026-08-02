@@ -43,8 +43,9 @@ def _create_mlflow_parent(
     total: int,
     chunk_size: int,
     chunk_offset: int,
+    run_name: str | None = None,
 ) -> str:
-    from bllarse.mlflow_utils import load_mlflow_env_defaults
+    from bllarse.mlflow_utils import load_mlflow_env_defaults, resolve_experiment_id
 
     load_mlflow_env_defaults()
     import mlflow
@@ -58,21 +59,38 @@ def _create_mlflow_parent(
         or os.environ.get("MLFLOW_EXPERIMENT_NAME")
         or "bllarse"
     )
-    name = _sweep_name(configs, sweep_source)
+    # MLflow does not enforce unique run names, so without an explicit name a
+    # resubmission silently produces a second parent identical in name to the
+    # first, and the two are then tellable apart only by run id or start time.
+    # `run_name` lets a submission label its own parent ("probe_vbll_fig1_rerun2")
+    # while `group_id` keeps the configs' own identity for filtering.
+    group_id = _sweep_name(configs, sweep_source)
+    name = run_name or group_id
 
     if tracking_uri:
         mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(experiment)
+    # experiment_id, not set_experiment: see resolve_experiment_id's docstring.
+    # This call site is the one that actually bites -- the parent is created on
+    # the login node, typically the first process ever to name the experiment,
+    # so it is exactly the case where set_experiment misfiles the run.
+    experiment_id = resolve_experiment_id(mlflow, experiment)
     tags = {
         "sweep_source": str(sweep_source),
         "sweep_name": name,
-        "group_id": name,
+        "group_id": group_id,
         "is_parent": "true",
         "sweep_size_total": str(total),
         "sweep_chunk_size": str(chunk_size),
         "sweep_chunk_offset": str(chunk_offset),
     }
-    with mlflow.start_run(run_name=name, tags=tags) as parent:
+    with mlflow.start_run(experiment_id=experiment_id, run_name=name, tags=tags) as parent:
+        if parent.info.experiment_id != experiment_id:
+            raise RuntimeError(
+                f"MLflow put the sweep parent in experiment "
+                f"{parent.info.experiment_id}, not the requested {experiment_id} "
+                f"({experiment!r}). Children would be unnestable in the UI, so "
+                f"refusing to submit."
+            )
         return parent.info.run_id
 
 
@@ -86,7 +104,10 @@ def run_sweep(
     index_offset: int = 0,
     num_jobs: int | None = None,
     cpus_per_task: int | None = None,
+    partition: str | None = None,
+    gres: str | None = None,
     parent_run_id: str | None = None,
+    parent_run_name: str | None = None,
     exclude_nodes: str | None = None,
     dry_run: bool = False,
 ) -> subprocess.CompletedProcess[str] | None:
@@ -137,6 +158,7 @@ def run_sweep(
             total=total,
             chunk_size=chunk_size,
             chunk_offset=index_offset,
+            run_name=parent_run_name,
         )
         print(f"[bllarse] MLflow parent run id: {parent_run_id}")
 
@@ -165,6 +187,12 @@ def run_sweep(
     ]
     if cpus_per_task is not None:
         command.append(f"--cpus-per-task={cpus_per_task}")
+    # Override the job script's #SBATCH defaults when the target cluster names
+    # its GPU partition/GRES differently (Raven: gpu + gpu:a100:N).
+    if partition:
+        command.append(f"--partition={partition}")
+    if gres:
+        command.append(f"--gres={gres}")
     if exclude_nodes:
         command.append(f"--exclude={exclude_nodes}")
     command.append(str(script))
@@ -184,9 +212,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--job-name")
     parser.add_argument("--job-script", type=Path, default=DEFAULT_JOB_SCRIPT)
     parser.add_argument("--cpus-per-task", type=int)
+    parser.add_argument("--partition")
+    parser.add_argument("--gres")
     parser.add_argument("--index-offset", type=int, default=0)
     parser.add_argument("--num-jobs", type=int)
     parser.add_argument("--parent-run-id")
+    parser.add_argument(
+        "--parent-run-name",
+        help="Name for the MLflow parent run this submission creates. "
+             "Defaults to the configs' shared group_id. Ignored when "
+             "--parent-run-id attaches to an existing parent.",
+    )
     parser.add_argument("--exclude-nodes")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -203,7 +239,10 @@ def main() -> None:
         index_offset=args.index_offset,
         num_jobs=args.num_jobs,
         cpus_per_task=args.cpus_per_task,
+        partition=args.partition,
+        gres=args.gres,
         parent_run_id=args.parent_run_id,
+        parent_run_name=args.parent_run_name,
         exclude_nodes=args.exclude_nodes,
         dry_run=args.dry_run,
     )

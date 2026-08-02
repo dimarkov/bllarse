@@ -1,14 +1,16 @@
 Bootstrap: docker
-From: nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
+From: python:3.12
 
 %post
-    # See bllarse-jax.def for why 24.04 and python-is-python3.
-    # Note this image takes the DEFAULT (CUDA) torch wheels -- unlike the dev
-    # venv, which pins CPU torch so it can coexist with jax[cuda] locally.
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends python3 python3-pip python-is-python3 git
-    rm -rf /var/lib/apt/lists/*
+    # See bllarse-jax.def for why the distro/CUDA base and its apt-get line are
+    # gone: unprivileged apptainer builds on MPCDF have no fakeroot, and
+    # apt-get cannot run without it. The torch CUDA wheels carry their own
+    # nvidia-* redistributables, so `apptainer --nv` is still all that is
+    # needed to reach the host driver.
+    #
+    # This image takes the DEFAULT (CUDA) torch wheels -- unlike the dev venv,
+    # which pins CPU torch so it can coexist with jax[cuda] locally.
+    #
     # jax + tfp are CPU-only here and are NOT used for training -- they are
     # pulled in solely because bllarse.metrics (ECE via TFP, the Newton
     # temperature fit) is implemented in JAX, and both arms must report through
@@ -16,7 +18,12 @@ From: nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
     # arm would be a silent comparability bug in exactly the quantity the paper
     # compares. Install order matters: torch first claims the CUDA nvidia-*
     # wheels, then plain `jax` resolves to the CPU build and adds none.
-    pip install --no-cache-dir --break-system-packages \
+    pip install --no-cache-dir \
         torch torchvision "vbll>=0.2.0" mlflow numpy tqdm huggingface_hub
-    pip install --no-cache-dir --break-system-packages \
-        jax "tfp-nightly[jax]"
+    # jaxtyping is listed explicitly because nothing else here pulls it in.
+    # bllarse.metrics does `from jaxtyping import Array`, and in the JAX image
+    # equinox happens to depend on jaxtyping -- this image has no equinox, so
+    # the import only fails on the torch arm, at module-import time, after the
+    # task has already been allocated a GPU.
+    pip install --no-cache-dir \
+        jax "tfp-nightly[jax]" jaxtyping

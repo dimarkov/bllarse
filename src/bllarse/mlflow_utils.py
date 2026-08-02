@@ -92,6 +92,35 @@ class _LiveRun:
         self._mlflow.set_tags({k: str(v)[:500] for k, v in tags.items()})
 
 
+def resolve_experiment_id(mlflow_module: Any, name: str) -> str:
+    """Return the id of experiment `name`, creating it if absent.
+
+    NOT `mlflow.set_experiment(name)`. When that call has to CREATE the
+    experiment it does not make the new one active, so the very next
+    `start_run()` silently lands in whatever experiment was active before
+    (Default, on a fresh process). Verified against the tracking server:
+
+        set_experiment("existing") -> id 5, run landed in 5   OK
+        set_experiment("brand_new") -> id 7, run landed in 5   WRONG
+
+    That is invisible until you notice the sweep parent sitting in Default
+    while its children are in the real experiment -- at which point the UI
+    shows no nesting at all, because it only nests within one experiment.
+    Resolving the id explicitly and passing `experiment_id=` to start_run
+    removes the dependence on that active-experiment state entirely.
+    """
+    client = mlflow_module.MlflowClient()
+    existing = client.get_experiment_by_name(name)
+    if existing is not None:
+        return existing.experiment_id
+    try:
+        return client.create_experiment(name)
+    except Exception:
+        # A concurrent array task won the race; re-read rather than fail. If it
+        # is still missing the error is real, so let this second call raise.
+        return client.get_experiment_by_name(name).experiment_id
+
+
 @contextmanager
 def child_run(config: Mapping[str, Any], *, run_name: str, tags: Mapping[str, Any] | None = None):
     """A per-config MLflow run, nested under the sweep parent. No-op when off.
@@ -131,8 +160,8 @@ def child_run(config: Mapping[str, Any], *, run_name: str, tags: Mapping[str, An
     try:
         if tracking_uri:
             mlflow.set_tracking_uri(tracking_uri)
-        mlflow.set_experiment(experiment)
-        with mlflow.start_run(run_name=run_name, tags=all_tags):
+        experiment_id = resolve_experiment_id(mlflow, experiment)
+        with mlflow.start_run(experiment_id=experiment_id, run_name=run_name, tags=all_tags):
             run = _LiveRun(mlflow)
             run.log_params(config)
             yield run

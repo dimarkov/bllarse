@@ -1,25 +1,26 @@
 Bootstrap: docker
-From: nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
+From: python:3.12
 
 %post
-    # 24.04, not 22.04: 22.04's python3-pip targets python3.10 even when
-    # python3.11 is installed alongside it, so the deps land in the wrong
-    # interpreter -- and neither image provides a bare `python`, which the job
-    # script invokes. 24.04 ships python3.12 (satisfies >=3.11) as the default
-    # python3, and python-is-python3 supplies /usr/bin/python.
+    # python:3.12, not nvidia/cuda:*-ubuntu24.04: MPCDF does not list users in
+    # /etc/subuid, so `apptainer build` on the cluster falls back to a
+    # root-mapped namespace with no working fakeroot. Under that namespace
+    # apt-get cannot drop privileges to the _apt user and dies with
+    #     E: setgroups 65534 failed - setgroups (1: Operation not permitted)
+    #     E: Method http has died unexpectedly!
+    # so ANY apt-get-based %post is unbuildable there. The docker `python`
+    # images already ship python3.12, pip, a bare `python` on PATH, and git --
+    # exactly what the deleted apt-get line was installing -- so dropping the
+    # distro base removes the one build step that cannot run.
     #
-    # CUDA 12.9.2, not 12.4.1: nvidia/cuda publishes NO 24.04 image before
-    # 12.9.x. Verified against the Docker Hub tag API -- 12.4.1 exists only for
-    # ubuntu20.04/22.04. Both jax[cuda12] and the torch CUDA wheels ship their
-    # own CUDA redistributables via pip, and `apptainer --nv` binds the host
-    # driver, so the base image's CUDA version is not load-bearing here.
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends python3 python3-pip python-is-python3 git
-    rm -rf /var/lib/apt/lists/*
-    # PEP 668 marks the system Python externally managed. Inside a
-    # single-purpose container that is exactly the environment we want.
-    pip install --no-cache-dir --break-system-packages \
+    # Losing the CUDA base costs nothing, by the same argument that justified
+    # picking nvidia/cuda in the first place: jax[cuda12] ships its own CUDA
+    # and cuDNN redistributables as pip wheels, and `apptainer --nv` binds the
+    # host driver, so the base image's CUDA version was never load-bearing.
+    #
+    # --break-system-packages is gone too: it was only needed because Ubuntu
+    # marks its distro python PEP 668 externally-managed. These images do not.
+    pip install --no-cache-dir \
         "jax[cuda12]" equinox optax "tfp-nightly[jax]" \
         datasets equimo augmax mlflow python-dotenv tqdm \
         "mlpox @ git+https://github.com/dimarkov/mlpox.git@main" \

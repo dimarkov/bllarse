@@ -1,13 +1,44 @@
-#!/usr/bin/env bash
+#!/bin/bash -l
+# A LOGIN shell (-l), not `env bash`: on MPCDF no modules are preloaded and the
+# `module` function itself only exists once /etc/profile.d has been sourced,
+# which a non-login shell skips.
 #SBATCH --time=12:00:00
 #SBATCH --mem=40G
-#SBATCH -G 1
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:a100:1
 #SBATCH --output=slurm_logs/%x.%A_%a.out
 #SBATCH --error=slurm_logs/%x.%A_%a.err
+# `--gres=gpu:a100:1`, not `-G 1`: Raven's default partition is `interactive`,
+# which has no GPUs, so a bare `-G 1` is rejected at submit time with
+# "Requested node configuration is not available" and the array never queues.
+# Both directives are overridable from run_sweep.py's --partition/--gres, since
+# sbatch command-line flags take precedence over #SBATCH lines.
 
 set -euo pipefail
 
-repo_root="${SLURM_SUBMIT_DIR:-$(pwd)}"
+# apptainer is not on PATH on MPCDF until a module is loaded, but this script
+# also runs on hosts that have it on PATH and no module system at all -- so try
+# the module only when the binary is genuinely missing, and fail loudly after.
+if ! command -v apptainer >/dev/null 2>&1; then
+  if [[ $(type -t module || true) == function ]]; then
+    module purge >/dev/null 2>&1 || true
+    module load "${BLLARSE_APPTAINER_MODULE:-apptainer}" >/dev/null 2>&1 || true
+  fi
+fi
+if ! command -v apptainer >/dev/null 2>&1; then
+  echo "[bllarse] ERROR: apptainer not found on PATH and no module supplied it." >&2
+  echo "[bllarse]        Set BLLARSE_APPTAINER_MODULE (e.g. apptainer/1.4.3)." >&2
+  exit 2
+fi
+
+# readlink -f, not the raw path: SLURM reports the submit dir exactly as typed,
+# and on MPCDF /ptmp and /u are top-level symlinks (/ptmp -> /raven/ptmp).
+# Apptainer binds the RESOLVED directory and does NOT recreate that symlink
+# inside the container, so an unresolved /ptmp/... path exists on the host but
+# not in the container -- PYTHONPATH then points at a directory that isn't
+# there and `import bllarse` fails on every single array task, with a
+# ModuleNotFoundError that says nothing about symlinks.
+repo_root="$(readlink -f "${SLURM_SUBMIT_DIR:-$(pwd)}")"
 cd "$repo_root"
 
 export BLLARSE_REPO_ROOT="$repo_root"
@@ -34,7 +65,7 @@ echo "[bllarse] task=${SLURM_ARRAY_TASK_ID} offset=${INDEX_OFFSET} config=${CONF
 # Apptainer binds $HOME, $PWD and /tmp by default and preserves UID/GID, so the
 # Docker wrapper's -u and passthrough gymnastics are unnecessary. Only paths
 # outside those roots need an explicit bind.
-bind_args=()
+bind_args=(--bind "$repo_root")
 if [[ -n "${BLLARSE_HF_HOME:-}" ]]; then
   mkdir -p "$BLLARSE_HF_HOME"
   bind_args+=(--bind "$BLLARSE_HF_HOME:$BLLARSE_HF_HOME")
@@ -58,7 +89,12 @@ env_args=(
   --env "BLLARSE_REPO_ROOT=$BLLARSE_REPO_ROOT"
   --env "BLLARSE_SWEEP_SOURCE=$BLLARSE_SWEEP_SOURCE"
   --env "CONFIG_IDX=$CONFIG_IDX"
-  --env "PYTHONPATH=${repo_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+  # scripts/vbll_pytorch/src too, not just src: the VBLL arm's entry point does
+  # `from vbll_experiments.models import build_vbll_head`, and vbll_experiments
+  # is a LOCAL package (scripts/vbll_pytorch/pyproject.toml declares it) that is
+  # never pip-installed into the image. Harmless for the JAX arm, which simply
+  # never imports it.
+  --env "PYTHONPATH=${repo_root}/src:${repo_root}/scripts/vbll_pytorch/src${PYTHONPATH:+:${PYTHONPATH}}"
 )
 [[ -n "${HF_TOKEN:-}" ]] && env_args+=(--env "HF_TOKEN=$HF_TOKEN")
 [[ -n "${HF_HOME:-}" ]] && env_args+=(--env "HF_HOME=$HF_HOME")
