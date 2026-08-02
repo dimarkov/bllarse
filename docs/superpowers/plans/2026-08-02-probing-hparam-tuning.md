@@ -653,7 +653,9 @@ def test_batch_ladder_is_powers_of_two_from_64_to_the_cap(dataset):
 
 
 def test_a_batch_cap_never_exceeds_half_the_training_set():
-    for n in (100, 601, 3680, 50_000, 1_281_167):
+    # Every value here must be large enough to HAVE a cap: n=100 would raise,
+    # since 100 // 2 = 50 is below the 64 floor.
+    for n in (601, 3680, 50_000, 1_281_167):
         assert space.batch_cap(n) <= n // 2
 
 
@@ -661,7 +663,7 @@ def test_tiny_training_sets_raise_rather_than_returning_an_unusable_cap():
     """32 rows cannot support the 64 minimum. Returning 32 would quietly search
     a ladder the spec does not describe."""
     with pytest.raises(ValueError, match="too small"):
-        space.batch_cap(100)
+        space.batch_cap(32)
 ```
 
 - [ ] **Step 2: Run to verify it fails**
