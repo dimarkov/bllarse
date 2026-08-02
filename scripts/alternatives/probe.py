@@ -122,7 +122,15 @@ def _logits_for(head, loss_fn, feats, labels, chunk=4096):
     return np.concatenate(out, axis=0)
 
 
-def main(args):
+def main(args, on_dump=None):
+    """Train one head. `on_dump(dump_index, step, scalars)` fires after every
+    scheduled dump, if given.
+
+    The index counts dumps rather than optimiser steps because it is Optuna's
+    pruning key: MedianPruner compares trials at the SAME key, and trials vary
+    batch_size, so two configs would share almost no raw step values. n_dumps is
+    40 for every run, so the dump index is a common grid by construction.
+    """
     key = jr.PRNGKey(args.seed)
     hf_repo = None if args.no_hf_cache else args.hf_repo
     img_size = args.img_size
@@ -174,6 +182,7 @@ def main(args):
         })
 
         step = 0
+        dump_index = 0
         for epoch in range(1, args.epochs + 1):
             key, epoch_key = jr.split(key)
             for head, opt_state in _ce_epoch(
@@ -203,6 +212,9 @@ def main(args):
                     f"[probe] step {step} (epoch {epoch}, {samples_seen} samples): "
                     + " ".join(f"{k}={v:.4f}" for k, v in scalars.items())
                 )
+                if on_dump is not None:
+                    on_dump(dump_index, step, scalars)
+                dump_index += 1
 
         # OOD dump: final point only. Fig 2 is a converged-endpoint figure.
         if args.ood_dataset:

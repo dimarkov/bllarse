@@ -297,3 +297,51 @@ def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypat
 
     # 16 feature dims x 2 classes + 2 biases
     assert logged["head_param_count"] == 34
+
+
+def test_on_dump_is_called_once_per_dump_with_val_nll(fake_features, tmp_path):
+    import probe
+
+    seen = []
+    args = probe.build_argparser().parse_args([
+        "--arm", "adamw_ce", "--model", "dinov3_small", "--dataset", "fake",
+        "--num-classes", "2", "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "cb", "--uid", "cb_0",
+        "--epochs", "10", "--n-dumps", "5", "--batch-size", "100",
+        "--seed", "137", "--no-hf-cache",
+    ])
+    probe.main(args, on_dump=lambda i, step, scalars: seen.append((i, step, scalars)))
+
+    assert len(seen) == 5, "one callback per dumped step"
+    assert [i for i, _, _ in seen] == [0, 1, 2, 3, 4], (
+        "dump_index must count dumps, not optimiser steps -- it is the pruner's "
+        "step key, and trials vary batch_size so raw steps are not comparable"
+    )
+    assert all("val_nll" in scalars for _, _, scalars in seen)
+
+
+def test_an_exception_from_on_dump_propagates(fake_features, tmp_path):
+    """optuna.TrialPruned is raised from inside the callback and must escape
+    the training loop. Swallowing it would run every pruned trial to
+    completion -- the pruner would cost time instead of saving it."""
+    import probe
+
+    class Sentinel(Exception):
+        pass
+
+    def boom(i, step, scalars):
+        raise Sentinel()
+
+    args = probe.build_argparser().parse_args([
+        "--arm", "adamw_ce", "--model", "dinov3_small", "--dataset", "fake",
+        "--num-classes", "2", "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "cb", "--uid", "cb_boom",
+        "--epochs", "4", "--n-dumps", "3", "--batch-size", "100",
+        "--seed", "137", "--no-hf-cache",
+    ])
+    with pytest.raises(Sentinel):
+        probe.main(args, on_dump=boom)

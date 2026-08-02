@@ -277,3 +277,44 @@ def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypat
     # 16 feature dims x 2 classes x 2 (mean + logdiag) + 2 biases + 2 frozen noise_mean
     # For diagonal: W_mean (16*2=32) + W_logdiag (16*2=32) + bias (2) + noise_mean (2)
     assert logged["head_param_count"] == 68
+
+
+def test_on_dump_is_called_once_per_dump_with_val_nll(fake_features, tmp_path):
+    import probing_vbll
+
+    seen = []
+    args = probing_vbll.build_argparser().parse_args([
+        "--model", "dinov3_small", "--dataset", "fake", "--num-classes", "2",
+        "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "cb", "--uid", "cb_0",
+        "--epochs", "10", "--n-dumps", "5", "--batch-size", "100",
+        "--seed", "137", "--device", "cpu",
+    ])
+    probing_vbll.main(args, on_dump=lambda i, step, s: seen.append((i, step, s)))
+
+    assert len(seen) == 5
+    assert [i for i, _, _ in seen] == [0, 1, 2, 3, 4]
+    assert all("val_nll" in scalars for _, _, scalars in seen)
+
+
+def test_an_exception_from_on_dump_propagates(fake_features, tmp_path):
+    import probing_vbll
+
+    class Sentinel(Exception):
+        pass
+
+    args = probing_vbll.build_argparser().parse_args([
+        "--model", "dinov3_small", "--dataset", "fake", "--num-classes", "2",
+        "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "cb", "--uid", "cb_boom",
+        "--epochs", "4", "--n-dumps", "3", "--batch-size", "100",
+        "--seed", "137", "--device", "cpu",
+    ])
+    with pytest.raises(Sentinel):
+        probing_vbll.main(
+            args, on_dump=lambda i, step, s: (_ for _ in ()).throw(Sentinel())
+        )

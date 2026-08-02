@@ -65,7 +65,15 @@ def head_param_count(head) -> int:
     return int(sum(p.numel() for p in head.parameters()))
 
 
-def main(args):
+def main(args, on_dump=None):
+    """Train one head. `on_dump(dump_index, step, scalars)` fires after every
+    scheduled dump, if given.
+
+    The index counts dumps rather than optimiser steps because it is Optuna's
+    pruning key: MedianPruner compares trials at the SAME key, and trials vary
+    batch_size, so two configs would share almost no raw step values. n_dumps is
+    40 for every run, so the dump index is a common grid by construction.
+    """
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     hf_repo = None if args.no_hf_cache else args.hf_repo
@@ -126,6 +134,7 @@ def main(args):
         })
 
         step = 0
+        dump_index = 0
         for epoch in range(1, args.epochs + 1):
             head.train()
             perm = torch.randperm(len(x_train))
@@ -164,6 +173,9 @@ def main(args):
                     f"[vbll] step {step} (epoch {epoch}, {samples_seen} samples): "
                     + " ".join(f"{k}={v:.4f}" for k, v in scalars.items())
                 )
+                if on_dump is not None:
+                    on_dump(dump_index, step, scalars)
+                dump_index += 1
 
         if args.ood_dataset:
             ood_f, ood_l = load_cached_features(
