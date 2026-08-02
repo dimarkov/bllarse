@@ -1,27 +1,26 @@
-"""Fig 1: AdamW+CE linear probing across the DINOv3 ladder and six datasets.
+"""Fig 1: AdamW+CE linear probing across the DINOv3 ladder and five datasets.
 
 AdamW+CE+TS is NOT a separate sweep -- temperature scaling is fit post-hoc from
 these dumps at every dump point, so it costs no GPU time.
 
-Measured training-set sizes and the resulting optimisation budgets at this
-sweep's batch_size=512, epochs=40 (cifar10/cifar100 are not part of this
-sweep's own grid -- they belong to the Fig 2 OOD sweeps -- but are included
-here for the full picture of the dataset-size spread the project spans):
+Measured training-set sizes (cifar10/cifar100 belong to the Fig 2 OOD sweeps,
+not this grid, and are listed only for the size spread the project spans):
 
-    | dataset             | n_train    | steps/epoch | total steps |
-    |---------------------|-----------:|------------:|-------------:|
-    | oxford_pets         |      3,680 |           7 |          280 |
-    | dtd                 |      3,760 |           7 |          280 |
-    | flowers102          |      7,169 |          14 |          560 |
-    | stanford_cars       |      8,144 |          15 |          600 |
-    | cifar10 / cifar100  |     50,000 |          97 |        3,880 |
-    | food101             |     75,750 |         147 |        5,880 |
-    | imagenet1k          |  1,281,167 |       2,502 |      100,080 |
+    | dataset             | n_train    |
+    |---------------------|-----------:|
+    | oxford_pets         |      3,680 |
+    | dtd                 |      3,760 |
+    | flowers102          |      7,169 |
+    | stanford_cars       |      8,144 |
+    | cifar10 / cifar100  |     50,000 |
+    | food101             |     75,750 |
 
-The epoch budget (40) is uniform across datasets, but the resulting
-gradient-step budget is not -- it spans roughly 280 to 100,080 steps, a 357x
-range across the panels of a single figure -- and this is unresolved pending
-a decision from the project owner.
+imagenet1k is deliberately absent: it is a full-network finetuning dataset only
+and will be retuned separately for that.
+
+The steps/epoch and total-step columns this docstring used to carry are gone
+because batch_size and epochs are no longer sweep-wide constants -- both are
+resolved per dataset from bllarse_sweeps/tuned_hparams.json.
 """
 
 from itertools import product
@@ -37,7 +36,6 @@ DATASETS = {
     "flowers102": (102, 512),
     "stanford_cars": (196, 512),
     "dtd": (47, 512),
-    "imagenet1k": (1000, 512),
 }
 SEEDS = list(range(137, 147))  # 10 seeds
 

@@ -36,9 +36,18 @@ def test_all_configs_share_one_group_id(path):
     assert len({c["group_id"] for c in configs}) == 1
 
 
-def test_fig1_sweep_sizes_match_the_plan():
-    # 4 backbones x 6 datasets x 10 seeds
-    assert len(get_module_from_source_path(SWEEPS[0]).create_configs()) == 240
+@pytest.mark.parametrize("path", [SWEEPS[0], SWEEPS[1]])
+def test_fig1_sweep_sizes_match_the_plan(path):
+    # 4 backbones x 5 datasets x 10 seeds. imagenet1k is deliberately absent:
+    # linear probing does not cover it, it is a full-network finetuning dataset
+    # only, and it will be retuned separately for that.
+    assert len(get_module_from_source_path(path).create_configs()) == 200
+
+
+@pytest.mark.parametrize("path", [SWEEPS[0], SWEEPS[1]])
+def test_fig1_sweeps_exclude_imagenet(path):
+    for c in get_module_from_source_path(path).create_configs():
+        assert c["dataset"] != "imagenet1k"
 
 
 @pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])

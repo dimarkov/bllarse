@@ -17,7 +17,6 @@ DATASETS = {
     "flowers102": (102, 512),
     "stanford_cars": (196, 512),
     "dtd": (47, 512),
-    "imagenet1k": (1000, 512),
 }
 SEEDS = list(range(137, 147))
 
