@@ -19,7 +19,7 @@ From: python:3.12
     # compares. Install order matters: torch first claims the CUDA nvidia-*
     # wheels, then plain `jax` resolves to the CPU build and adds none.
     pip install --no-cache-dir \
-        torch torchvision "vbll>=0.2.0" mlflow numpy tqdm huggingface_hub
+        torch torchvision "vbll>=0.2.0" mlflow numpy tqdm huggingface_hub "optuna>=4.0"
     # jaxtyping is listed explicitly because nothing else here pulls it in.
     # bllarse.metrics does `from jaxtyping import Array`, and in the JAX image
     # equinox happens to depend on jaxtyping -- this image has no equinox, so

@@ -22,7 +22,7 @@ From: python:3.12
     # marks its distro python PEP 668 externally-managed. These images do not.
     pip install --no-cache-dir \
         "jax[cuda12]" equinox optax "tfp-nightly[jax]" \
-        datasets equimo augmax mlflow python-dotenv tqdm \
+        datasets equimo augmax mlflow python-dotenv tqdm "optuna>=4.0" \
         "mlpox @ git+https://github.com/dimarkov/mlpox.git@main" \
         "blrax @ git+https://github.com/dimarkov/blrax.git@main"
 

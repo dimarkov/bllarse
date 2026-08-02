@@ -1,0 +1,203 @@
+"""An Optuna TPE worker for one (arm, dataset) study.
+
+Not a run_sweep submission: run_sweep enumerates create_configs() before
+submitting, and TPE generates configurations adaptively from the trials already
+reported. Four workers share one study through a journal file.
+
+TPE degrades under parallelism -- each worker samples a posterior that has not
+yet been updated by the trials in flight beside it -- so the worker count is
+deliberately low.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+import optuna
+from optuna.pruners import MedianPruner
+from optuna.samplers import TPESampler
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
+
+from bllarse.tuning import budgets as budgets_mod
+from bllarse.tuning import objective as objective_mod
+from bllarse.tuning import space
+
+DIRECTION = "minimize"
+N_DUMPS = 40
+
+# Fires no earlier than 25% of the dump grid, and only once 20 trials have
+# completed, so early noise cannot kill a config that starts slowly.
+PRUNER_STARTUP_TRIALS = 20
+PRUNER_WARMUP_DUMPS = N_DUMPS // 4
+
+VBLL_FIXED = {
+    "parameterization": "diagonal",
+    "vbll_type": "discriminative",
+    "device": "cuda",
+}
+
+
+def study_name(arm: str, dataset: str) -> str:
+    return f"{arm}_{dataset}"
+
+
+def open_study(arm: str, dataset: str, storage_dir: Any) -> optuna.Study:
+    """Load or create this (arm, dataset)'s study.
+
+    JournalStorage on JournalFileBackend, NOT SQLite: SQLite over GPFS with
+    concurrent writers is unreliable, and the journal backend is built for
+    network filesystems. One file per study means the 14 studies never contend
+    with one another -- only the four workers within a study do.
+    """
+    directory = Path(storage_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    name = study_name(arm, dataset)
+    storage = JournalStorage(JournalFileBackend(str(directory / f"{name}.log")))
+    return optuna.create_study(
+        study_name=name,
+        storage=storage,
+        direction=DIRECTION,
+        sampler=TPESampler(),
+        pruner=MedianPruner(
+            n_startup_trials=PRUNER_STARTUP_TRIALS,
+            n_warmup_steps=PRUNER_WARMUP_DUMPS,
+        ),
+        load_if_exists=True,
+    )
+
+
+def trial_config(
+    arm: str,
+    dataset: str,
+    *,
+    params: Mapping[str, Any],
+    budgets: Mapping[str, Mapping[str, int]],
+    cache_dir: str = ".cache/features",
+    split_cache_dir: str = ".cache/splits",
+    enable_mlflow: bool = True,
+    mlflow_experiment: str = "bllarse-probing-tuning",
+) -> dict[str, Any]:
+    """A full training config for one sampled parameter set.
+
+    The Stage 1 budget is a STEP budget; `epochs` is only how the scripts
+    express it. Converting at the SAMPLED batch size rather than the pilot's is
+    what keeps trials comparable: two configs with different batch sizes get the
+    same number of gradient steps, not the same number of passes.
+    """
+    if dataset not in budgets:
+        raise KeyError(
+            f"no epoch budget for {dataset!r}. Run the Stage 1 pilot and "
+            f"`python -m bllarse.tuning.budgets` first -- tuning under a "
+            f"truncated budget biases the search toward high learning rates."
+        )
+    num_classes, img_size = space.DATASETS[dataset]
+    target_steps = budgets[dataset]["steps"]
+    batch_size = params["batch_size"]
+
+    config: dict[str, Any] = {
+        "model": space.TUNING_MODEL,
+        "dataset": dataset,
+        "num_classes": num_classes,
+        "img_size": img_size,
+        "cache_dir": cache_dir,
+        "split_cache_dir": split_cache_dir,
+        "epochs": budgets_mod.epochs_for_steps(dataset, target_steps, batch_size),
+        "n_dumps": N_DUMPS,
+        "val_fraction": 0.1,
+        "enable_mlflow": enable_mlflow,
+        "mlflow_experiment": mlflow_experiment,
+        **params,
+    }
+    if arm == "vbll":
+        config.update(VBLL_FIXED)
+    else:
+        config["arm"] = "adamw_ce"
+    return config
+
+
+def make_objective(
+    arm: str,
+    dataset: str,
+    *,
+    budgets: Mapping[str, Mapping[str, int]],
+    dump_root: Any,
+    group_id: str,
+    **config_kw: Any,
+) -> Callable[[optuna.Trial], float]:
+    """The optuna objective closure for one study."""
+
+    def run_trial(trial: optuna.Trial) -> float:
+        params = space.suggest(trial, arm, dataset)
+        config = trial_config(
+            arm, dataset, params=params, budgets=budgets, **config_kw
+        )
+        trial.set_user_attr("epochs", config["epochs"])
+        trial.set_user_attr("steps", budgets[dataset]["steps"])
+
+        def on_dump(dump_index: int, step: int, scalars: Mapping[str, float]) -> None:
+            # Reported on the DUMP INDEX, never the optimiser step. MedianPruner
+            # compares trials at matching keys and trials vary batch_size, so
+            # raw steps would rarely even collide -- the pruner would silently
+            # never have a cohort to compare against.
+            trial.report(float(scalars["val_nll"]), dump_index)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return objective_mod.evaluate(
+            arm, config,
+            dump_root=dump_root,
+            group_id=group_id,
+            uid=f"trial{trial.number:05d}",
+            on_dump=on_dump,
+        )
+
+    return run_trial
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--arm", required=True, choices=sorted(objective_mod.SCRIPTS))
+    p.add_argument("--dataset", required=True, choices=sorted(space.DATASETS))
+    p.add_argument("--n-trials", type=int, required=True,
+                   help="Trials THIS worker runs. With 4 workers, one quarter "
+                        "of the study's total.")
+    p.add_argument("--storage-dir", required=True)
+    p.add_argument("--dump-root",
+                   default=os.environ.get("BLLARSE_EVAL_DUMP_ROOT", "eval_dumps"))
+    p.add_argument("--budgets", type=Path,
+                   default=Path("bllarse_sweeps/epoch_budgets.json"))
+    p.add_argument("--cache-dir", default=".cache/features")
+    p.add_argument("--split-cache-dir", default=".cache/splits")
+    p.add_argument("--mlflow-experiment", default="bllarse-probing-tuning")
+    p.add_argument("--no-mlflow", action="store_true")
+    return p
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    budgets = json.loads(Path(args.budgets).read_text())
+    study = open_study(args.arm, args.dataset, args.storage_dir)
+    group_id = f"tune_{args.arm}_{args.dataset}"
+
+    study.optimize(
+        make_objective(
+            args.arm, args.dataset,
+            budgets=budgets,
+            dump_root=args.dump_root,
+            group_id=group_id,
+            cache_dir=args.cache_dir,
+            split_cache_dir=args.split_cache_dir,
+            enable_mlflow=not args.no_mlflow,
+            mlflow_experiment=args.mlflow_experiment,
+        ),
+        n_trials=args.n_trials,
+    )
+    print(f"[tune] {study.study_name}: {len(study.trials)} trials, "
+          f"best={study.best_value:.5f} params={study.best_params}")
+
+
+if __name__ == "__main__":
+    main()
