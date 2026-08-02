@@ -202,3 +202,31 @@ def test_cov_rank_flag_is_exposed_by_the_probing_cli():
         "--parameterization", "lowrank", "--cov-rank", "4",
     ])
     assert args.cov_rank == 4
+
+
+def test_head_params_counts_every_head_parameter():
+    from vbll_experiments.models import build_vbll_head
+
+    import probing_vbll
+
+    head = build_vbll_head(32, 5, parameterization="diagonal")
+    expected = sum(p.numel() for p in head.parameters())
+    assert probing_vbll.head_param_count(head) == expected
+    assert expected > 0
+
+
+def test_head_params_grows_with_cov_rank():
+    """Ties Task 1's plumbing to the number the appendix actually plots: if
+    cov_rank stopped reaching the head, head_param_count would go flat across the
+    Pareto front's six ranks and the front would look like a vertical line."""
+    from vbll_experiments.models import build_vbll_head
+
+    import probing_vbll
+
+    r2 = probing_vbll.head_param_count(
+        build_vbll_head(32, 5, parameterization="lowrank", cov_rank=2)
+    )
+    r8 = probing_vbll.head_param_count(
+        build_vbll_head(32, 5, parameterization="lowrank", cov_rank=8)
+    )
+    assert r8 > r2

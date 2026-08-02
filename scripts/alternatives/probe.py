@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -45,6 +46,20 @@ def steps_per_epoch(n_train: int, batch_size: int) -> int:
             f"provide more training data."
         )
     return n_batches
+
+
+def head_param_count(head) -> int:
+    """Trainable parameter count of the head.
+
+    Logged per run because Fig-appendix's rank/cost Pareto front plots
+    calibration against head size: VBLL costs D*C*(2+r) and IBProbit costs
+    D*(D-1)/2, independent of C, so the ranks that match IBProbit's budget
+    differ by two orders of magnitude across one figure's panels. Reading the
+    count off the run keeps that axis a recorded quantity.
+    """
+    return int(
+        sum(x.size for x in jax.tree_util.tree_leaves(eqx.filter(head, eqx.is_array)))
+    )
 
 
 @eqx.filter_jit
@@ -146,7 +161,11 @@ def main(args):
         "arm": args.arm, "group_id": args.group_id, "uid": args.uid,
         "dump_dir": str(Path(args.dump_root) / args.group_id / args.uid),
     }) as run:
-        run.log_params({"steps_per_epoch": per_epoch, "total_steps": total_steps})
+        run.log_params({
+            "steps_per_epoch": per_epoch,
+            "total_steps": total_steps,
+            "head_param_count": head_param_count(head),
+        })
 
         step = 0
         for epoch in range(1, args.epochs + 1):

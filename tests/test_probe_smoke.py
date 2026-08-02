@@ -243,3 +243,57 @@ def test_ce_step_is_jitted_and_matches_the_eager_computation():
 
     assert jnp.allclose(got_head.weight, want_head.weight, atol=1e-6)
     assert jnp.allclose(got_head.bias, want_head.bias, atol=1e-6)
+
+
+def test_head_params_counts_every_array_leaf():
+    import equinox as eqx
+    from jax import random as jr
+
+    import probe
+
+    head = eqx.nn.Linear(16, 3, key=jr.PRNGKey(0))
+    # 16*3 weights + 3 biases
+    assert probe.head_param_count(head) == 51
+
+
+def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypatch):
+    """The Pareto front plots calibration against head size. Recomputing that
+    size in the plotting script would be a second implementation of the exact
+    quantity being compared, and it would silently disagree the moment a head
+    gains a parameter."""
+    import contextlib
+
+    import probe
+
+    logged = {}
+
+    class Recorder:
+        active = False
+
+        def log_params(self, params):
+            logged.update(params)
+
+        def log_metrics(self, metrics, step=None):
+            pass
+
+        def set_tags(self, tags):
+            pass
+
+    @contextlib.contextmanager
+    def fake_child_run(config, *, run_name, tags=None):
+        yield Recorder()
+
+    monkeypatch.setattr(probe, "child_run", fake_child_run)
+
+    args = probe.build_argparser().parse_args([
+        "--arm", "adamw_ce", "--model", "dinov3_small", "--dataset", "fake",
+        "--num-classes", "2", "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "hp", "--uid", "hp_0",
+        "--epochs", "2", "--n-dumps", "2", "--seed", "137", "--no-hf-cache",
+    ])
+    probe.main(args)
+
+    # 16 feature dims x 2 classes + 2 biases
+    assert logged["head_param_count"] == 34

@@ -50,6 +50,13 @@ def _forward(head, feats, device, chunk=4096):
     return np.concatenate(logits_out), np.concatenate(score_out)
 
 
+def head_param_count(head) -> int:
+    """Trainable parameter count of the head. See probe.head_param_count -- both arms
+    must report this identically or the Pareto front's cost axis is not a single
+    axis."""
+    return int(sum(p.numel() for p in head.parameters()))
+
+
 def main(args):
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -104,7 +111,11 @@ def main(args):
         "arm": "vbll", "group_id": args.group_id, "uid": args.uid,
         "dump_dir": str(Path(args.dump_root) / args.group_id / args.uid),
     }) as run:
-        run.log_params({"steps_per_epoch": n_batches, "total_steps": total_steps})
+        run.log_params({
+            "steps_per_epoch": n_batches,
+            "total_steps": total_steps,
+            "head_param_count": head_param_count(head),
+        })
 
         step = 0
         for epoch in range(1, args.epochs + 1):
