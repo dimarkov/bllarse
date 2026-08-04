@@ -17,33 +17,51 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from bllarse import evaldump, splits
-from bllarse.features import eval_split_name, load_cached_features
+from bllarse.features import eval_split_name, load_cached_features, train_split_name
 from bllarse.mlflow_utils import child_run
 from bllarse.reporting import report_step
 from vbll_experiments.models import build_vbll_head
 
 
-def _forward(head, feats, device, chunk=4096):
+def _forward(head, feats, device, n_samples):
     """Return (logits, epistemic_score) as numpy arrays.
 
-    `out.predictive` (a `torch.distributions.Categorical` built from VBLL's
-    Monte-Carlo-integrated softmax) exposes `.logits` as documented, but it has
-    no `.covariance` -- that attribute lives on the pre-softmax logit
-    distribution instead, which the public `forward()` does not return.
-    `head.logit_predictive(x)` gives that distribution directly; its
-    `covariance_diagonal`, summed over classes, is the analytic epistemic
-    variance from the last-layer weight posterior -- VBLL's actual native
-    uncertainty quantity. (Categorical's own `.variance` is degenerate --
-    it evaluates to NaN, since "variance of a category index" is not a
-    meaningful quantity for a nominal outcome.)
+    Calls `head.predictive(x, n_samples=...)` rather than reading
+    `head(x).predictive`: vbll's `forward` builds that Categorical from
+    `self.predictive(x)` at its default `n_samples = 20` with no pass-through
+    (classification.py:147), and 20 samples is a badly biased estimate of
+    `E_w[softmax(w.x)]` whenever the posterior is wide relative to the decision
+    margin. Measured on stanford_cars, argmax through that noise cost 8.9 points
+    of accuracy at the old campaign's operating point and 15.2 at prior_scale
+    1e3, against a 2,000-sample reference. The bias is one-directional -- it
+    penalises wide posteriors -- so leaving it in place would bias the tuner's
+    own objective against posterior width, which is the quantity the paper
+    measures.
+
+    The score comes from `head.logit_predictive(x)` instead, because
+    `out.predictive` (a `torch.distributions.Categorical`) has no `.covariance`
+    -- that attribute lives on the pre-softmax logit distribution, which the
+    public `forward()` does not return. Its `covariance_diagonal`, summed over
+    classes, is the analytic epistemic variance from the last-layer weight
+    posterior -- VBLL's actual native uncertainty quantity. (Categorical's own
+    `.variance` is degenerate -- it evaluates to NaN, since "variance of a
+    category index" is not meaningful for a nominal outcome.)
     """
     head.eval()
+    # rsample materialises [n_samples, chunk, C], so the chunk has to fall as
+    # n_samples rises or the eval OOMs where training did not: a fixed chunk of
+    # 4096 allocated 16 GiB once n_samples passed a few thousand.
+    n_classes = head.W_mean.shape[0]
+    chunk = max(64, int(2e8 / (n_samples * n_classes)))
     logits_out, score_out = [], []
     with torch.no_grad():
         for start in range(0, len(feats), chunk):
             x = torch.from_numpy(feats[start:start + chunk]).float().to(device)
-            out = head(x)
-            logits_out.append(out.predictive.logits.cpu().numpy())
+            probs = head.predictive(x, n_samples=n_samples)
+            # log, so the returned array stays log-probabilities as before.
+            # clamp_min guards the log: predictive() clips to [0, 1] and a
+            # class no sample lands on comes back exactly 0.
+            logits_out.append(torch.log(probs.clamp_min(1e-12)).cpu().numpy())
             score_out.append(
                 head.logit_predictive(x).covariance_diagonal.sum(dim=-1).cpu().numpy()
             )
@@ -79,19 +97,32 @@ def main(args, on_dump=None):
     hf_repo = None if args.no_hf_cache else args.hf_repo
 
     train_f, train_l = load_cached_features(
-        args.cache_dir, args.model, args.dataset, args.img_size, "train", hf_repo=hf_repo
+        args.cache_dir, args.model, args.dataset, args.img_size,
+        train_split_name(args.dataset), hf_repo=hf_repo,
     )
     eval_f, eval_l = load_cached_features(
         args.cache_dir, args.model, args.dataset, args.img_size,
         eval_split_name(args.dataset), hf_repo=hf_repo,
     )
+    # The cache key is the eval split's real name, not the literal "test". The
+    # indices themselves do not depend on it -- splits.make_pinned_split seeds
+    # from the dataset name alone -- so this only renames food101's cache file
+    # and leaves its partition byte-identical. It matters for flowers102, whose
+    # eval pool is now the 7,169-image "train" file: under the old hardcoded key
+    # this would collide with a cached 1,020-entry split and raise on size drift.
     val_idx, test_idx = splits.load_or_make_pinned_split(
-        args.split_cache_dir, args.dataset, "test", len(eval_f), args.val_fraction
+        args.split_cache_dir, args.dataset, eval_split_name(args.dataset),
+        len(eval_f), args.val_fraction,
     )
 
     head = build_vbll_head(
         train_f.shape[-1], args.num_classes,
-        regularization_weight=1.0 / len(train_f),
+        # eta / N, not 1 / N. eta = kl_ratio * prior_scale is the KL multiplier;
+        # the ELBO's principled eta = 1 is recovered at kl_ratio = 1 /
+        # prior_scale. Shrinkage of the posterior mean goes as eta / prior_scale
+        # = kl_ratio, so searching the ratio directly makes the two axes
+        # near-orthogonal: kl_ratio controls fit, prior_scale controls width.
+        regularization_weight=args.kl_ratio * args.prior_scale / len(train_f),
         prior_scale=args.prior_scale,
         wishart_scale=args.wishart_scale,
         parameterization=args.parameterization,
@@ -131,6 +162,15 @@ def main(args, on_dump=None):
             "steps_per_epoch": n_batches,
             "total_steps": total_steps,
             "head_param_count": head_param_count(head),
+            # Derived, not searched: eta is the departure from the ELBO, so it
+            # must be visible per trial rather than reconstructed from two axes.
+            "eta": args.kl_ratio * args.prior_scale,
+            "regularization_weight": args.kl_ratio * args.prior_scale / len(train_f),
+            # Which pool was which, since flowers102's two are swapped.
+            "train_split": train_split_name(args.dataset),
+            "eval_split": eval_split_name(args.dataset),
+            "n_train": len(train_f),
+            "n_eval": len(eval_f),
         })
 
         step = 0
@@ -151,7 +191,7 @@ def main(args, on_dump=None):
 
                 # Exact: drop-remainder means every step is exactly batch_size.
                 samples_seen = step * args.batch_size
-                logits, score = _forward(head, eval_f, device)
+                logits, score = _forward(head, eval_f, device, args.predictive_samples)
                 # _forward leaves the head in eval mode. Evaluating mid-epoch
                 # rather than at the epoch boundary means the remaining steps
                 # of this epoch would otherwise train in eval mode.
@@ -182,7 +222,7 @@ def main(args, on_dump=None):
                 args.cache_dir, args.model, args.ood_dataset, args.img_size,
                 eval_split_name(args.ood_dataset), hf_repo=hf_repo,
             )
-            ood_logits, ood_score = _forward(head, ood_f, device)
+            ood_logits, ood_score = _forward(head, ood_f, device, args.predictive_samples)
             evaldump.write_dump(
                 args.dump_root, args.group_id, args.uid, total_steps,
                 ood_logits, ood_l,
@@ -215,6 +255,21 @@ def build_argparser():
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--prior-scale", type=float, default=1.0)
     p.add_argument("--wishart-scale", type=float, default=0.1)
+    p.add_argument(
+        "--kl-ratio", type=float, default=1.0,
+        help="eta / prior_scale, where eta is the KL multiplier in "
+             "regularization_weight = eta / N. The default 1.0 combined with "
+             "the default --prior-scale 1.0 gives eta = 1, the textbook ELBO "
+             "and this script's previous behaviour. Measured optimum is ~1e-5: "
+             "vbll needs a strongly tempered posterior to be competitive, which "
+             "is a finding about the method, not a tuning detail.",
+    )
+    p.add_argument(
+        "--predictive-samples", type=int, default=200,
+        help="Monte Carlo samples for E_w[softmax(w.x)] at eval time. vbll's "
+             "own default is 20, which is visibly biased when the posterior is "
+             "wide relative to the decision margin -- see _forward.",
+    )
     p.add_argument("--parameterization", default="diagonal")
     p.add_argument(
         "--cov-rank", type=int, default=2,

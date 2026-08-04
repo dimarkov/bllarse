@@ -72,6 +72,21 @@ def classification_metrics(
     }
 
 
+# Newton's iterate is clipped into this interval so a flat Hessian cannot throw
+# beta to infinity. The bounds are a safety rail, not a prior: when one binds,
+# the returned temperature is a boundary value rather than an optimum, and every
+# temperature-scaled metric downstream is conditioned on a fit that did not
+# converge. is_clipped_temperature exists so that is visible instead of silent.
+BETA_BOUNDS = (0.01, 100.0)
+
+
+def is_clipped_temperature(temperature: float, tol: float = 1e-6) -> bool:
+    """Did `fit_temperature` return a clip boundary rather than an optimum?"""
+    return any(
+        abs(temperature - 1.0 / bound) < tol for bound in BETA_BOUNDS
+    )
+
+
 def fit_temperature(logits: Any, labels: Any, num_iters: int = 16) -> float:
     """Fit one scalar temperature T > 0 by minimising NLL of softmax(z / T).
 
@@ -79,7 +94,8 @@ def fit_temperature(logits: Any, labels: Any, num_iters: int = 16) -> float:
     cross-entropy. NLL is convex in beta, so this reaches the global optimum in a
     handful of steps -- no learning rate to tune, unlike a gradient fit.
 
-    Returns T (the divisor), not beta.
+    Returns T (the divisor), not beta. The result may be a BETA_BOUNDS boundary
+    rather than an optimum -- check is_clipped_temperature.
     """
     logits = _f32(logits)
     labels = jnp.asarray(labels)
@@ -91,7 +107,7 @@ def fit_temperature(logits: Any, labels: Any, num_iters: int = 16) -> float:
         e_z2 = jnp.sum(p * logits * logits, axis=-1)
         grad = jnp.mean(e_z - target_z)
         hess = jnp.mean(e_z2 - e_z * e_z)
-        return jnp.clip(beta - grad / (hess + 1e-8), 0.01, 100.0), None
+        return jnp.clip(beta - grad / (hess + 1e-8), *BETA_BOUNDS), None
 
     beta, _ = lax.scan(newton_step, jnp.ones(()), jnp.arange(num_iters))
     return float(1.0 / beta)

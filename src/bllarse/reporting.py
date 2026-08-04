@@ -30,6 +30,12 @@ def step_metrics(
 
     temperature = metrics.fit_temperature(val_logits, val_labels)
     out["temperature"] = temperature
+    # A boundary temperature means the Newton fit hit its clip, so every
+    # test_ts_* scalar below is conditioned on a fit that did not converge.
+    # Logged as 0/1 rather than raised on: one clipped dump early in a run is
+    # not a reason to kill a trial, but a curve full of them is not a
+    # calibration result. analysis.curves carries the same flag to the figures.
+    out["temperature_clipped"] = float(metrics.is_clipped_temperature(temperature))
     scaled = metrics.apply_temperature(test_logits, temperature)
     out.update({f"test_ts_{k}": v for k, v in metrics.classification_metrics(scaled, test_labels).items()})
     return out

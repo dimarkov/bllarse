@@ -26,7 +26,7 @@ import optax
 from jax import random as jr, vmap
 
 from bllarse import evaldump, splits
-from bllarse.features import eval_split_name, load_cached_features
+from bllarse.features import eval_split_name, load_cached_features, train_split_name
 from bllarse.losses import CrossEntropy
 from bllarse.mlflow_utils import child_run
 from bllarse.reporting import report_step
@@ -136,7 +136,8 @@ def main(args, on_dump=None):
     img_size = args.img_size
 
     train_f, train_l = load_cached_features(
-        args.cache_dir, args.model, args.dataset, img_size, "train", hf_repo=hf_repo
+        args.cache_dir, args.model, args.dataset, img_size,
+        train_split_name(args.dataset), hf_repo=hf_repo,
     )
     eval_f, eval_l = load_cached_features(
         args.cache_dir, args.model, args.dataset, img_size,
@@ -144,9 +145,15 @@ def main(args, on_dump=None):
     )
 
     # Pinned split: val is for post-hoc temperature scaling, test for reporting.
-    # Seed-independent by construction (bllarse.splits).
+    # Seed-independent by construction (bllarse.splits) -- the key below names
+    # the cache file only, it does not enter the partition, so passing the eval
+    # split's real name rather than the literal "test" renames food101's cache
+    # and leaves its indices untouched. flowers102 needs it: its eval pool is
+    # the 7,169-image "train" file, which under the old key would collide with
+    # a cached 1,020-entry split and raise on size drift.
     val_idx, test_idx = splits.load_or_make_pinned_split(
-        args.split_cache_dir, args.dataset, "test", len(eval_f), args.val_fraction
+        args.split_cache_dir, args.dataset, eval_split_name(args.dataset),
+        len(eval_f), args.val_fraction,
     )
 
     embed_dim = train_f.shape[-1]

@@ -40,12 +40,25 @@ VBLL_FIXED = {
 }
 
 
-def study_name(arm: str, dataset: str) -> str:
-    return f"{arm}_{dataset}"
+def study_name(arm: str, dataset: str, campaign: str | None = None) -> str:
+    """Study identity, optionally namespaced by campaign.
+
+    `open_study` passes `load_if_exists=True`, so a study name that collides
+    with an earlier campaign's RESUMES it. That is the desired behaviour for the
+    four workers of one campaign and wrong across campaigns: the trials of the
+    first VBLL campaign carry a `prior_scale` distribution of [1e-2, 1e2] and no
+    `kl_ratio` at all, so resuming would have TPE model a search space that no
+    longer exists. The campaign suffix keeps the old journals readable as
+    evidence rather than forcing them to be deleted.
+    """
+    base = f"{arm}_{dataset}"
+    return base if campaign is None else f"{base}_{campaign}"
 
 
-def open_study(arm: str, dataset: str, storage_dir: Any) -> optuna.Study:
-    """Load or create this (arm, dataset)'s study.
+def open_study(
+    arm: str, dataset: str, storage_dir: Any, campaign: str | None = None
+) -> optuna.Study:
+    """Load or create this (arm, dataset, campaign)'s study.
 
     JournalStorage on JournalFileBackend, NOT SQLite: SQLite over GPFS with
     concurrent writers is unreliable, and the journal backend is built for
@@ -54,7 +67,7 @@ def open_study(arm: str, dataset: str, storage_dir: Any) -> optuna.Study:
     """
     directory = Path(storage_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    name = study_name(arm, dataset)
+    name = study_name(arm, dataset, campaign)
     storage = JournalStorage(JournalFileBackend(str(directory / f"{name}.log")))
     return optuna.create_study(
         study_name=name,
@@ -199,6 +212,14 @@ def build_argparser() -> argparse.ArgumentParser:
                    default=Path("bllarse_sweeps/epoch_budgets.json"))
     p.add_argument("--cache-dir", default=".cache/features")
     p.add_argument("--split-cache-dir", default=".cache/splits")
+    p.add_argument(
+        "--campaign", default=None,
+        help="Namespace suffix for the study, its journal file, its dump "
+             "directory and its MLflow group_id tag. Omit to reproduce the "
+             "unsuffixed names of the first campaign. Required whenever the "
+             "search space has changed, since open_study loads an existing "
+             "study of the same name rather than creating a fresh one.",
+    )
     p.add_argument("--mlflow-experiment", default="bllarse-probing-tuning")
     p.add_argument("--no-mlflow", action="store_true")
     p.add_argument(
@@ -222,8 +243,10 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
     budgets = json.loads(Path(args.budgets).read_text())
-    study = open_study(args.arm, args.dataset, args.storage_dir)
-    group_id = f"tune_{args.arm}_{args.dataset}"
+    study = open_study(args.arm, args.dataset, args.storage_dir, args.campaign)
+    # The group_id carries the campaign too, so the dumps and the MLflow runs
+    # of two campaigns never land in the same directory or the same tag value.
+    group_id = f"tune_{study_name(args.arm, args.dataset, args.campaign)}"
 
     def log_failed_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         # Printed unconditionally on any non-COMPLETE, non-PRUNED outcome so a

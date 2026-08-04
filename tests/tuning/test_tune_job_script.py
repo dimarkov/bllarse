@@ -41,6 +41,22 @@ def test_it_invokes_the_worker_module():
     assert "bllarse.tuning.worker" in SCRIPT.read_text()
 
 
+def test_it_forwards_an_optional_campaign_suffix():
+    """The worker opens studies with load_if_exists=True, so a re-run under a
+    CHANGED search space must namespace its study or it silently resumes the
+    old one. The suffix has to be OPTIONAL -- an unset variable must reproduce
+    the first campaign's unsuffixed names rather than passing an empty string,
+    which would create a study called `vbll_food101_`."""
+    text = SCRIPT.read_text()
+    assert "BLLARSE_TUNE_CAMPAIGN" in text
+    assert "--campaign" in text
+    # Guarded by a non-empty test, not interpolated unconditionally.
+    assert 'if [[ -n "${BLLARSE_TUNE_CAMPAIGN:-}" ]]; then' in text
+    # ...and it must NOT be in the required-variable list, which exits 2.
+    required = text[text.index("for var in"):text.index("done", text.index("for var in"))]
+    assert "BLLARSE_TUNE_CAMPAIGN" not in required
+
+
 def test_it_passes_a_patience_of_20_by_default():
     """20 is the smallest patience at which none of the 28 real pilot curves
     stop before their own val_nll argmin (15 stops one early, 8 stops two

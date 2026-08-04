@@ -143,12 +143,18 @@ def fixed_budgets(fixed_steps: int, *, batch_size: int) -> dict[str, dict[str, i
     flowers102, food101 and stanford_cars at 12,000 steps while already
     beating faster learning rates, so 30,000 was chosen as a generous budget
     rather than chased further with another pilot.
+
+    `batch_size` is a reference for the steps -> epochs conversion only;
+    `worker.trial_config` re-derives epochs at each trial's SAMPLED batch size,
+    so `steps` is the field that binds. It is clamped per dataset to that
+    dataset's own cap, because a reference above the cap documents a config the
+    search cannot sample: flowers102 trains on 1,020 images, capping it at 256.
     """
     return {
         dataset: {
-            "batch_size": batch_size,
+            "batch_size": (reference := min(batch_size, space.batch_cap(space.N_TRAIN[dataset]))),
             "steps": fixed_steps,
-            "epochs": epochs_for_steps(dataset, fixed_steps, batch_size),
+            "epochs": epochs_for_steps(dataset, fixed_steps, reference),
             "provenance": "fixed by decision",
         }
         for dataset in space.DATASETS

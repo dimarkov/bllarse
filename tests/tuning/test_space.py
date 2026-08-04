@@ -8,7 +8,10 @@ from bllarse.tuning import space
 EXPECTED_CAPS = {
     "oxford_pets": 1024,
     "dtd": 1024,
-    "flowers102": 2048,
+    # 256, not 2048: flowers102 trains on the official 1,020-image split, not
+    # the 7,169-image val+test pool the upstream repo calls "train". See
+    # bllarse.features._TRAIN_SPLIT.
+    "flowers102": 256,
     "stanford_cars": 2048,
     "food101": 32768,
     "cifar10": 16384,
@@ -97,3 +100,42 @@ def test_suggest_works_with_a_duck_typed_trial(arm):
     trial = _FakeTrial()
     params = space.suggest(trial, arm, "dtd")
     assert params["learning_rate"] == 1e-3
+
+
+def test_vbll_searches_the_kl_ratio_not_a_bare_eta():
+    """The quantity that controls fit is eta / prior_scale, so it is the axis.
+
+    The first campaign fixed eta = 1 and searched prior_scale in [1e-2, 1e2],
+    confining the ratio to [1e-2, 1e2] when the measured optimum is ~1e-5 --
+    the box excluded the answer by three orders of magnitude, and all seven
+    VBLL studies pinned prior_scale to its ceiling as a result. This pins the
+    replacement so it cannot drift back to a range that cannot express 1e-5.
+    """
+    trial = _FakeTrial()
+    space.suggest(trial, "vbll", "dtd")
+    low, high, log = trial.floats["kl_ratio"]
+    assert (low, high, log) == (1e-7, 1e-2, True)
+    assert low < 1e-5 < high, "the measured optimum must be interior"
+    assert "eta" not in trial.floats, "eta is derived from the ratio, not searched"
+
+
+def test_vbll_prior_scale_is_widened_a_decade_at_each_end():
+    trial = _FakeTrial()
+    space.suggest(trial, "vbll", "dtd")
+    assert trial.floats["prior_scale"] == (1e-1, 1e3, True)
+
+
+def test_adamw_ce_gains_no_vbll_axes():
+    trial = _FakeTrial()
+    params = space.suggest(trial, "adamw_ce", "dtd")
+    for axis in ("kl_ratio", "prior_scale", "wishart_scale"):
+        assert axis not in params
+        assert axis not in trial.floats
+
+
+def test_flowers102_trains_on_the_official_split():
+    """1,020 images, not the 7,169-image val+test pool the upstream repo names
+    "train". The whole batch ladder follows from this number, so it is pinned
+    here as well as in bllarse.features."""
+    assert space.N_TRAIN["flowers102"] == 1_020
+    assert space.batch_sizes("flowers102") == [64, 128, 256]

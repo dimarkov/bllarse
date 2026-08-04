@@ -18,8 +18,8 @@
     "steps": 30000
   },
   "flowers102": {
-    "batch_size": 512,
-    "epochs": 2143,
+    "batch_size": 256,
+    "epochs": 10000,
     "provenance": "fixed by decision",
     "steps": 30000
   },

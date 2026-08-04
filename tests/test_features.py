@@ -205,6 +205,13 @@ def test_module_imports_without_jax_or_torch():
     assert "clean" in result.stdout
 
 
+# flowers102's two pools are deliberately swapped relative to what the upstream
+# repo calls them -- see features._TRAIN_SPLIT. Everything else must track
+# DATASET_CONFIGS exactly, so the exception is listed here rather than being
+# silently tolerated by a weakened assertion.
+POOL_SWAPPED = {"flowers102"}
+
+
 def test_eval_split_name_tracks_the_upstream_split_names():
     """precompute_features.py writes the held-out file under the dataset's own
     split name, so the two datasets whose upstream split is 'validation' must
@@ -213,8 +220,27 @@ def test_eval_split_name_tracks_the_upstream_split_names():
     assert features.eval_split_name("food101") == "validation"
     assert features.eval_split_name("imagenet1k") == "validation"
     for dataset in ("cifar10", "cifar100", "svhn", "dtd", "oxford_pets",
-                    "flowers102", "stanford_cars"):
+                    "stanford_cars"):
         assert features.eval_split_name(dataset) == "test"
+
+
+def test_flowers102_pools_are_swapped():
+    """nelorth/oxford-flowers packs Flowers-102 as train=7,169 / test=1,020,
+    which is the official protocol inverted: the official training split is the
+    1,020 (10 per class) and the 7,169 is val+test. Reading the names literally
+    trains on seven times the protocol's data and leaves 1,020 images to
+    evaluate on, of which a 10% val fraction is 102 -- one per class to fit a
+    temperature. So the two are swapped, and the swap is pinned here because
+    getting it backwards is silent: both files load, both train, and only the
+    numbers are wrong."""
+    assert features.train_split_name("flowers102") == "test"
+    assert features.eval_split_name("flowers102") == "train"
+
+
+def test_train_split_name_defaults_to_train():
+    for dataset in ("cifar10", "cifar100", "svhn", "dtd", "oxford_pets",
+                    "stanford_cars", "food101", "imagenet1k"):
+        assert features.train_split_name(dataset) == "train"
 
 
 def test_eval_split_name_matches_dataset_configs():
@@ -228,4 +254,12 @@ def test_eval_split_name_matches_dataset_configs():
     splits_found = re.findall(r'"test_split":\s*"(\w+)"', body)
     assert len(entries) == len(splits_found), (entries, splits_found)
     for dataset, split in zip(entries, splits_found):
+        if dataset in POOL_SWAPPED:
+            # Still a drift guard, just against the swap rather than the
+            # identity: eval must read the file upstream calls "train", and
+            # train must read the file upstream nominates as its test split.
+            assert features.eval_split_name(dataset) == "train", dataset
+            assert features.train_split_name(dataset) == split, dataset
+            continue
         assert features.eval_split_name(dataset) == split, dataset
+        assert features.train_split_name(dataset) == "train", dataset

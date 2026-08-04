@@ -76,6 +76,14 @@ def run_curve(
             "seed": test_record.meta["seed"],
             "arm": test_record.meta["arm"],
             "temperature": temperature,
+            # A boundary T is a clip, not an optimum, so the scaled metrics on
+            # this row rest on a fit that did not converge. Carried onto the row
+            # so a figure built from these curves can exclude or flag them
+            # rather than averaging them in silently. False when
+            # temperature_scaled is off, where T is the identity by definition.
+            "temperature_clipped": (
+                temperature_scaled and metrics.is_clipped_temperature(temperature)
+            ),
             **metrics.classification_metrics(logits, labels),
         }
 

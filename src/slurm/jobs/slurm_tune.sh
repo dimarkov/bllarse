@@ -97,14 +97,24 @@ env_args=(
 # stops before its argmin is scored at the wrong point, which changes which
 # hyperparameters the campaign selects -- do NOT lower this "to save time"
 # without re-running that replay against fresh pilot curves.
+worker_args=(
+  --arm "$BLLARSE_TUNE_ARM"
+  --dataset "$BLLARSE_TUNE_DATASET"
+  --n-trials "$BLLARSE_TUNE_TRIALS"
+  --storage-dir "$storage_dir"
+  --patience "${BLLARSE_TUNE_PATIENCE:-20}"
+  --cache-dir "${BLLARSE_CACHE_DIR:-.cache/features}"
+)
+# Optional, and unset reproduces the first campaign's unsuffixed study names.
+# Set it whenever the search space has changed: the worker opens studies with
+# load_if_exists, so an unsuffixed re-run resumes the old study instead of
+# starting a new one.
+if [[ -n "${BLLARSE_TUNE_CAMPAIGN:-}" ]]; then
+  worker_args+=(--campaign "$BLLARSE_TUNE_CAMPAIGN")
+fi
+
 exec apptainer exec --nv \
   "${env_args[@]}" \
   "${bind_args[@]}" \
   "$BLLARSE_SIF" \
-  python -m bllarse.tuning.worker \
-    --arm "$BLLARSE_TUNE_ARM" \
-    --dataset "$BLLARSE_TUNE_DATASET" \
-    --n-trials "$BLLARSE_TUNE_TRIALS" \
-    --storage-dir "$storage_dir" \
-    --patience "${BLLARSE_TUNE_PATIENCE:-20}" \
-    --cache-dir "${BLLARSE_CACHE_DIR:-.cache/features}"
+  python -m bllarse.tuning.worker "${worker_args[@]}"

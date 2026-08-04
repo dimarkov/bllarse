@@ -36,7 +36,27 @@ def _hub_status(exc: BaseException) -> int | None:
 # names the cache file after the dataset's own split (vit_classification's
 # DATASET_CONFIGS[...]["test_split"]), so an arm that hardcodes "test" raises
 # FileNotFoundError on exactly these -- which is two of Fig 1's six datasets.
-_EVAL_SPLIT = {"food101": "validation", "imagenet1k": "validation"}
+#
+# flowers102 is here for a different reason: its two cached pools are inverted
+# relative to the official protocol. Oxford Flowers-102 ships train/val/test at
+# 1,020 / 1,020 / 6,149, but the upstream config pairs the 7,169-image val+test
+# pool with the name "train" and the 1,020-image official train split with the
+# name "test". Taken literally that trains on 7,169 images -- seven times the
+# protocol's training set, and a different benchmark from the published one --
+# and then evaluates on 1,020, of which a 10% val fraction leaves 102 images to
+# fit a temperature on, one per class. So the two are swapped below: train on
+# the 1,020-image split, evaluate on the 7,169-image pool.
+_TRAIN_SPLIT = {"flowers102": "test"}
+_EVAL_SPLIT = {
+    "food101": "validation",
+    "imagenet1k": "validation",
+    "flowers102": "train",
+}
+
+
+def train_split_name(dataset: str) -> str:
+    """On-disk name of `dataset`'s training split. Not always "train"."""
+    return _TRAIN_SPLIT.get(dataset, "train")
 
 
 def eval_split_name(dataset: str) -> str:

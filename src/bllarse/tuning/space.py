@@ -13,7 +13,10 @@ from typing import Any
 N_TRAIN = {
     "oxford_pets": 3_680,
     "dtd": 3_760,
-    "flowers102": 7_169,
+    # The official Flowers-102 training split, 10 images per class. NOT the
+    # 7,169-image pool the upstream config calls "train" -- that is val+test and
+    # is now the eval pool. See bllarse.features._TRAIN_SPLIT.
+    "flowers102": 1_020,
     "stanford_cars": 8_144,
     "food101": 75_750,
     "cifar10": 50_000,
@@ -105,6 +108,23 @@ def suggest(trial: Any, arm: str, dataset: str) -> dict[str, Any]:
         "batch_size": trial.suggest_categorical("batch_size", batch_sizes(dataset)),
     }
     if arm == "vbll":
-        params["prior_scale"] = trial.suggest_float("prior_scale", 1e-2, 1e2, log=True)
+        # kl_ratio, not eta, is the first axis. vbll's loss carries the KL at
+        # regularization_weight = eta / N, and the shrinkage of the posterior
+        # mean goes as ||m||^2 * eta / (N * prior_scale) -- so eta and
+        # prior_scale are degenerate in the mean and differ only in the width
+        # they leave behind. Searching them as independent axes spends trials
+        # sliding along that diagonal ridge; searching the ratio directly makes
+        # the axes near-orthogonal, one for fit and one for width.
+        #
+        # The first campaign fixed eta = 1 and searched prior_scale in
+        # [1e-2, 1e2], which confines the ratio to [1e-2, 1e2]. The measured
+        # optimum is ~1e-5, so the box excluded the answer by three orders of
+        # magnitude and every one of the seven VBLL studies pinned prior_scale
+        # to its ceiling. [1e-7, 1e-2] brackets 1e-5 by two decades below and
+        # three above; 1e-4 was already 1.2 points worse and 1e-3 6.3 points.
+        params["kl_ratio"] = trial.suggest_float("kl_ratio", 1e-7, 1e-2, log=True)
+        # Widened one decade at each end. At a fixed ratio, posterior sd grows
+        # as sqrt(prior_scale), so this spans roughly sd 0.06 to 6.
+        params["prior_scale"] = trial.suggest_float("prior_scale", 1e-1, 1e3, log=True)
         params["wishart_scale"] = trial.suggest_float("wishart_scale", 1e-3, 1e1, log=True)
     return params

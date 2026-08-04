@@ -29,6 +29,32 @@ def test_workers_sharing_a_storage_dir_share_one_study(tmp_path):
     assert second.study_name == first.study_name
 
 
+def test_an_unnamed_campaign_reproduces_the_original_study_names():
+    """The suffix is opt-in, so replaying the first campaign stays possible."""
+    assert worker.study_name("vbll", "food101") == "vbll_food101"
+    assert worker.study_name("vbll", "food101", None) == "vbll_food101"
+
+
+def test_a_campaign_suffix_makes_a_separate_study(tmp_path):
+    """open_study passes load_if_exists=True, which is what lets four workers
+    share one study -- and exactly why a re-run under a CHANGED search space
+    must not reuse the name. The old trials carry a prior_scale distribution of
+    [1e-2, 1e2] and no kl_ratio at all, so resuming would have TPE model a
+    space that no longer exists."""
+    old = worker.open_study("vbll", "food101", tmp_path)
+    old.tell(old.ask(), 1.23)
+
+    new = worker.open_study("vbll", "food101", tmp_path, "kl_ratio")
+    assert new.study_name == "vbll_food101_kl_ratio"
+    assert new.study_name != old.study_name
+    assert len(new.trials) == 0, "a new campaign must not inherit old trials"
+
+    # ...and the second worker of the NEW campaign still shares its study.
+    peer = worker.open_study("vbll", "food101", tmp_path, "kl_ratio")
+    peer.tell(peer.ask(), 0.5)
+    assert len(worker.open_study("vbll", "food101", tmp_path, "kl_ratio").trials) == 1
+
+
 def test_the_study_minimises():
     assert worker.DIRECTION == "minimize"
 

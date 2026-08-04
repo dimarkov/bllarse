@@ -67,6 +67,33 @@ def test_fit_temperature_reduces_nll():
     )
 
 
+def test_a_converged_temperature_is_not_flagged_as_clipped():
+    base, labels = _calibrated_logits_and_labels(2)
+    T = metrics.fit_temperature(jnp.asarray(base * 4.0), labels)
+    assert not metrics.is_clipped_temperature(T)
+
+
+@pytest.mark.parametrize("bound", metrics.BETA_BOUNDS)
+def test_a_boundary_temperature_is_flagged(bound):
+    """Both clip boundaries must be recognised, expressed as T = 1/beta."""
+    assert metrics.is_clipped_temperature(1.0 / bound)
+
+
+def test_a_separable_problem_clips_and_says_so():
+    """Labels taken as argmax make the problem perfectly separable, so NLL
+    falls monotonically as T -> 0 and Newton runs beta to its upper clip. The
+    returned T is then a boundary, not an optimum, and every temperature-scaled
+    metric computed from it rests on a fit that did not converge -- which is
+    the case the flag exists to surface."""
+    rng = np.random.default_rng(3)
+    base = rng.normal(size=(2000, 5)).astype(np.float32) * 8.0
+    labels = jnp.asarray(np.asarray(base).argmax(-1))
+
+    T = metrics.fit_temperature(jnp.asarray(base), labels)
+    assert metrics.is_clipped_temperature(T), f"expected a clipped fit, got T={T}"
+    assert T == pytest.approx(1.0 / metrics.BETA_BOUNDS[1])
+
+
 def test_msp_ood_score_is_higher_for_uniform_than_confident():
     confident = jnp.array([[10.0, 0.0, 0.0]])
     uniform = jnp.zeros((1, 3))
