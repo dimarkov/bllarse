@@ -68,20 +68,58 @@ class IBProbit(eqx.Module):
             (mu, Lambda, jnp.ones((), dtype=jnp.float32)),
         )
 
+    @staticmethod
+    def _prefers_dual(N: int, D: int, K: int, num_iters: int) -> bool:
+        """Is the pred-carrying CAVI form cheaper than the eta-carrying one?
+
+        Shapes are static at trace time, so this is a plain Python branch. The
+        dual pays 2N^2D up front to save 2NK(2D - N) per iteration, so it needs
+        both a narrow batch and enough iterations to amortise the hat matrix.
+        """
+        primal = 4 * num_iters * N * D * K
+        dual = 2 * N * N * D + 4 * N * D * K + 2 * (num_iters - 1) * N * N * K
+        return num_iters >= 1 and dual < primal
+
+    @staticmethod
+    def _expected_z(pred: Array, y_one_hot: Array) -> Array:
+        """E_q[z_ik] via log-space Mills ratios."""
+        log_pdf = norm.logpdf(pred)
+        logcdf1 = norm.logcdf(pred)
+        logcdf2 = norm.logcdf(-pred)
+        mills_pos = jnp.exp(log_pdf - logcdf1)
+        mills_neg = jnp.exp(log_pdf - logcdf2)
+        correction = jnp.where(y_one_hot, mills_pos, -mills_neg)
+        return pred + correction
+
     def _cavi_scan(self, fts: Array, x: Array, y_one_hot: Array, eta_init: Array, eta_old: Array, num_iters: int) -> Array:
-        """CAVI fixed-point scan. Returns eta_new = eta_old + X^T E_q[z]."""
+        """CAVI fixed-point scan. Returns eta_new = eta_old + X^T E_q[z].
+
+        Two algebraically identical forms, picked by whichever is cheaper at
+        these shapes. The primal carries eta (D, K) and costs 4NDK per
+        iteration. Since the carry is always eta_old + X^T E_q[z], the
+        prediction it feeds back satisfies
+
+            x @ eta = x @ eta_old + (x @ X^T) E_q[z] = c + S E_q[z],
+
+        so the dual carries pred (N, K) against the precomputed hat matrix
+        S = X (I + X^T X)^-1 X^T at 2N^2K per iteration. The dual wins on wide
+        features and modest batches (roughly N < 2D) and loses on large batches,
+        where the N x N matrix is both slower and far bigger than eta.
+        """
+        if self._prefers_dual(x.shape[0], x.shape[1], y_one_hot.shape[-1], num_iters):
+            S = mm_update(x, fts.T)
+            c = mm_update(x, eta_old)
+
+            def step_fn(pred, *args):
+                return c + mm_update(S, self._expected_z(pred, y_one_hot)), None
+
+            # one prediction is consumed by the final projection below, so the
+            # scan is one iteration shorter than the primal loop
+            pred, _ = lax.scan(step_fn, mm_update(x, eta_init), jnp.arange(num_iters - 1))
+            return eta_old + mm_update(fts.T, self._expected_z(pred, y_one_hot))
+
         def step_fn(eta_carry, *args):
-            pred = mm_update(x, eta_carry)
-
-            # Compute E_q[z_ik] via log-space Mills ratios
-            log_pdf = norm.logpdf(pred)
-            logcdf1 = norm.logcdf(pred)
-            logcdf2 = norm.logcdf(-pred)
-            mills_pos = jnp.exp(log_pdf - logcdf1)
-            mills_neg = jnp.exp(log_pdf - logcdf2)
-            correction = jnp.where(y_one_hot, mills_pos, -mills_neg)
-            E_q_z = pred + correction
-
+            E_q_z = self._expected_z(mm_update(x, eta_carry), y_one_hot)
             return eta_old + mm_update(fts.T, E_q_z), None
 
         eta_new, _ = lax.scan(step_fn, eta_init, jnp.arange(num_iters))
