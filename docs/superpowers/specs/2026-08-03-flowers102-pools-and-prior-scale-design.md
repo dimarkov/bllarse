@@ -217,8 +217,27 @@ probabilities so the returned array stays log-probabilities as before.
   `n_samples`: `chunk = max(64, int(2e8 / (n_samples * C)))`. Without this the
   round-1 diagnostic OOM'd at 16 GiB.
 
-200, not 2000: it recovers 86% of the n=20 gap at the campaign's worst operating
-point and ~99% at the ones the new space selects, for 1/10th the eval cost.
+200, not 2000, and not 32 or 64. The NLL error is a Jensen bias on
+`log E[softmax]` and scales as `1/n`; the accuracy loss comes from argmax errors
+through the noise and decays faster still. So `n=200` leaves at most ~10% of the
+`n=20` error — under 0.1 points where the new space selects, ~1.5 points at the
+campaign's worst corner, which is only visited during exploration. That is an
+extrapolation from the two sampled points (`n=20`, `n=2000`), not a measurement,
+and it is not worth a job to refine: `predictive` samples logits, `[n, B, C]`,
+with no dependence on the 1280-dim feature, so 40 dumps at `n=200` cost ~1 s
+against an ~11-minute trial. `n=64` would save under a second.
+
+Two reasons to be generous rather than tight. First, the bias is largest when the
+posterior is widest, which is *early* in training (`m/sd ≈ 0` at init) — and
+`MedianPruner` cuts at `PRUNER_WARMUP_DUMPS = 10` of 40, so the estimator is
+noisiest exactly where the pruning decisions are made. Second, the bias has a
+direction: it penalises wide posteriors, and `val_nll` is the objective. Since the
+paper's claim is about posterior width collapsing, an objective biased against
+width would partly manufacture that claim.
+
+Worth a footnote in the paper: vbll ships `n_samples = 20` as its default, and
+that default costs up to 15 accuracy points in the wide-posterior regime. Anyone
+using the library as-is on a small-margin problem takes that hit silently.
 
 ### Pool swap for flowers102
 
