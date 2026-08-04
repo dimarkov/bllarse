@@ -164,3 +164,54 @@ def test_a_failing_trial_does_not_abort_the_remaining_trials(tmp_path):
     states = [t.state for t in study.trials]
     assert states.count(optuna.trial.TrialState.FAIL) == 1
     assert states.count(optuna.trial.TrialState.COMPLETE) == 1
+
+
+def test_a_study_with_no_completed_trials_reports_the_harness_fault(tmp_path):
+    """`catch` keeps the worker alive through a failing trial, which is right
+    -- but if EVERY trial fails, study.best_value raises "No trials are
+    completed yet" and that traceback becomes the last thing in the SLURM log,
+    burying the real cause far above it. That is how a misresolved --cache-dir
+    presented: 32 trials dying on Errno 30, reported as an opaque optuna error.
+    The worker must say plainly that it produced nothing, and exit non-zero so
+    the task is not mistaken for a bad-scoring configuration."""
+    study = worker.open_study("adamw_ce", "dtd", tmp_path)
+
+    def always_fails(trial: optuna.Trial) -> float:
+        raise OSError(30, "Read-only file system")
+
+    study.optimize(always_fails, n_trials=3, catch=(Exception,))
+    assert all(t.state == optuna.trial.TrialState.FAIL for t in study.trials)
+
+    with pytest.raises(SystemExit) as excinfo:
+        worker.summarize_study(study)
+    message = str(excinfo.value)
+    assert "NONE completed" in message
+    assert "3 failed" in message
+    assert "harness fault" in message
+
+
+def test_a_study_with_results_summarises_normally(tmp_path):
+    study = worker.open_study("adamw_ce", "cifar10", tmp_path)
+    study.optimize(lambda t: 0.25, n_trials=2, catch=(Exception,))
+
+    summary = worker.summarize_study(study)
+    assert "2 completed" in summary
+    assert "0.25000" in summary
+
+
+def test_a_partly_failed_study_still_summarises(tmp_path):
+    """One bad trial must NOT be escalated to a harness fault -- that is the
+    whole point of catch, and conflating the two would make a single flaky
+    trial kill an otherwise good study."""
+    study = worker.open_study("adamw_ce", "cifar100", tmp_path)
+    calls = {"n": 0}
+
+    def flaky(trial: optuna.Trial) -> float:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        return 0.5
+
+    study.optimize(flaky, n_trials=3, catch=(Exception,))
+    summary = worker.summarize_study(study)
+    assert "2 completed" in summary

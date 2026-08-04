@@ -54,6 +54,21 @@ echo "[bllarse] tune worker=${SLURM_ARRAY_TASK_ID} arm=${BLLARSE_TUNE_ARM}" \
      "dataset=${BLLARSE_TUNE_DATASET} trials=${BLLARSE_TUNE_TRIALS}"
 
 bind_args=(--bind "$repo_root" --bind "$storage_dir")
+
+# Resolved for the same reason as repo_root: /ptmp is a host symlink to
+# /raven/ptmp, apptainer binds the RESOLVED target and does not recreate the
+# symlink inside the container, so an unresolved /ptmp/... path exists in the
+# container as a READ-ONLY stub. A cache dir given that way does not fail at
+# startup -- load_cached_features simply does not find the features there,
+# falls back to downloading from the Hub, and dies on mkdir with
+# `OSError: [Errno 30] Read-only file system` once per trial. Resolving here
+# rather than trusting the caller is deliberate: this is the third time that
+# symlink has cost a job, and the failure mode looks like a data problem
+# rather than a path problem.
+cache_dir="$(readlink -f "${BLLARSE_CACHE_DIR:-$repo_root/.cache/features}")"
+if [[ "$cache_dir" != "$repo_root"/* ]]; then
+  bind_args+=(--bind "$cache_dir")
+fi
 if [[ -n "${BLLARSE_HF_HOME:-}" ]]; then
   mkdir -p "$BLLARSE_HF_HOME"
   bind_args+=(--bind "$BLLARSE_HF_HOME:$BLLARSE_HF_HOME")
@@ -103,7 +118,7 @@ worker_args=(
   --n-trials "$BLLARSE_TUNE_TRIALS"
   --storage-dir "$storage_dir"
   --patience "${BLLARSE_TUNE_PATIENCE:-20}"
-  --cache-dir "${BLLARSE_CACHE_DIR:-.cache/features}"
+  --cache-dir "$cache_dir"
 )
 # Optional, and unset reproduces the first campaign's unsuffixed study names.
 # Set it whenever the search space has changed: the worker opens studies with

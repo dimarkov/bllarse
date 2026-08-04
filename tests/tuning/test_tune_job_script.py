@@ -41,6 +41,21 @@ def test_it_invokes_the_worker_module():
     assert "bllarse.tuning.worker" in SCRIPT.read_text()
 
 
+def test_it_resolves_the_cache_dir_through_symlinks():
+    """/ptmp is a host symlink to /raven/ptmp. Apptainer binds the RESOLVED
+    target and does not recreate the symlink inside the container, so an
+    unresolved /ptmp/... cache dir is a read-only stub in there. That does not
+    fail at startup: load_cached_features just misses the cache, falls back to
+    the Hub, and dies on mkdir with Errno 30 once per trial -- a whole campaign
+    of tasks that run, burn GPU time and complete zero trials. The script must
+    resolve it itself rather than trusting whatever the launcher exported."""
+    text = SCRIPT.read_text()
+    assert 'cache_dir="$(readlink -f' in text
+    assert '--cache-dir "$cache_dir"' in text
+    # The raw variable must not reach the worker directly.
+    assert '--cache-dir "${BLLARSE_CACHE_DIR' not in text
+
+
 def test_it_forwards_an_optional_campaign_suffix():
     """The worker opens studies with load_if_exists=True, so a re-run under a
     CHANGED search space must namespace its study or it silently resumes the

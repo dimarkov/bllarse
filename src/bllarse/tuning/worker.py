@@ -82,6 +82,37 @@ def open_study(
     )
 
 
+def summarize_study(study: optuna.Study) -> str:
+    """One line describing what this worker achieved.
+
+    Raises SystemExit when NOTHING completed. `catch=(Exception,)` keeps the
+    worker alive through a failing trial, which is right -- but if EVERY trial
+    fails, `study.best_value` raises ValueError("No trials are completed yet.")
+    and THAT traceback becomes the last thing in the SLURM log, burying the
+    real cause a hundred lines above it. A misresolved --cache-dir presented
+    exactly this way: 32 trials each dying on `OSError: [Errno 30] Read-only
+    file system`, surfacing as an opaque optuna error.
+
+    A study where every trial failed is a harness fault -- paths, container,
+    missing features -- not a search-space outcome, and it must be
+    distinguishable from a configuration that merely scored badly.
+    """
+    states = [t.state for t in study.trials]
+    n_complete = states.count(optuna.trial.TrialState.COMPLETE)
+    if n_complete == 0:
+        raise SystemExit(
+            f"[tune] {study.study_name}: {len(states)} trials, NONE completed "
+            f"({states.count(optuna.trial.TrialState.FAIL)} failed, "
+            f"{states.count(optuna.trial.TrialState.PRUNED)} pruned). The "
+            f"worker ran but produced no usable result -- read the FIRST "
+            f"traceback in this log, not the last. Every trial failing is a "
+            f"harness fault, not a search outcome."
+        )
+    return (f"[tune] {study.study_name}: {len(states)} trials, "
+            f"{n_complete} completed, best={study.best_value:.5f} "
+            f"params={study.best_params}")
+
+
 def trial_config(
     arm: str,
     dataset: str,
@@ -286,8 +317,7 @@ def main() -> None:
         catch=(Exception,),
         callbacks=[log_failed_trial],
     )
-    print(f"[tune] {study.study_name}: {len(study.trials)} trials, "
-          f"best={study.best_value:.5f} params={study.best_params}")
+    print(summarize_study(study))
 
 
 if __name__ == "__main__":
