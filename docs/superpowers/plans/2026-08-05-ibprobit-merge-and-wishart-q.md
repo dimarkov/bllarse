@@ -61,20 +61,29 @@ git show ibprobit-process-noise:tests/losses/test_bayesian.py > tests/losses/tes
 Run: `CUDA_VISIBLE_DEVICES=2 XLA_PYTHON_CLIENT_PREALLOCATE=false uv run pytest -q tests/losses/test_bayesian.py`
 Expected: PASS, 44 tests. If any fail, they are genuine port breakage — fix `bayesian.py`, not the test.
 
-- [ ] **Step 3: Confirm the dual-CAVI suite is now the only breakage**
+- [ ] **Step 3: Mark the dual-CAVI suite xfail until Task 2 restores it**
 
-Run: `CUDA_VISIBLE_DEVICES=2 XLA_PYTHON_CLIENT_PREALLOCATE=false uv run pytest -q tests/losses/`
-Expected: `test_bayesian.py` passes; `test_cavi_dual.py` fails — it references `IBProbit._prefers_dual` and `_expected_z`, which the ported file does not have. This is expected and is Task 2's job. Do not fix it here.
+`tests/losses/test_cavi_dual.py` references `IBProbit._prefers_dual` and `_expected_z`, which the ported file does not have; Task 2 restores both. Rather than leave a red commit, mark the whole module expected-to-fail. Add at the top of the file, directly under the imports:
 
-- [ ] **Step 4: Confirm the rest of the suite is unaffected**
+```python
+pytestmark = pytest.mark.xfail(
+    reason="dual CAVI form is restored in the next commit; see plan Task 2",
+    raises=AttributeError,
+    strict=True,
+)
+```
 
-Run: `CUDA_VISIBLE_DEVICES=2 XLA_PYTHON_CLIENT_PREALLOCATE=false uv run pytest -q --ignore=tests/losses/test_cavi_dual.py`
-Expected: PASS. Compare the count against the 283-passed baseline; the delta should be exactly the 40 new `test_bayesian.py` tests minus the 6 ignored dual tests.
+and add `import pytest` if the file does not already have it. `strict=True` means the marker itself fails the suite the moment Task 2 makes these tests pass, so it cannot be forgotten.
+
+- [ ] **Step 4: Confirm the whole suite is green**
+
+Run: `CUDA_VISIBLE_DEVICES=2 XLA_PYTHON_CLIENT_PREALLOCATE=false uv run pytest -q`
+Expected: PASS with 6 xfailed. Compare against the 283-passed baseline: the delta is the 40 new `test_bayesian.py` tests, with the 6 dual tests moving from passed to xfailed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/bllarse/losses/bayesian.py tests/losses/test_bayesian.py
+git add src/bllarse/losses/bayesian.py tests/losses/test_bayesian.py tests/losses/test_cavi_dual.py
 git commit -m "feat(ibprobit): port the process-noise head onto the protocol branch
 
 Brings Sigma-carrying recursive state, process noise q I, the PX-CAVI scan,
@@ -85,8 +94,8 @@ consolidated by 726bc78 already call this API and were dead without it.
 The LayerNorm and alpha-forgetting do not come across: e79fc20 replaced the
 former with the probit marginalization, and process noise subsumes the latter.
 
-tests/losses/test_cavi_dual.py is knowingly left failing; the next commit
-restores the dual form it covers."
+test_cavi_dual.py is strict-xfail for one commit; the next restores the dual
+form it covers, at which point the strict marker fails until it is removed."
 ```
 
 ---
@@ -105,9 +114,9 @@ restores the dual form it covers."
 
 The dual does not compose with PX, which needs `eta_hat` in d-space for `B = sum(p .* eta_hat)`. So `_prefers_dual` is consulted only inside `_cavi_scan` and `_cavi_scan_px` is left alone.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Remove the xfail marker and write the failing test**
 
-Append to `tests/losses/test_cavi_dual.py`:
+Delete the `pytestmark = pytest.mark.xfail(...)` block Task 1 added at the top of `tests/losses/test_cavi_dual.py` — it is `strict=True`, so it will fail the suite as soon as this task's implementation lands. Then append:
 
 ```python
 def test_dual_matches_primal_under_process_noise_and_gate():
