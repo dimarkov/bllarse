@@ -215,28 +215,70 @@ class IBProbit(eqx.Module):
              jnp.zeros((), dtype=jnp.int32), False),
         )
 
+    @staticmethod
+    def _prefers_dual(N: int, D: int, K: int, num_iters: int) -> bool:
+        """Is the pred-carrying CAVI form cheaper than the eta-carrying one?
+
+        Shapes are static at trace time, so this is a plain Python branch. The
+        dual pays 2N^2D up front to save 2NK(2D - N) per iteration, so it needs
+        both a narrow batch and enough iterations to amortise the hat matrix.
+        """
+        primal = 4 * num_iters * N * D * K
+        dual = 2 * N * N * D + 4 * N * D * K + 2 * (num_iters - 1) * N * N * K
+        return num_iters >= 1 and dual < primal
+
+    @staticmethod
+    def _expected_z(alpha: Array, y_one_hot: Array) -> Array:
+        """Standardized truncated-latent mean: E_q[z]/sigma_z given alpha = m/sigma_z,
+        via log-space Mills ratios. Caller rescales by sigma_z."""
+        log_pdf = norm.logpdf(alpha)
+        mills_pos = jnp.exp(log_pdf - norm.logcdf(alpha))
+        mills_neg = jnp.exp(log_pdf - norm.logcdf(-alpha))
+        return alpha + jnp.where(y_one_hot, mills_pos, -mills_neg)
+
     def _cavi_scan(self, fts: Array, x: Array, y_one_hot: Array, eta_init: Array, eta_anchor: Array, num_iters: int, sigma_z: Array, g: Optional[Array] = None) -> Array:
         """CAVI fixed-point scan for the posterior mean. Returns the natural
-        parameter eta = eta_anchor + (1/sigma_z^2) X^T (g ⊙ E_q[z]), where E_q[z] is the
-        sign-truncated latent mean E[z] = m + sigma_z * Mills(m / sigma_z),
-        m = mu^T f. ``x = fts @ Lambda_post^{-1}`` so ``x @ eta`` recovers m. ``g`` is an
-        optional per-point (n,1) BMR weight (None = unweighted)."""
+        parameter eta = eta_anchor + (1/sigma_z^2) fts' (g .* E_q[z]), where E_q[z] is
+        the sign-truncated latent mean E[z] = m + sigma_z * Mills(m / sigma_z),
+        m = mu' f. ``x = fts * Lambda_post^-1`` so ``x * eta`` recovers m. ``g`` is an
+        optional per-point (n,1) weight (None = unweighted).
+
+        Two algebraically identical forms, picked by whichever is cheaper at these
+        shapes. The primal carries eta (d,K) at 4NdK per iteration. Since the carry is
+        always eta_anchor + (1/sigma_z^2) fts'(g .* E[z]), the prediction it feeds back
+        satisfies
+
+            x * eta = x * eta_anchor + (1/sigma_z^2)(x * fts')(g .* E[z]) = c + S(g .* E[z])/sigma_z^2,
+
+        so the dual carries pred (N,K) against the precomputed hat matrix S = x * fts'
+        at 2N^2K per iteration. Both x and S are built from UNGATED fts, matching the
+        primal -- the gate enters only through the contribution. The dual wins on wide
+        features and modest batches (roughly N < 2D) and loses on large batches, where
+        the N x N matrix is both slower and far bigger than eta. PX (``_cavi_scan_px``)
+        has no dual form: it needs eta_hat in d-space for its scalar quadratic.
+        """
         inv_sz2 = 1.0 / (sigma_z * sigma_z)
 
-        def step_fn(eta_carry, *args):
-            pred = mm_update(x, eta_carry)           # mean scores m = fts @ mu_carry
-            alpha = pred / sigma_z                    # standardized by the latent SD
+        if self._prefers_dual(x.shape[0], x.shape[1], y_one_hot.shape[-1], num_iters):
+            S = mm_update(x, fts.T)
+            c = mm_update(x, eta_anchor)
 
-            # E_q[z_ik] = m + sigma_z * Mills(m / sigma_z) via log-space Mills ratios
-            log_pdf = norm.logpdf(alpha)
-            logcdf1 = norm.logcdf(alpha)
-            logcdf2 = norm.logcdf(-alpha)
-            mills_pos = jnp.exp(log_pdf - logcdf1)
-            mills_neg = jnp.exp(log_pdf - logcdf2)
-            correction = sigma_z * jnp.where(y_one_hot, mills_pos, -mills_neg)
-            E_q_z = pred + correction
+            def step_fn(pred, *args):
+                E_q_z = sigma_z * self._expected_z(pred / sigma_z, y_one_hot)
+                contrib = E_q_z if g is None else g * E_q_z
+                return c + inv_sz2 * mm_update(S, contrib), None
+
+            # one prediction is consumed by the final projection below, so the
+            # scan is one iteration shorter than the primal loop
+            pred, _ = lax.scan(step_fn, mm_update(x, eta_init), jnp.arange(num_iters - 1))
+            E_q_z = sigma_z * self._expected_z(pred / sigma_z, y_one_hot)
             contrib = E_q_z if g is None else g * E_q_z
+            return eta_anchor + inv_sz2 * mm_update(fts.T, contrib)
 
+        def step_fn(eta_carry, *args):
+            pred = mm_update(x, eta_carry)
+            E_q_z = sigma_z * self._expected_z(pred / sigma_z, y_one_hot)
+            contrib = E_q_z if g is None else g * E_q_z
             return eta_anchor + inv_sz2 * mm_update(fts.T, contrib), None
 
         eta_new, _ = lax.scan(step_fn, eta_init, jnp.arange(num_iters))
