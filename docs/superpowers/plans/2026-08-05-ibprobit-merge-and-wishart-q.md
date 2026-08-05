@@ -484,6 +484,24 @@ def test_sigma_z2_is_gone():
         IBProbit(12, 5, key=jr.key(0), q_init=1e-3, sigma_z2_init=2.0)
 
 
+def test_key_is_accepted_but_not_carried():
+    """key stays in the signature for parity with the sibling loss classes and with
+    reset(key), but nothing in IBProbit draws a random number -- mu seeds to zeros and
+    the scan starts at eta_pred -- so storing it would carry a dead leaf through every
+    jit and scan."""
+    import equinox as eqx
+    import jax
+
+    lf = IBProbit(12, 5, key=jr.key(0), q_init=1e-3)
+    assert not hasattr(lf, "key")
+
+    leaves = jax.tree_util.tree_leaves(eqx.filter(lf, eqx.is_array))
+    assert not any(jnp.issubdtype(l.dtype, jax.dtypes.prng_key) for l in leaves)
+
+    # reset(key) keeps its signature: src/bllarse/utils.py calls it on every loss class
+    assert lf.reset(jr.key(1)).mu.shape == lf.mu.shape
+
+
 def test_moderated_predictive_is_the_exact_marginal():
     """q-update-spec sec 5.8: probit composed with a Gaussian conjugates EXACTLY, so
         E_{w ~ N(mu, Sigma + Qhat)}[Phi(w'f)] = Phi(mu'f / sqrt(1 + f'(Sigma + Qhat)f)).
@@ -547,7 +565,6 @@ In `IBProbit`, replace the `log_q` / `log_sigma_z2` fields and the q-learning co
     cdf: Callable
     logcdf: Callable
     posterior_ready: bool
-    key: PRNGKey
     # --- static config ---
     learn_q: bool = eqx.field(static=True)
     q0: float = eqx.field(static=True)       # prior E[Q] scale: alpha^2 / B, or q_init
@@ -594,7 +611,13 @@ and the constructor:
         else:
             raise ValueError("pass q_init or batch_size (q0 = alpha^2 / batch_size)")
 
-        self.key = key
+        # `key` is accepted for interface parity with MultinomialPolyaGamma and
+        # IBPolyaGamma (and with reset(key)) but deliberately NOT stored: mu seeds to
+        # zeros and the CAVI scan starts from eta_pred, so nothing in this class draws
+        # a random number. Keeping it would carry a dead pytree leaf through every
+        # jit and scan. The siblings accept key and consume it immediately without
+        # storing it either.
+        del key
         self.q0 = q0
         self.kappa = float(num_classes if kappa is None else kappa)
         self.learn_q = bool(learn_q)
@@ -757,7 +780,11 @@ scans lose their sigma_z factor.
 
 learn_q now switches the recursion rather than an SGD step; off holds Qhat at
 q0 I by construction, which is the ablation REWRITE-PLAN Risk 3 asks for.
-The recursion itself lands in the next three commits."
+The recursion itself lands in the next three commits.
+
+Also drops the stored `key`: it has been unread since eta_init became eta_pred,
+and carrying it meant a dead PRNG leaf in every jit and scan. The constructor
+and reset() still accept it, matching the sibling loss classes."
 ```
 
 ---
