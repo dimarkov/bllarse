@@ -799,6 +799,29 @@ and reset() still accept it, matching the sibling loss classes."
 - Consumes: Task 4.
 - Produces: `_increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta) -> Array (d,d)`.
 
+- [ ] **Step 0: Guard `kappa`**
+
+Task 4's review found that a non-positive `kappa` fails silently in two different ways: `kappa = 0` gives `nu - d - 1 = 0` and `Qhat` is all-NaN, while `kappa < 0` gives `nu < d + 1` — where the Inverse-Wishart mean does not exist — yet `Psi/(nu - d - 1) = q0*kappa/kappa` cancels to a perfectly plausible-looking `q0 * I`. The second is the dangerous one. Add to `__init__`, immediately after `self.kappa` is set:
+
+```python
+        if self.kappa <= 0.0:
+            raise ValueError(
+                f"kappa must be positive (got {self.kappa}): nu_0 = d + 1 + kappa and the "
+                "Inverse-Wishart mean Psi/(nu - d - 1) requires nu > d + 1. At kappa == 0 "
+                "the mean is 0/0; at kappa < 0 the scale factor cancels and returns a "
+                "plausible q0 * I for a distribution whose mean does not exist."
+            )
+```
+
+and a test in `tests/losses/test_wishart_q.py`:
+
+```python
+@pytest.mark.parametrize("bad", [0.0, -2.0])
+def test_nonpositive_kappa_is_rejected(bad):
+    with pytest.raises(ValueError, match="kappa must be positive"):
+        IBProbit(12, 5, key=jr.key(0), q_init=1e-3, kappa=bad)
+```
+
 This is the substance of q-update-spec §5.5(a), kept in matrix form. The naive mean-field statistic returns `2K*Sigma_jj > 0` even at `Q = 0` — a model that cannot represent "the head is not moving" always reports that it is. Conditioning on `W_t` fixes it exactly and for free, because the emission touches only `W_t`, so the increment's posterior follows from PREDICT alone.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1499,16 +1522,44 @@ structural rather than opt-in. _preq_objective goes with the SGD it served."
 
 ---
 
-### Task 9: Update the three scripts' CLIs
+### Task 9: Update every IBProbit call site
 
 **Files:**
 - Modify: `scripts/alternatives/ood_evaluation.py:321-326, 367-373, 451-472`
 - Modify: `scripts/alternatives/full_finetune_comparison.py:117-129, 598, 679-684, 1099-1118`
 - Modify: `scripts/alternatives/vit_classification.py:620-627, 644-651, 806-825`
+- Modify (one-line each, see Step 0): `scripts/finetuning.py:218`, `scripts/experiment_ibprobit.py:325`, `scripts/alternatives/sample_efficiency.py:292`, `scripts/alternatives/segmentation.py:326`, `scripts/alternatives/text_classification.py:245`, `scripts/alternatives/language_modeling.py:326`, `tests/test_full_network_restore_ivon.py:127`, `benchmarks/bayesian_losses.py` (6 sites)
 
 **Interfaces:**
 - Consumes: Tasks 4-8.
-- Produces: no new API; the three scripts construct `IBProbit` with the Task 4 signature and log the new hyperparameters.
+- Produces: no new API; every call site constructs `IBProbit` with the Task 4 signature, and the three CLI-bearing scripts log the new hyperparameters.
+
+- [ ] **Step 0: Unbreak the peripheral call sites**
+
+Task 4 made `q_init` or `batch_size` mandatory, which breaks every call site of the form `IBProbit(embed_dim, num_classes, key=...)`. Task 4's review caught six; a full sweep found more. None of these are part of the paper's `q` story, and silently moving them to `q0 = alpha^2/B` would be an unannounced five-orders-of-magnitude regime change in scripts nobody is watching. Give each the old default explicitly, which preserves its previous behaviour exactly:
+
+| file:line | edit |
+|---|---|
+| `scripts/finetuning.py:218` | add `q_init=1.0 / m_config['embed_dim']` |
+| `scripts/experiment_ibprobit.py:325` | add `q_init=1.0 / embed_dim` |
+| `scripts/alternatives/sample_efficiency.py:292` | add `q_init=1.0 / embed_dim` |
+| `scripts/alternatives/segmentation.py:326` | add `q_init=1.0 / embed_dim` |
+| `scripts/alternatives/text_classification.py:245` | add `q_init=1.0 / embed_dim` |
+| `scripts/alternatives/language_modeling.py:326` | add `q_init=1.0 / embed_dim` |
+| `tests/test_full_network_restore_ivon.py:127` | add `q_init=1.0 / embed_dim` |
+| `benchmarks/bayesian_losses.py` (6 sites) | add `q_init=1.0 / n_features` |
+
+Add a comment at each site: `# pre-Wishart default; this script is not part of the q study`.
+
+Verify none remain:
+
+```bash
+grep -rn "IBProbit(" --include=*.py scripts/ tests/ benchmarks/ src/ | grep -v "class IBProbit" | while read -r line; do
+  f="${line%%:*}"; n=$(echo "$line" | cut -d: -f2)
+  sed -n "${n},$((n+6))p" "$f" | grep -q "q_init\|batch_size" || echo "STILL BROKEN: $f:$n"
+done
+```
+Expected: no output.
 
 The three flag blocks are near-identical. Delete `--fix-q`, `--hyper-lr`, `--anchor-weight`, `--sigma-z2-init`, `--bmr-gate`, `--learn-eps`; rename `--bmr-warmup` to `--warmup`; add `--alpha` and `--no-learn-q`. Old sweep configs passing a removed flag now fail loudly, which is the intent — a flag that silently does nothing is worse.
 
