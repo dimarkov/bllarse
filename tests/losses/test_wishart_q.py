@@ -208,6 +208,25 @@ def test_log_bayes_factor_is_zero_at_the_prior():
     assert float(lf._log_bayes_factor(S, Psi0, nu0, K)) == pytest.approx(0.0, abs=1e-4)
 
 
+def test_log_bayes_factor_reads_its_arguments_not_self():
+    """Guards two bugs the zero-at-prior anchor cannot see: a swapped block() operand
+    order, and reading self.Psi/self.nu instead of the passed belief."""
+    import equinox as eqx
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9)
+    Psi0, nu0 = lf._q_seed()
+    S = jnp.eye(d) * float(jnp.diagonal(Psi0)[0]) * 1.5
+
+    # move self.Psi away from the prior; passing the prior explicitly must still give 0
+    moved = eqx.tree_at(lambda m: (m.Psi, m.nu), lf, (Psi0 * 0.25, nu0 + 7.0))
+    assert float(moved._log_bayes_factor(S, Psi0, nu0, K)) == pytest.approx(0.0, abs=1e-4)
+
+    # and a sharpened belief must give a NONZERO, positively-signed surprise
+    sharp = float(moved._log_bayes_factor(S, Psi0 * 0.25, nu0 + 7.0, K))
+    assert abs(sharp) > 1e-3
+    assert sharp > 0.0, "S atypical under the sharpened belief must be positive surprise"
+
+
 def test_surprise_rate_at_prior_equals_expected_pc():
     d, K = 9, 4
     lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
@@ -236,7 +255,38 @@ def test_surprise_rate_stays_in_the_unit_interval():
     d, K = 9, 4
     lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
     Psi0, nu0 = lf._q_seed()
-    for scale in (1e-8, 1e-3, 1.0, 1e3, 1e8):
+    # 1e20 is past where the naive Sbar itself would still fit float32; 1e30 and 1e35
+    # are past the ~1e30 point where exp(log_Sbar) overflows float32 and the naive
+    # m*Sbar/(1+m*Sbar) form would divide inf by inf and return NaN. The sigmoid form
+    # must stay finite and in [0, 1] straight through.
+    for scale in (1e-8, 1e-3, 1.0, 1e3, 1e8, 1e20, 1e30, 1e35):
         g = lf._surprise_rate(jnp.eye(d) * scale, Psi0 * 1e-2, nu0 + 10.0,
                               lf.p_a, lf.p_b, K)
         assert 0.0 <= float(g) <= 1.0 and jnp.isfinite(g), (scale, g)
+
+
+def test_surprise_rate_normalizes_by_d_times_K():
+    """One matrix node absorbs d*K scalar observations, so the rate divides log S_BF
+    by d*K rather than the scalar spec's K. Pinned as an exact identity: a regression
+    to /K cannot pass this, whereas a behavioural check at small d cannot see the
+    difference (both divisors saturate the sigmoid)."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9)
+    Psi0, nu0 = lf._q_seed()
+    # calibrated so gamma lands strictly inside (0,1): Psi0 * 0.5, nu0 + 3.0, S scaled
+    # 1.5x the prior's diagonal give gamma ~= 0.251 (settled by direct search, not
+    # tuned to a target -- the requirement was only "not saturated").
+    Psi_t, nu_t = Psi0 * 0.5, nu0 + 3.0
+    S = jnp.eye(d) * float(jnp.diagonal(Psi0)[0]) * 1.5
+
+    gamma = lf._surprise_rate(S, Psi_t, nu_t, lf.p_a, lf.p_b, K)
+    assert 1e-6 < float(gamma) < 1.0 - 1e-6, (
+        f"gamma={float(gamma)} is saturated; the logit below is uninformative there. "
+        "Soften the perturbation until it is not.")
+
+    log_SBF = lf._log_bayes_factor(S, Psi_t, nu_t, K)
+    logit = jnp.log(gamma) - jnp.log1p(-gamma)
+    recovered = float(logit - (jnp.log(lf.p_a) - jnp.log(lf.p_b)))
+
+    assert recovered == pytest.approx(float(log_SBF) / (d * K), rel=1e-4)
+    assert abs(recovered - float(log_SBF) / K) > 1e-3, "must not be the /K normalization"
