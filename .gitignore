@@ -186,3 +186,6 @@ wandb/
 # Eval-dump artifacts (logits/scores per run) — large, regenerable, never committed
 eval_dumps/
 scripts/results/
+
+# Claude Code local state (settings, worktrees)
+.claude/
