@@ -195,3 +195,48 @@ def test_moderated_predictive_is_the_exact_marginal():
     mc = jnorm.cdf(jnp.einsum("nd,sdk->snk", f, w)).mean(axis=0)
 
     assert jnp.abs(closed - mc).max() < 4e-3, jnp.abs(closed - mc).max()
+
+
+def test_log_bayes_factor_is_zero_at_the_prior():
+    """The sec 5.5(c) anchor: at t=0 the belief IS the prior, so log S_BF = 0 exactly
+    and gamma reduces to E[p_c] whatever S happens to be."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3)
+    Psi0, nu0 = lf._q_seed()
+    S = jnp.eye(d) * 3.7 + 0.1
+    S = 0.5 * (S + S.T)
+    assert float(lf._log_bayes_factor(S, Psi0, nu0, K)) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_surprise_rate_at_prior_equals_expected_pc():
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
+    Psi0, nu0 = lf._q_seed()
+    S = jnp.eye(d) * 2.0
+    gamma = lf._surprise_rate(S, Psi0, nu0, lf.p_a, lf.p_b, K)
+    assert float(gamma) == pytest.approx(0.1, abs=1e-3)   # E_0[p_c] = 1 - rho
+
+
+def test_surprise_rate_rises_with_an_unexpected_increment():
+    """S typical under the prior but atypical under a sharpened belief must raise
+    gamma above E[p_c]: the node resets toward the prior when it is surprised."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
+    Psi0, nu0 = lf._q_seed()
+    # a belief that has concentrated on a much smaller Q than the prior
+    Psi_t, nu_t = Psi0 * 1e-3, nu0 + 50.0
+    S_big = jnp.eye(d) * float(jnp.diagonal(Psi0)[0]) * 10.0
+
+    g_prior = lf._surprise_rate(S_big, Psi0, nu0, lf.p_a, lf.p_b, K)
+    g_sharp = lf._surprise_rate(S_big, Psi_t, nu_t, lf.p_a, lf.p_b, K)
+    assert float(g_sharp) > float(g_prior)
+
+
+def test_surprise_rate_stays_in_the_unit_interval():
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
+    Psi0, nu0 = lf._q_seed()
+    for scale in (1e-8, 1e-3, 1.0, 1e3, 1e8):
+        g = lf._surprise_rate(jnp.eye(d) * scale, Psi0 * 1e-2, nu0 + 10.0,
+                              lf.p_a, lf.p_b, K)
+        assert 0.0 <= float(g) <= 1.0 and jnp.isfinite(g), (scale, g)

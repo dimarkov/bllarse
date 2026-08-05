@@ -3,6 +3,7 @@ import optax
 import jax.numpy as jnp
 from jax import nn, vmap, random as jr, lax, grad
 from jax.scipy.stats import norm
+from jax.scipy.special import gammaln, digamma
 from jax.scipy.linalg import solve, lu_solve, lu_factor, cho_factor, cho_solve
 from jaxtyping import Array, PRNGKeyArray as PRNGKey
 from typing import Optional, Tuple, Callable
@@ -23,6 +24,12 @@ def mm(a, b, *, preset, dot_dtype):
 
 mm_update = partial(mm, preset='F32_F32_F32', dot_dtype=jnp.float32)
 mm_loss = partial(mm, preset='TF32_TF32_F32', dot_dtype=jnp.float32)
+
+def _logdet_pd(M):
+    """log|M| for symmetric positive-definite M, via Cholesky. Cheaper and better
+    conditioned than slogdet, and every matrix it is called on here is PD by
+    construction (see IBProbit._increment_statistic)."""
+    return 2.0 * jnp.sum(jnp.log(jnp.diagonal(jnp.linalg.cholesky(M))))
 
 class IBProbit(eqx.Module):
     """
@@ -394,6 +401,58 @@ class IBProbit(eqx.Module):
         Cv = mm_update(mm_update(G, Sigma_new), G.T)        # = G Sigma_t G'
         S = mm_update(GD, GD.T) + K * (A + Cv)
         return 0.5 * (S + S.T)
+
+    def _log_bayes_factor(self, S: Array, Psi: Array, nu: Array, K: int) -> Array:
+        """log of the Bayes Factor Surprise for the process-noise node.
+
+        q-update-spec sec 5.5(b), generalized from the Gamma-Gamma compound to the
+        Wishart / Inverse-Wishart one. The observation arriving at the node is S_t,
+        and under (G1) it is Wishart: S | Q ~ W_d(Q, K). Compounding with an
+        Inverse-Wishart(Psi, nu) belief gives the closed-form marginal
+
+            log p(S | Psi, nu) = [ (K-d-1)/2 log|S| - logGamma_d(K/2) ]   <- free of (Psi,nu)
+                               + block(Psi, nu)
+
+            block(Psi, nu) = (nu/2) log|Psi|
+                           + sum_j [ lgamma((nu+K)/2 + (1-j)/2) - lgamma(nu/2 + (1-j)/2) ]
+                           - ((nu+K)/2) log|Psi + S|
+
+        The (Psi,nu)-free part cancels in the ratio, and so does the
+        d(d-1)/4 log(pi) constant inside the multivariate gamma -- hence the bare
+        lgamma sum. Evaluated against the PRE-update belief, otherwise the surprise
+        is measured against a belief already updated to explain S.
+
+        Cost: two d x d Choleskys (|Psi + S| at each of the two beliefs) plus 2d
+        lgamma. That is the same order as the Cholesky update() already does, not the
+        handful of lgamma the diagonal formulation advertised. Scalar."""
+        d = self.mu.shape[0]
+        j = jnp.arange(1, d + 1, dtype=jnp.float32)
+        Psi0, nu0 = self._q_seed(d)
+
+        def block(Psi_, nu_):
+            half, half_K = 0.5 * nu_, 0.5 * (nu_ + K)
+            lg = jnp.sum(gammaln(half_K + 0.5 * (1.0 - j)) - gammaln(half + 0.5 * (1.0 - j)))
+            return half * _logdet_pd(Psi_) + lg - half_K * _logdet_pd(Psi_ + S)
+
+        return block(Psi0, nu0) - block(Psi, nu)
+
+    def _surprise_rate(self, S: Array, Psi: Array, nu: Array,
+                       p_a: Array, p_b: Array, K: int) -> Array:
+        """VarSMiLe's adaptive forgetting rate gamma for the process-noise node.
+
+        q-update-spec sec 5.5(c): gamma = m Sbar / (1 + m Sbar) with m = E[p_c]/(1-E[p_c])
+        = p_a/p_b, computed as a sigmoid of log(m) + log(Sbar) so it cannot overflow.
+
+        NORMALIZATION. The spec divides log S_BF by K because each scalar node saw K
+        observations. One Wishart node absorbs d*K scalar observations, and log S_BF
+        grows with d through both log-determinants and the d lgamma pairs, so
+        dividing by K alone saturates gamma at 1 for any realistic d -- the same trap
+        sec 5.5(b) warns about one level down. 1/(d*K) keeps gamma free of both K and
+        d and numerically comparable to the diagonal formulation. This is a choice
+        this codebase makes; the spec only covers the scalar case. Scalar in (0, 1)."""
+        d = self.mu.shape[0]
+        log_Sbar = self._log_bayes_factor(S, Psi, nu, K) / (d * K)
+        return nn.sigmoid(jnp.log(p_a) - jnp.log(p_b) + log_Sbar)
 
     def calibrate(self, features: Array, y: Array, *, num_iters: int = 8, loss_type: int = 2) -> "IBProbit":
         """Temperature scaling via Newton steps on beta, using held-out (val) data.
