@@ -17,6 +17,12 @@ from jax.scipy.stats import norm
 
 from bllarse.losses.bayesian import IBProbit, mm_update
 
+pytestmark = pytest.mark.xfail(
+    reason="dual CAVI form is restored in the next commit; see plan Task 2",
+    raises=AttributeError,
+    strict=True,
+)
+
 
 def reference_cavi_scan(fts, x, y_one_hot, eta_init, eta_old, num_iters):
     """The pre-optimisation primal scan, kept verbatim as the oracle."""
