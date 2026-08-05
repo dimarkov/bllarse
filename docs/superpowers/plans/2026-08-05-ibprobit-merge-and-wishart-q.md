@@ -15,7 +15,7 @@
 - Run everything from the worktree root `/home/dima/projects/bllarse/.claude/worktrees/ibprobit-merge`. Do not `cd` to the main checkout.
 - Python is driven through `uv run`. There is no `pytest-timeout` plugin — do not pass `--timeout`.
 - `IBProbit` state arrays are `float32` throughout. Symmetrize every `d x d` matrix that mathematics says is symmetric (`0.5 * (M + M.T)`) before a Cholesky.
-- Reuse the module-level `mm_update = partial(mm, preset='F32_F32_F32', dot_dtype=jnp.float32)` for all posterior algebra and `mm_loss` (TF32) only for predictive logits. Do not call `jnp.matmul` directly in new code.
+- In `src/`, reuse the module-level `mm_update = partial(mm, preset='F32_F32_F32', dot_dtype=jnp.float32)` for all posterior algebra and `mm_loss` (TF32) only for predictive logits; do not call `jnp.matmul` or `@` directly there. Test code is exempt and should prefer plain `@` / `jnp.linalg` — an independent formulation is what makes the test a check rather than a restatement.
 - Everything must survive `jax.jit` and `lax.scan` over batches: no Python branching on traced values, use `jnp.where`. Python branching on *static* config (`self.learn_q`, `self.px`) is fine and intended.
 - Notation in comments and docstrings: `'` transpose, `*` matmul, `.*` elementwise. Keep the existing house style of long explanatory docstrings on the mathematical methods.
 
@@ -248,28 +248,31 @@ Run: `CUDA_VISIBLE_DEVICES=2 XLA_PYTHON_CLIENT_PREALLOCATE=false uv run pytest -
 Five of the six existing tests exercise `_prefers_dual` and `_cavi_scan` directly and should now pass; they call `_cavi_scan` with the old 6-argument signature and need `sigma_z=jnp.float32(1.0)` appended. `test_update_is_unchanged_end_to_end` pins a numeric value produced by the pre-process-noise `update()` and is no longer meaningful: replace its assertion with an invariance check, which is what it was actually protecting.
 
 ```python
-def test_update_is_unchanged_end_to_end():
-    """update() must give the same posterior whichever CAVI form the dispatch picks."""
+def test_update_matches_across_cavi_forms(monkeypatch):
+    """update() must reach the same posterior whichever CAVI form the dispatch picks.
+
+    The two forms must be compared at the SAME num_iters -- varying num_iters to flip
+    the dispatch would change the answer as well as the form, so the comparison would
+    prove nothing. Force the primal by patching the dispatch predicate instead.
+    """
     import jax.numpy as jnp
     import jax.random as jr
     from bllarse.losses.bayesian import IBProbit
 
-    D, K, N = 40, 3, 12                      # narrow batch -> dual
+    D, K, N, iters = 40, 3, 12, 8            # narrow batch, enough iters -> dual
     keys = jr.split(jr.key(7), 3)
     lf = IBProbit(D, K, key=keys[0], use_bias=True, q_init=1e-2)
     fts = jr.normal(keys[1], (N, D))
     y = jr.randint(keys[2], (N,), 0, K)
 
-    assert IBProbit._prefers_dual(N, D + 1, K, 8)
-    dual = lf.update(fts, y, num_iters=8)
+    assert IBProbit._prefers_dual(N, D + 1, K, iters), "shapes must select the dual"
+    dual = lf.update(fts, y, num_iters=iters)
 
-    # force the primal by asking for so few iterations that the hat matrix cannot amortise
-    assert not IBProbit._prefers_dual(N, D + 1, K, 1)
-    ref = lf.update(fts, y, num_iters=1)
-    one_step_dual = lf.update(fts, y, num_iters=1)
-    assert jnp.allclose(ref.mu, one_step_dual.mu)
+    monkeypatch.setattr(IBProbit, "_prefers_dual", staticmethod(lambda *a, **k: False))
+    primal = lf.update(fts, y, num_iters=iters)
 
-    assert jnp.isfinite(dual.mu).all() and jnp.isfinite(dual.Sigma).all()
+    assert jnp.allclose(dual.mu, primal.mu, atol=1e-4), jnp.abs(dual.mu - primal.mu).max()
+    assert jnp.allclose(dual.Sigma, primal.Sigma, atol=1e-5)
 ```
 
 - [ ] **Step 7: Run the full suite**
@@ -500,11 +503,13 @@ def test_moderated_predictive_is_the_exact_marginal():
 
     closed = jnorm.cdf(lf._predictive_logits(f_raw))
 
+    # 400k samples put the per-entry MC standard error near 8e-4; 4e-3 is ~5 sigma on
+    # the max over 12 entries, which keeps this from flaking.
     L = jnp.linalg.cholesky(V)
-    w = lf.mu[None, :, :] + jnp.einsum("ij,sjk->sik", L, jr.normal(keys[3], (200_000, d, K)))
+    w = lf.mu[None, :, :] + jnp.einsum("ij,sjk->sik", L, jr.normal(keys[3], (400_000, d, K)))
     mc = jnorm.cdf(jnp.einsum("nd,sdk->snk", f, w)).mean(axis=0)
 
-    assert jnp.abs(closed - mc).max() < 3e-3, jnp.abs(closed - mc).max()
+    assert jnp.abs(closed - mc).max() < 4e-3, jnp.abs(closed - mc).max()
 ```
 
 - [ ] **Step 2: Run to verify they fail**
