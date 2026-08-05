@@ -16,6 +16,7 @@
 - Python is driven through `uv run`. There is no `pytest-timeout` plugin — do not pass `--timeout`.
 - `IBProbit` state arrays are `float32` throughout. Symmetrize every `d x d` matrix that mathematics says is symmetric (`0.5 * (M + M.T)`) before a Cholesky.
 - In `src/`, reuse the module-level `mm_update = partial(mm, preset='F32_F32_F32', dot_dtype=jnp.float32)` for all posterior algebra and `mm_loss` (TF32) only for predictive logits; do not call `jnp.matmul` or `@` directly there. Test code is exempt and should prefer plain `@` / `jnp.linalg` — an independent formulation is what makes the test a check rather than a restatement.
+- **TF32 trap in test references.** The test GPU is Ampere-class, where a bare `@` defaults to TF32 while `mm_update` pins true F32. So a test's plain-`@` reference is the *less* accurate side, and a tight comparison against an `mm_update`-based implementation fails on precision alone. Any test reference computation that mirrors `src/` linear algebra must pass `precision="highest"` — e.g. `jnp.matmul(A, B, precision="highest")`. This keeps the reference algebraically independent while making it at least as accurate as what it checks. Raising a tolerance instead would be masking; do not do that.
 - Everything must survive `jax.jit` and `lax.scan` over batches: no Python branching on traced values, use `jnp.where`. Python branching on *static* config (`self.learn_q`, `self.px`) is fine and intended.
 - Notation in comments and docstrings: `'` transpose, `*` matmul, `.*` elementwise. Keep the existing house style of long explanatory docstrings on the mathematical methods.
 
@@ -871,9 +872,15 @@ def test_increment_statistic_diagonal_matches_the_scalar_spec():
     Qhat, Lambda_pred, Sigma_prev, Sigma_new, Delta = _random_state(jr.key(3), d, K)
     S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
 
-    G = Qhat @ Lambda_pred
-    expected = (jnp.sum((G @ Delta) ** 2, axis=-1)
-                + K * (jnp.diagonal(G @ Sigma_prev) + jnp.diagonal(G @ Sigma_new @ G.T)))
+    # precision="highest" because a bare @ runs at TF32 on this GPU while the
+    # implementation pins true F32 -- without it the REFERENCE is the inaccurate side.
+    def hp(a, b):
+        return jnp.matmul(a, b, precision="highest")
+
+    G = hp(Qhat, Lambda_pred)
+    expected = (jnp.sum(hp(G, Delta) ** 2, axis=-1)
+                + K * (jnp.diagonal(hp(G, Sigma_prev))
+                       + jnp.diagonal(hp(hp(G, Sigma_new), G.T))))
     assert jnp.allclose(jnp.diagonal(S), expected, rtol=1e-4), (
         jnp.abs(jnp.diagonal(S) - expected).max())
 
