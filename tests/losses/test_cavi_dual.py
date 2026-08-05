@@ -59,7 +59,7 @@ def _inputs(N, D, K, seed=0):
     features = jr.normal(keys[0], (N, D))
     y = jr.randint(keys[1], (N,), 0, K)
 
-    lf = IBProbit(D, K, key=keys[2], use_bias=True)
+    lf = IBProbit(D, K, key=keys[2], use_bias=True, q_init=1e-2)
 
     fts = features.astype(jnp.float32)
     fts = jnp.pad(fts, [(0, 0), (0, 1)], constant_values=1.0)
@@ -81,7 +81,7 @@ def test_dual_form_matches_primal(num_iters):
     eta_old = jnp.zeros_like(eta_init)
 
     assert IBProbit._prefers_dual(N, D + 1, K, num_iters), "test no longer exercises the dual"
-    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, num_iters, jnp.float32(1.0))
+    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, num_iters)
     want = reference_cavi_scan(fts, x, y_one_hot, eta_init, eta_old, num_iters)
 
     assert_agrees(got, want)
@@ -95,7 +95,7 @@ def test_primal_form_retained_when_iterations_are_too_few(num_iters):
     eta_old = jnp.zeros_like(eta_init)
 
     assert not IBProbit._prefers_dual(N, D + 1, K, num_iters)
-    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, num_iters, jnp.float32(1.0))
+    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, num_iters)
     want = reference_cavi_scan(fts, x, y_one_hot, eta_init, eta_old, num_iters)
 
     assert_agrees(got, want)
@@ -108,7 +108,7 @@ def test_dual_form_matches_primal_with_nonzero_eta_old():
     eta_old = jr.normal(jr.key(9), eta_init.shape) * 0.1
 
     assert IBProbit._prefers_dual(N, D + 1, K, 16)
-    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, 16, jnp.float32(1.0))
+    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, 16)
     want = reference_cavi_scan(fts, x, y_one_hot, eta_init, eta_old, 16)
 
     assert_agrees(got, want)
@@ -121,7 +121,7 @@ def test_wide_batch_keeps_primal_form():
     eta_old = jnp.zeros_like(eta_init)
 
     assert not IBProbit._prefers_dual(N, D + 1, K, 32)
-    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, 32, jnp.float32(1.0))
+    got = lf._cavi_scan(fts, x, y_one_hot, eta_init, eta_old, 32)
     want = reference_cavi_scan(fts, x, y_one_hot, eta_init, eta_old, 32)
 
     assert_agrees(got, want)
@@ -157,7 +157,7 @@ def test_update_matches_across_cavi_forms(monkeypatch):
 
 
 def test_dual_matches_primal_under_process_noise_and_gate():
-    """The dual re-association must survive the eta_pred anchor and the BMR gate."""
+    """The dual re-association must survive the eta_pred anchor and the assimilation gate."""
     import jax.numpy as jnp
     import jax.random as jr
     from jax.scipy.linalg import cho_factor, cho_solve
@@ -174,23 +174,21 @@ def test_dual_matches_primal_under_process_noise_and_gate():
     y_one_hot = nn.one_hot(y, K)
     g = jr.uniform(keys[3], (N, 1), minval=0.2, maxval=1.0)
 
-    Sigma_pred = lf.Sigma.at[jnp.diag_indices(d)].add(lf.q)
-    tmp = cho_solve(cho_factor(Sigma_pred), jnp.concatenate([lf.mu, jnp.eye(d)], axis=-1))
+    Sigma_pred = lf.Sigma + lf.Qhat
+    tmp = cho_solve(cho_factor(0.5 * (Sigma_pred + Sigma_pred.T)),
+                    jnp.concatenate([lf.mu, jnp.eye(d)], axis=-1))
     eta_pred, Lambda_pred = tmp[:, :-d], tmp[:, -d:]
 
     Lambda_new = Lambda_pred + mm_update((g * fts).T, fts)
     L = cho_factor(0.5 * (Lambda_new + Lambda_new.T))
     x = cho_solve(L, fts.T).T
-    sigma_z = jnp.sqrt(lf.sigma_z2)
 
     assert IBProbit._prefers_dual(N, d, K, iters), "shapes must select the dual path"
-    dual = lf._cavi_scan(fts, x, y_one_hot, eta_pred, eta_pred, iters, sigma_z, g)
+    dual = lf._cavi_scan(fts, x, y_one_hot, eta_pred, eta_pred, iters, g)
 
-    # primal, written out longhand so the test does not depend on the dispatch
     eta = eta_pred
     for _ in range(iters):
-        pred = mm_update(x, eta)
-        E_z = IBProbit._expected_z(pred / sigma_z, y_one_hot) * sigma_z
-        eta = eta_pred + mm_update(fts.T, g * E_z) / lf.sigma_z2
+        E_z = IBProbit._expected_z(mm_update(x, eta), y_one_hot)
+        eta = eta_pred + mm_update(fts.T, g * E_z)
 
     assert jnp.allclose(dual, eta, atol=1e-4), jnp.abs(dual - eta).max()

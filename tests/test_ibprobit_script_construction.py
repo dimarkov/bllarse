@@ -12,15 +12,9 @@ from bllarse.losses.bayesian import IBProbit
 
 
 def _kwargs():
-    """Union of constructor kwargs the three scripts pass.
-
-    full_finetune_comparison.py and vit_classification.py pass px to the
-    constructor. ood_evaluation.py constructs without px and passes it per-update
-    via stream_train_ibprobit -> loss_fn.update(..., px=px).
-    """
-    return dict(q_init=1e-3, sigma_z2_init=1.0, learn_q=True, hyper_lr=0.1,
-                anchor_weight=1e-3, px=True, bmr_gate=True, bmr_warmup=1,
-                learn_eps=True, eps_init=0.01, rho=0.9)
+    """Exactly the kwarg set the three scripts construct with."""
+    return dict(alpha=1e-3, batch_size=32, learn_q=True, px=True,
+                warmup=1, eps_init=0.01, rho=0.9)
 
 
 def test_scripts_kwargs_construct_a_head():

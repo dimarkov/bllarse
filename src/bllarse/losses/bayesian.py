@@ -30,51 +30,55 @@ class IBProbit(eqx.Module):
     (streaming) CAVI posterior and a learnable predictive temperature.
 
     Generative model (per observation i, class k):
-        z_ik ~ N(w_k^T f_i, sigma_z^2),   sign-pattern (pseudo-)likelihood
-        w_k  ~ carried Gaussian posterior, inflated by process noise q I each step.
+        z_ik ~ N(w_k^T f_i, 1),   sign-pattern (pseudo-)likelihood
+        w_k  ~ carried Gaussian posterior, inflated by process noise Q each step.
 
     The posterior ``q(W) = N(mu, Sigma)`` is built by ``update`` as a recursive
     Bayesian filter: each minibatch's posterior is the next minibatch's prior,
-    inflated by process noise ``q I`` (the PREDICT step). There is no persistent
+    inflated by the process noise ``Q`` (the PREDICT step). There is no persistent
     fixed prior -- ``mu_0`` and the seed ``Sigma = I`` are just the initial state
     and wash out with data.
 
-    The predictive (used identically for the gradient step AND at eval) is the
-    moderated probit
-        logit_ik = mu_k^T f / sqrt( sigma_z^2 + f^T (q I + Sigma) f ).
-    The two scalars ``q`` (process noise / covariance floor) and ``sigma_z^2``
-    (latent noise) are the gradient-trained knobs; the process-noise floor
-    ``q ||f||^2`` keeps the predictive variance from collapsing as ``Sigma`` does,
-    so moderation survives abundant data.
+    The latent scale is GAUGE-FIXED at sigma_z^2 = 1 (q-update-spec sec 5.7):
+    rescaling (z, W, Sigma, Q) by a common factor leaves the sign-pattern
+    likelihood and the moderated predictive invariant, so sigma_z^2 carries no
+    information and is not a free parameter.
+
+    The process noise is a full matrix ``Q`` carried as a conjugate
+    Inverse-Wishart posterior ``(Psi, nu)``; ``Qhat = Psi / (nu - d - 1)`` is its
+    mean, the object the PREDICT step needs. Seeded isotropically at
+    ``E_0[Q] = q0 I``.
+
+    The predictive (used at eval and by every internal gate) is the moderated probit
+        logit_ik = mu_k^T f / sqrt( 1 + f^T (Qhat + Sigma) f ),
+    which is EXACT, not an approximation: a probit composed with a Gaussian
+    conjugates in closed form. The process-noise floor ``f^T Qhat f`` keeps the
+    predictive variance from collapsing as ``Sigma`` does, so moderation survives
+    abundant data.
     """
     # --- recursive posterior state (set by `update`; not gradient-trained) ---
     mu: Array              # (d, K) posterior mean
     Sigma: Array           # (d, d) posterior covariance
-    step: Array            # int32 scalar; number of update() steps (drives BMR warmup)
-    eps_alpha: Array       # scalar; Beta posterior count a (contamination mass)
-    eps_beta: Array        # scalar; Beta posterior count b (model mass); eps = a/(a+b)
-    # --- gradient-trained scalars ---
-    log_q: Array           # scalar; q = exp(log_q)         (process noise / cov floor)
-    log_sigma_z2: Array    # scalar; sigma_z^2 = exp(...)   (latent noise variance)
-    beta: Array            # scalar temperature (calibrate only)
+    step: Array            # int32 scalar; number of update() steps (drives warmup)
+    eps_alpha: Array       # scalar; Beta count a (contamination mass)
+    eps_beta: Array        # scalar; Beta count b (model mass); eps = a/(a+b)
+    Psi: Array             # (d, d) Inverse-Wishart scale on the process noise Q
+    nu: Array              # scalar; Inverse-Wishart degrees of freedom, > d + 1
+    p_a: Array             # scalar; Beta count on the change rate p_c
+    p_b: Array             # scalar
+    beta: Array            # scalar temperature (calibrate baseline only)
     # --- static-ish (non-array leaves) ---
     use_bias: bool
     cdf: Callable
     logcdf: Callable
     posterior_ready: bool
-    key: PRNGKey
-    # --- in-update q-learning config (static) ---
+    # --- static config ---
     learn_q: bool = eqx.field(static=True)
-    hyper_lr: float = eqx.field(static=True)
-    anchor_weight: float = eqx.field(static=True)
-    anchor_mode: float = eqx.field(static=True)
+    q0: float = eqx.field(static=True)       # prior E[Q] scale: alpha^2 / B, or q_init
+    kappa: float = eqx.field(static=True)    # Inverse-Wishart prior pseudo-count
+    warmup: int = eqx.field(static=True)
     loss_type: int = eqx.field(static=True)
     px: bool = eqx.field(static=True)
-    # --- per-data-point BMR gate config (static) ---
-    bmr_gate: bool = eqx.field(static=True)
-    bmr_warmup: int = eqx.field(static=True)
-    # --- epsilon-contamination mixture config (static) ---
-    learn_eps: bool = eqx.field(static=True)
     eps_init: float = eqx.field(static=True)
     rho: float = eqx.field(static=True)
 
@@ -87,73 +91,92 @@ class IBProbit(eqx.Module):
         use_bias: bool = True,
         use_approx_cdf: bool = True,
         q_init: Optional[float] = None,
-        sigma_z2_init: float = 1.0,
-        learn_q: bool = False,
-        hyper_lr: float = 0.1,
-        anchor_weight: float = 1e-4,
-        anchor_mode: Optional[float] = None,
+        alpha: float = 1e-3,
+        batch_size: Optional[int] = None,
+        kappa: Optional[float] = None,
+        learn_q: bool = True,
         loss_type: int = 2,
         px: bool = False,
-        bmr_gate: bool = False,
-        bmr_warmup: int = 0,
-        learn_eps: bool = False,
-        eps_init: float = 0.0,
+        warmup: int = 1,
+        eps_init: float = 0.01,
         rho: float = 1.0,
     ):
         d = input_dim + int(use_bias)
-        # Process noise q defaults to 1/D (D = embedding dim): the seed predictive
-        # variance sigma_z^2 + q ||f||^2 then sits at the feature-RMS scale, so the
-        # untrained predictive starts at the LayerNorm-equivalent normalization.
-        q0 = (1.0 / input_dim) if q_init is None else float(q_init)
-        self.key = key
-        self.log_q = jnp.log(jnp.asarray(q0, dtype=jnp.float32))
-        self.log_sigma_z2 = jnp.log(jnp.asarray(sigma_z2_init, dtype=jnp.float32))
-        self.beta = jnp.ones((), dtype=jnp.float32)
-        # recursive posterior seed: mu = 0, Sigma = I (so the first PREDICT step
-        # gives Sigma_pred = (1 + q) I, the effective initial covariance).
+        # Prior scale on the process noise. q-update-spec sec 5.5(e) derives
+        # q0 = alpha^2 / B by equating the covariance floor of the submitted paper's
+        # alpha-forgetting with the Kalman steady state, so the paper's tuned
+        # forgetting factor survives as the prior on Q. q_init overrides it, which is
+        # how the old q = 1/D regime stays reachable for the sec 12.5 comparison.
+        if q_init is not None:
+            q0 = float(q_init)
+        elif batch_size is not None:
+            q0 = float(alpha) ** 2 / float(batch_size)
+        else:
+            raise ValueError("pass q_init or batch_size (q0 = alpha^2 / batch_size)")
+
+        # `key` is accepted for interface parity with MultinomialPolyaGamma and
+        # IBPolyaGamma (and with reset(key)) but deliberately NOT stored: mu seeds to
+        # zeros and the CAVI scan starts from eta_pred, so nothing in this class draws
+        # a random number. Keeping it would carry a dead pytree leaf through every
+        # jit and scan. The siblings accept key and consume it immediately without
+        # storing it either.
+        del key
+        self.q0 = q0
+        self.kappa = float(num_classes if kappa is None else kappa)
+        self.learn_q = bool(learn_q)
+        self.warmup = int(warmup)
+        self.loss_type = int(loss_type)
+        self.px = bool(px)
+        self.eps_init = float(eps_init)
+        self.rho = float(rho)
+
         self.mu = jnp.zeros((d, num_classes), dtype=jnp.float32)
         self.Sigma = jnp.eye(d, dtype=jnp.float32)
         self.step = jnp.zeros((), dtype=jnp.int32)
+        self.beta = jnp.ones((), dtype=jnp.float32)
         self.use_bias = use_bias
         self.cdf = approx_cdf if use_approx_cdf else norm.cdf
         self.logcdf = approx_logcdf if use_approx_cdf else norm.logcdf
         self.posterior_ready = False
-        # in-update q-learning config (see update(): prequential SGD on log_q)
-        self.learn_q = bool(learn_q)
-        self.hyper_lr = float(hyper_lr)
-        self.anchor_weight = float(anchor_weight)
-        self.anchor_mode = float(q0 if anchor_mode is None else anchor_mode)
-        self.loss_type = int(loss_type)
-        self.px = bool(px)
-        # per-data-point BMR gate: down-weight badly-predicted points in the update;
-        # skipped for the first ``bmr_warmup`` steps (the mu=0 seed gate is a useless 0.5).
-        self.bmr_gate = bool(bmr_gate)
-        self.bmr_warmup = int(bmr_warmup)
-        # epsilon-contamination mixture: p_eps = (1-eps) p_model + eps/K. The contamination
-        # rate eps is estimated by CONJUGATE BETA updating inside update() (not by gradients):
-        # each point's responsibility r_i is a soft Bernoulli count for a Beta-Bernoulli, so
-        # eps = eps_alpha / (eps_alpha + eps_beta) is the posterior mean. The learnable prior
-        # is Beta(1, 1/eps_init) (mean ~ eps_init); ``rho`` is the forgetting factor on the
-        # accumulated counts (scripts set rho = 1 - batch/data_size to cap the memory at one
-        # pass; rho=1 = unbounded accumulation). eps drives the floored predictive (scoring)
-        # always, and gates assimilation only when bmr_gate is on. Active iff learn_eps or
-        # eps_init>0 (``use_eps``); otherwise every eps code path is skipped and the model is
-        # bitwise the plain IBProbit.
-        self.learn_eps = bool(learn_eps)
-        self.eps_init = float(eps_init)
-        self.rho = float(rho)
+
+        Psi0, nu0 = self._q_seed(d)
+        self.Psi, self.nu = Psi0, nu0
+        self.p_a, self.p_b = self._pc_seed()
         a0, b0 = self._eps_seed()
         self.eps_alpha = jnp.asarray(a0, dtype=jnp.float32)
         self.eps_beta = jnp.asarray(b0, dtype=jnp.float32)
 
-    # --- gradient-trained predictive scalars ---
-    @property
-    def q(self) -> Array:
-        return jnp.exp(self.log_q)
+    def _q_seed(self, d: Optional[int] = None) -> Tuple[Array, Array]:
+        """Isotropic Inverse-Wishart prior on Q with E_0[Q] = q0 * I.
+
+        With nu_0 = d + 1 + kappa the mean is Psi_0 / (nu_0 - d - 1) = Psi_0 / kappa,
+        so Psi_0 = q0 * kappa * I. kappa is the prior pseudo-count, defaulting to K so
+        the prior carries the weight of one batch's worth of transition evidence."""
+        d = self.mu.shape[0] if d is None else d
+        Psi0 = (self.q0 * self.kappa) * jnp.eye(d, dtype=jnp.float32)
+        nu0 = jnp.asarray(d + 1.0 + self.kappa, dtype=jnp.float32)
+        return Psi0, nu0
+
+    def _pc_seed(self) -> Tuple[Array, Array]:
+        """Unit-mass Beta seed with mean E_0[p_c] = 1 - rho.
+
+        rho = 1 - B/N is the one-pass memory convention already used for eps, and
+        q-update-spec sec 5.5(d) reads it as 'expect one change per epoch', so the
+        change rate inherits it rather than adding a hyperparameter. rho = 1
+        (unbounded memory) would give a degenerate zero-mass seed, so it floors."""
+        pc0 = max(1.0 - self.rho, 1e-4)
+        return (jnp.asarray(pc0, dtype=jnp.float32),
+                jnp.asarray(1.0 - pc0, dtype=jnp.float32))
 
     @property
-    def sigma_z2(self) -> Array:
-        return jnp.exp(self.log_sigma_z2)
+    def Qhat(self) -> Array:
+        """Working estimate of the process noise: the Inverse-Wishart mean.
+
+        This is the correct object for PREDICT -- Cov(W_t | data_{1..t-1}) =
+        Sigma_{t-1} + E_q(Q)[Q] by the law of total covariance, since q(Q) is
+        independent of q(W_{t-1}) in the variational family. (d, d)."""
+        d = self.mu.shape[0]
+        return self.Psi / (self.nu - d - 1.0)
 
     @property
     def eps(self) -> Array:
@@ -163,50 +186,49 @@ class IBProbit(eqx.Module):
 
     @property
     def use_eps(self) -> bool:
-        """Static: whether the eps-contamination mixture is active. Off => every eps code
-        path is skipped and the model is bitwise the plain IBProbit."""
-        return self.learn_eps or self.eps_init > 0.0
+        """Static: whether the eps-contamination mixture floors the SCORING predictive.
+        The contamination rate is always estimated (the mixture is structural in the
+        recursion); ``eps_init <= 0`` only opts __call__ out of the floored predictive,
+        which is how the bare moderated probit stays testable."""
+        return self.eps_init > 0.0
 
     def _eps_seed(self) -> Tuple[float, float]:
-        """Seed (a0, b0) for the Beta contamination posterior. learn_eps: the prior
-        Beta(1, 1/eps_init) (mean ~ eps_init; eps_init<=0 falls back to Beta(1, 100)). Fixed
-        eps (eps_init>0, not learned): a unit-mass point (eps_init, 1-eps_init) so eps ==
-        eps_init exactly. Mixture off: an unread (1, 1) sentinel."""
-        if self.learn_eps:
-            return 1.0, (1.0 / self.eps_init if self.eps_init > 0.0 else 100.0)
-        if self.eps_init > 0.0:
-            return self.eps_init, 1.0 - self.eps_init
-        return 1.0, 1.0
+        """Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init)."""
+        return 1.0, (1.0 / self.eps_init if self.eps_init > 0.0 else 100.0)
 
     def reset_posterior(self) -> "IBProbit":
         """Reset the recursive posterior to the seed state (mu = 0, Sigma = I, Beta counts
         back to the prior), used before a fresh online pass over data."""
         d, nc = self.mu.shape
         a0, b0 = self._eps_seed()
+        Psi0, nu0 = self._q_seed()
+        pa0, pb0 = self._pc_seed()
         return eqx.tree_at(
-            lambda m: (m.mu, m.Sigma, m.step, m.posterior_ready, m.eps_alpha, m.eps_beta),
+            lambda m: (m.mu, m.Sigma, m.step, m.posterior_ready, m.eps_alpha, m.eps_beta,
+                       m.Psi, m.nu, m.p_a, m.p_b),
             self,
             (jnp.zeros((d, nc), dtype=jnp.float32),
              jnp.eye(d, dtype=jnp.float32),
              jnp.zeros((), dtype=jnp.int32),
              False,
              jnp.asarray(a0, dtype=jnp.float32),
-             jnp.asarray(b0, dtype=jnp.float32))
+             jnp.asarray(b0, dtype=jnp.float32),
+             Psi0, nu0, pa0, pb0)
         )
 
     def reset(self, key: PRNGKey) -> "IBProbit":
-        """Re-initialize to defaults (mu = 0, Sigma = I seed, q = 1/D, sigma_z^2 = 1, Beta
-        counts to prior) and clear the posterior. Signature kept for `bllarse.utils` / tests;
-        ``key`` unused."""
+        """Re-initialize to defaults (mu = 0, Sigma = I seed, the Inverse-Wishart prior on
+        Q, and both Beta count pairs back to their priors) and clear the posterior.
+        Signature kept for `bllarse.utils` / tests; ``key`` unused."""
         d, num_classes = self.mu.shape
-        input_dim = d - int(self.use_bias)
-        q0 = 1.0 / input_dim
         a0, b0 = self._eps_seed()
+        Psi0, nu0 = self._q_seed()
+        pa0, pb0 = self._pc_seed()
         return eqx.tree_at(
-            lambda m: (m.log_q, m.log_sigma_z2, m.eps_alpha, m.eps_beta, m.beta, m.mu, m.Sigma, m.step, m.posterior_ready),
+            lambda m: (m.Psi, m.nu, m.p_a, m.p_b, m.eps_alpha, m.eps_beta, m.beta,
+                       m.mu, m.Sigma, m.step, m.posterior_ready),
             self,
-            (jnp.log(jnp.asarray(q0, dtype=jnp.float32)),
-             jnp.zeros((), dtype=jnp.float32),                  # sigma_z^2 = 1
+            (Psi0, nu0, pa0, pb0,
              jnp.asarray(a0, dtype=jnp.float32),
              jnp.asarray(b0, dtype=jnp.float32),
              jnp.ones((), dtype=jnp.float32),
@@ -228,27 +250,26 @@ class IBProbit(eqx.Module):
         return num_iters >= 1 and dual < primal
 
     @staticmethod
-    def _expected_z(alpha: Array, y_one_hot: Array) -> Array:
-        """Standardized truncated-latent mean: E_q[z]/sigma_z given alpha = m/sigma_z,
-        via log-space Mills ratios. Caller rescales by sigma_z."""
-        log_pdf = norm.logpdf(alpha)
-        mills_pos = jnp.exp(log_pdf - norm.logcdf(alpha))
-        mills_neg = jnp.exp(log_pdf - norm.logcdf(-alpha))
-        return alpha + jnp.where(y_one_hot, mills_pos, -mills_neg)
+    def _expected_z(pred: Array, y_one_hot: Array) -> Array:
+        """Sign-truncated latent mean E_q[z] = m + Mills(m) at the gauge-fixed
+        sigma_z^2 = 1, via log-space Mills ratios. ``pred`` is the raw score m = mu' f."""
+        log_pdf = norm.logpdf(pred)
+        mills_pos = jnp.exp(log_pdf - norm.logcdf(pred))
+        mills_neg = jnp.exp(log_pdf - norm.logcdf(-pred))
+        return pred + jnp.where(y_one_hot, mills_pos, -mills_neg)
 
-    def _cavi_scan(self, fts: Array, x: Array, y_one_hot: Array, eta_init: Array, eta_anchor: Array, num_iters: int, sigma_z: Array, g: Optional[Array] = None) -> Array:
+    def _cavi_scan(self, fts: Array, x: Array, y_one_hot: Array, eta_init: Array, eta_anchor: Array, num_iters: int, g: Optional[Array] = None) -> Array:
         """CAVI fixed-point scan for the posterior mean. Returns the natural
-        parameter eta = eta_anchor + (1/sigma_z^2) fts' (g .* E_q[z]), where E_q[z] is
-        the sign-truncated latent mean E[z] = m + sigma_z * Mills(m / sigma_z),
-        m = mu' f. ``x = fts * Lambda_post^-1`` so ``x * eta`` recovers m. ``g`` is an
-        optional per-point (n,1) weight (None = unweighted).
+        parameter eta = eta_anchor + fts' (g .* E_q[z]), where E_q[z] is the
+        sign-truncated latent mean E[z] = m + Mills(m), m = mu' f (the latent scale is
+        gauge-fixed at sigma_z^2 = 1). ``x = fts * Lambda_post^-1`` so ``x * eta``
+        recovers m. ``g`` is an optional per-point (n,1) weight (None = unweighted).
 
         Two algebraically identical forms, picked by whichever is cheaper at these
         shapes. The primal carries eta (d,K) at 4NdK per iteration. Since the carry is
-        always eta_anchor + (1/sigma_z^2) fts'(g .* E[z]), the prediction it feeds back
-        satisfies
+        always eta_anchor + fts'(g .* E[z]), the prediction it feeds back satisfies
 
-            x * eta = x * eta_anchor + (1/sigma_z^2)(x * fts')(g .* E[z]) = c + S(g .* E[z])/sigma_z^2,
+            x * eta = x * eta_anchor + (x * fts')(g .* E[z]) = c + S(g .* E[z]),
 
         so the dual carries pred (N,K) against the precomputed hat matrix S = x * fts'
         at 2N^2K per iteration. Both x and S are built from UNGATED fts, matching the
@@ -257,35 +278,32 @@ class IBProbit(eqx.Module):
         the N x N matrix is both slower and far bigger than eta. PX (``_cavi_scan_px``)
         has no dual form: it needs eta_hat in d-space for its scalar quadratic.
         """
-        inv_sz2 = 1.0 / (sigma_z * sigma_z)
-
         if self._prefers_dual(x.shape[0], x.shape[1], y_one_hot.shape[-1], num_iters):
             S = mm_update(x, fts.T)
             c = mm_update(x, eta_anchor)
 
             def step_fn(pred, *args):
-                E_q_z = sigma_z * self._expected_z(pred / sigma_z, y_one_hot)
+                E_q_z = self._expected_z(pred, y_one_hot)
                 contrib = E_q_z if g is None else g * E_q_z
-                return c + inv_sz2 * mm_update(S, contrib), None
+                return c + mm_update(S, contrib), None
 
             # one prediction is consumed by the final projection below, so the
             # scan is one iteration shorter than the primal loop
             pred, _ = lax.scan(step_fn, mm_update(x, eta_init), jnp.arange(num_iters - 1))
-            E_q_z = sigma_z * self._expected_z(pred / sigma_z, y_one_hot)
+            E_q_z = self._expected_z(pred, y_one_hot)
             contrib = E_q_z if g is None else g * E_q_z
-            return eta_anchor + inv_sz2 * mm_update(fts.T, contrib)
+            return eta_anchor + mm_update(fts.T, contrib)
 
         def step_fn(eta_carry, *args):
-            pred = mm_update(x, eta_carry)
-            E_q_z = sigma_z * self._expected_z(pred / sigma_z, y_one_hot)
+            E_q_z = self._expected_z(mm_update(x, eta_carry), y_one_hot)
             contrib = E_q_z if g is None else g * E_q_z
-            return eta_anchor + inv_sz2 * mm_update(fts.T, contrib), None
+            return eta_anchor + mm_update(fts.T, contrib), None
 
         eta_new, _ = lax.scan(step_fn, eta_init, jnp.arange(num_iters))
         return eta_new
 
     def _cavi_scan_px(self, fts: Array, x: Array, y_one_hot: Array, eta_pred: Array,
-                      L_post, Lambda_pred: Array, num_iters: int, sigma_z: Array,
+                      L_post, Lambda_pred: Array, num_iters: int,
                       g: Optional[Array] = None) -> Array:
         """Parameter-expanded (PX) CAVI scan -- accelerates the slow scale mode.
 
@@ -294,21 +312,19 @@ class IBProbit(eqx.Module):
         the expanded free energy. Optimizing ``a`` in closed form and reducing back to
         the canonical gauge (a=1) every iteration turns the eta-space update into
 
-            eta_new = eta_pred + b / a,     b = (1/sigma_z^2) X^T E[z],
+            eta_new = eta_pred + b / a,     b = X^T E[z],
 
         i.e. PX just rescales the *data increment* by 1/a. ``a`` solves the scalar
         quadratic  nK a^2 + B a - C = 0  with  eta_hat = eta_pred + b  (the plain
         M-step natural parameter, a=1) and m_hat = X Lambda_post^{-1} eta_hat = x eta_hat:
-            B = sum(p * eta_hat),                         p   = Lambda_post^{-1} eta_pred,
-            C = S_z/sigma_z^2 + sum(eta_hat * M_c eta_hat), M_c = Lambda_post^{-1} Lambda_pred Lambda_post^{-1},
+            B = sum(p * eta_hat),                        p   = Lambda_post^{-1} eta_pred,
+            C = S_z + sum(eta_hat * M_c eta_hat),        M_c = Lambda_post^{-1} Lambda_pred Lambda_post^{-1},
             S_z = sum_ik (E[z^2] - 2 E[z] m_hat + m_hat^2).
         Both B and C are written in terms of eta_hat (= eta_pred + b) and the two
         scan-constant matrices p, M_c, so the per-iteration mu_hat / cho_solve are not
         needed -- the loop is pure matmuls. At the plain-CAVI fixed point nK = C - B,
         so a=1 and the reduction is the identity -> PX shares the plain fixed point,
         only converging faster."""
-        inv_sz2 = 1.0 / (sigma_z * sigma_z)
-        sz2 = sigma_z * sigma_z
         n, K = fts.shape[0], y_one_hot.shape[-1]
         # latent-normalizer count: n*K ungated; the effective sample size K*sum(g) gated.
         nK = float(n * K) if g is None else K * jnp.sum(g)
@@ -319,23 +335,19 @@ class IBProbit(eqx.Module):
 
         def step_fn(eta_carry, *args):
             m = mm_update(x, eta_carry)              # canonical mean scores  (n,K)
-            alpha = m / sigma_z
 
-            log_pdf = norm.logpdf(alpha)
-            mills_pos = jnp.exp(log_pdf - norm.logcdf(alpha))
-            mills_neg = jnp.exp(log_pdf - norm.logcdf(-alpha))
-            E_q_z = m + sigma_z * jnp.where(y_one_hot, mills_pos, -mills_neg)
+            E_q_z = self._expected_z(m, y_one_hot)
             contrib = E_q_z if g is None else g * E_q_z
 
-            b = inv_sz2 * mm_update(fts.T, contrib)  # data increment  (d,K)
+            b = mm_update(fts.T, contrib)            # data increment  (d,K)
             eta_hat = eta_pred + b                   # plain M-step nat-param (a=1)
             m_hat = mm_update(x, eta_hat)            # = fts @ Lambda_post^{-1} eta_hat  (n,K)
 
-            E_q_z2 = m * E_q_z + sz2                  # truncated 2nd moment
+            E_q_z2 = m * E_q_z + 1.0                  # truncated 2nd moment (sigma_z^2 = 1)
             resid = E_q_z2 - 2.0 * E_q_z * m_hat + m_hat * m_hat
             S_z = jnp.sum(resid if g is None else g * resid)   # per-point g-weight (m_hat NOT re-gated)
             B = jnp.sum(p * eta_hat)
-            Cq = S_z * inv_sz2 + jnp.sum(eta_hat * mm_update(M_c, eta_hat))
+            Cq = S_z + jnp.sum(eta_hat * mm_update(M_c, eta_hat))
             a = (-B + jnp.sqrt(B * B + 4.0 * nK * Cq)) / (2.0 * nK)
 
             return eta_pred + b / a, None
@@ -358,117 +370,76 @@ class IBProbit(eqx.Module):
         beta_new, _ = lax.scan(newton_step, self.beta, jnp.arange(num_iters))
         return eqx.tree_at(lambda m: m.beta, self, beta_new)
 
-    def update(self, features: Array, y: Array, *, num_iters: int = 32, px: Optional[bool] = None, bmr_gate: Optional[bool] = None) -> "IBProbit":
+    def update(self, features: Array, y: Array, *, num_iters: int = 32, px: Optional[bool] = None) -> "IBProbit":
         """One recursive-Bayesian / CAVI minibatch update.
 
-        PREDICT: the previous posterior, inflated by process noise, is this
-        batch's prior -- ``Sigma_pred = Sigma + q I`` (no persistent anchor).
-        UPDATE: assimilate the batch under latent noise ``sigma_z^2``; the
+        PREDICT: the previous posterior, inflated by the process noise, is this
+        batch's prior -- ``Sigma_pred = Sigma + Qhat`` (no persistent anchor), with
+        ``Qhat`` the Inverse-Wishart mean of Q.
+        UPDATE: assimilate the batch at the gauge-fixed latent scale sigma_z^2 = 1; the
         posterior precision is closed-form, the mean comes from the CAVI scan:
-            Lambda_post = inv(Sigma_pred) + (1/sigma_z^2) X^T X
-            mu_post     = Lambda_post^{-1} ( inv(Sigma_pred) mu + (1/sigma_z^2) X^T E[z] )
+            Lambda_post = inv(Sigma_pred) + X^T X
+            mu_post     = Lambda_post^{-1} ( inv(Sigma_pred) mu + X^T E[z] )
         Sets (mu, Sigma) and posterior_ready=True.
 
         ``px=True`` runs the parameter-expanded CAVI scan (``_cavi_scan_px``), which
         collapses the slow scale mode and converges in far fewer iterations to the
-        SAME posterior as the plain scan.
+        SAME posterior as the plain scan. If left ``None`` it falls back to the
+        instance field ``self.px`` (so the training loop enables PX via construction
+        without passing a kwarg).
 
-        If ``self.learn_q`` is set, a single prequential SGD step is taken on
-        ``log_q`` BEFORE the PREDICT/CAVI assimilation: the gradient of the
-        pre-update predictive NLL (``self.loss_type``) plus an optional Inverse-Gamma
-        anchor (``anchor_weight * (log_q + anchor_mode * exp(-log_q))``, mode at
-        ``anchor_mode``) is descended with step size ``hyper_lr``. The stepped ``q``
-        then drives the PREDICT step and is persisted. This folds the external
-        ``ood_evaluation`` hyper-optimizer into the recursion so the training loop
-        needs no separate optimizer.
+        Each observation i is softly down-weighted in BOTH the precision and the CAVI
+        mean by its responsibility ``r_i`` (the probability the point came from the
+        model rather than the contamination), giving a data-driven effective sample
+        size. The gate is held at 1 for the first ``self.warmup`` update steps -- on
+        the mu=0 seed every predictive is uniform, so the gate is uninformative.
 
-        ``px`` selects the parameter-expanded scan; if left ``None`` it falls back to
-        the instance field ``self.px`` (so the training loop enables PX via
-        construction without passing a kwarg).
+        The contamination rate ``eps`` is updated by a single CONJUGATE BETA step per
+        call (no gradient): the responsibilities ``r_i`` are soft Bernoulli counts,
+        ``eps_alpha += sum_i (1 - r_i)`` (contamination mass) and ``eps_beta += sum_i
+        r_i`` (model mass), so ``eps = eps_alpha/(eps_alpha+eps_beta)`` is the mean of
+        the Beta(1, 1/eps_init) posterior. The forgetting factor ``self.rho`` decays
+        the accumulated excess over the prior each step (``rho = 1 - B/N`` gives a
+        one-pass memory; ``rho = 1`` accumulates over the whole recursive pass);
+        counts are reset by ``reset_posterior``.
 
-        If ``self.bmr_gate`` (or the ``bmr_gate`` kwarg) is set, each observation i is
-        softly down-weighted in BOTH the precision and the CAVI mean, giving a data-driven
-        effective sample size. With the eps-mixture active the weight is the per-point
-        responsibility ``r_i`` (probability the point came from the model, not the
-        contamination); otherwise it is the committed fixed-1/2 BMR gate
-        ``g_i = Phi(mu~_i) / (Phi(mu~_i) + 1/2)``. It is skipped for the first
-        ``bmr_warmup`` update steps -- on the mu=0 seed the gate is uninformative.
-
-        If ``self.learn_eps``, the contamination rate ``eps`` is updated by a single
-        CONJUGATE BETA step per call (no gradient): the responsibilities ``r_i`` are soft
-        Bernoulli counts, ``eps_alpha += sum_i (1 - r_i)`` (contamination mass) and
-        ``eps_beta += sum_i r_i`` (model mass), so ``eps = eps_alpha/(eps_alpha+eps_beta)``
-        is the mean of the Beta(1, 1/eps_init) posterior. ``r_i`` is formed whenever the
-        mixture is active, independent of ``bmr_gate`` (which only decides whether it also
-        gates assimilation). The forgetting factor ``self.rho`` decays the accumulated excess
-        over the prior each step (``rho = 1 - B/N`` gives a one-pass memory; ``rho = 1``
-        accumulates over the whole recursive pass); counts are reset by ``reset_posterior``.
+        ``self.learn_q`` will switch the conjugate recursion on ``(Psi, nu)`` once it
+        lands; with it off, ``Qhat`` stays at its ``q0 I`` seed by construction.
         """
         use_px = self.px if px is None else px
-        use_bmr = self.bmr_gate if bmr_gate is None else bmr_gate
-        use_eps = self.use_eps                                    # static: mixture active?
 
-        # Pre-step eps drives the responsibility (the gate / Beta counts read pre-step q/eps,
-        # like the committed BMR gate; assimilation below uses the stepped q).
-        eps_pre = self.eps if use_eps else None
+        # One pre-update predictive pass, shared by the responsibility and the gate.
+        # The pre-step eps drives the responsibility (the Beta counts read pre-step eps).
+        raw = self._predictive_logits(features)
+        loss_vec = self._loss_from_logits(raw, nn.one_hot(y, self.mu.shape[-1]))[0]
 
-        # Optional prequential SGD step on log_q, taken on the PRE-update predictive; the
-        # per-point predictive loss is reused (has_aux) for the responsibility so the step,
-        # the gate and the eps update all share one predictive pass.
-        raw = None
-        loss_vec = None
-        if self.learn_q:
-            def preq_obj(log_q):
-                model = eqx.tree_at(lambda m: m.log_q, self, log_q)
-                raw_l = model._predictive_logits(features)
-                y_oh = nn.one_hot(y, self.mu.shape[-1])
-                loss_l = model._loss_from_logits(raw_l, y_oh)[0]   # per-point plain predictive NLL
-                return self._preq_objective(loss_l, log_q), (raw_l, loss_l)
-            g_grad, (raw, loss_vec) = grad(preq_obj, has_aux=True)(self.log_q)
-            self = eqx.tree_at(lambda m: m.log_q, self, self.log_q - self.hyper_lr * g_grad)
-        elif use_eps or use_bmr:
-            raw = self._predictive_logits(features)                # one pre-update pass
-            if use_eps:
-                loss_vec = self._loss_from_logits(raw, nn.one_hot(y, self.mu.shape[-1]))[0]
+        # Per-point responsibility r_i = P(point i from the model | label); drives both
+        # the Beta eps update and the assimilation gate.
+        r = self._eps_responsibility(loss_vec, self.eps)          # (n,1) in (0,1)
 
-        # Per-point responsibility r_i = P(point i from the model | label); formed whenever
-        # the mixture is active (drives both the Beta eps update and, if on, the gate).
-        r = self._eps_responsibility(loss_vec, eps_pre) if use_eps else None   # (n,1) in (0,1)
+        # Conjugate Beta update of the contamination rate: the r_i are soft Bernoulli
+        # counts -- eps_alpha += sum(1-r_i) (contamination mass), eps_beta += sum(r_i)
+        # (model mass) -- so eps = eps_alpha/(eps_alpha+eps_beta) is the Beta posterior
+        # mean. The prior Beta(1, 1/eps_init) is the seed. The forgetting factor rho
+        # decays the accumulated EXCESS over the prior before adding the batch counts:
+        # with rho = 1 - B/N (batch B, data size N) the steady-state concentration is
+        # ~N (a one-pass memory), so eps tracks recent data; rho=1 recovers unbounded
+        # accumulation.
+        r_flat = r[:, 0]
+        a0, b0 = self._eps_seed()
+        eps_alpha_new = a0 + self.rho * (self.eps_alpha - a0) + jnp.sum(1.0 - r_flat)
+        eps_beta_new = b0 + self.rho * (self.eps_beta - b0) + jnp.sum(r_flat)
 
-        # Conjugate Beta update of the contamination rate (learn_eps only): the r_i are soft
-        # Bernoulli counts -- eps_alpha += sum(1-r_i) (contamination mass), eps_beta += sum(r_i)
-        # (model mass) -- so eps = eps_alpha/(eps_alpha+eps_beta) is the Beta posterior mean.
-        # The prior Beta(1, 1/eps_init) is the seed. The forgetting factor rho decays the
-        # accumulated EXCESS over the prior before adding the batch counts: with rho = 1 - B/N
-        # (batch B, data size N) the steady-state concentration is ~N (a one-pass memory), so
-        # eps tracks recent data; rho=1 recovers unbounded accumulation. Replaces the former
-        # in-update SGD on eps.
-        eps_alpha_new, eps_beta_new = self.eps_alpha, self.eps_beta
-        if self.learn_eps:
-            r_flat = r[:, 0]
-            a0, b0 = self._eps_seed()
-            eps_alpha_new = a0 + self.rho * (self.eps_alpha - a0) + jnp.sum(1.0 - r_flat)
-            eps_beta_new = b0 + self.rho * (self.eps_beta - b0) + jnp.sum(r_flat)
-
-        # Per-point gate (pre-step); active only when bmr_gate is on. With the mixture active
-        # the gate is the responsibility r_i, else the committed fixed-1/2 BMR gate. Held at
-        # g == 1 (un-gated) for the first bmr_warmup steps (the mu=0 seed gate is useless).
-        g = None
-        if use_bmr:
-            g_real = r if use_eps else self._gate_from_logits(raw, y)   # (n,1)
-            g = jnp.where(self.step >= self.bmr_warmup, g_real, jnp.float32(1.0))
+        # Per-point gate (pre-step), held at g == 1 (un-gated) for the first
+        # ``warmup`` steps -- on the mu=0 seed the gate is uninformative.
+        g = jnp.where(self.step >= self.warmup, r, jnp.float32(1.0))
 
         fts = features.astype(jnp.float32)
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
         d = fts.shape[-1]
 
-        sigma_z = jnp.sqrt(self.sigma_z2)
-        inv_sz2 = 1.0 / self.sigma_z2
-
         # PREDICT: previous posterior + process noise is this batch's prior.
-
-        indices = jnp.diag_indices(self.Sigma.shape[0])
-        Sigma_pred = self.Sigma.at[indices].add(self.q)
+        Sigma_pred = self.Sigma + self.Qhat
         Sigma_pred = 0.5 * (Sigma_pred + Sigma_pred.T)   # symmetrize for stability
         L = cho_factor(Sigma_pred)
         tmp = cho_solve(L, jnp.concatenate([self.mu, jnp.eye(d)], axis=-1))
@@ -476,10 +447,9 @@ class IBProbit(eqx.Module):
         Lambda_pred = tmp[:, -d:]
 
         # UPDATE: posterior precision is closed-form; mean via the CAVI scan.
-        # The BMR gate g (if any) weights point i in both moments: (g ⊙ X)^T X and g ⊙ E[z].
-        gated_fts = fts if g is None else g * fts
-        xxT = mm_update(gated_fts.T, fts)
-        Lambda_new = Lambda_pred + inv_sz2 * xxT
+        # The gate g weights point i in both moments: (g ⊙ X)^T X and g ⊙ E[z].
+        xxT = mm_update((g * fts).T, fts)
+        Lambda_new = Lambda_pred + xxT
         Lambda_new = 0.5 * (Lambda_new + Lambda_new.T)   # symmetrize for stability
         y_one_hot = nn.one_hot(y, self.mu.shape[-1])
 
@@ -487,9 +457,9 @@ class IBProbit(eqx.Module):
         x = cho_solve(L, fts.T).T
         if use_px:
             eta_post = self._cavi_scan_px(fts, x, y_one_hot, eta_pred, L,
-                                          Lambda_pred, num_iters, sigma_z, g)
+                                          Lambda_pred, num_iters, g)
         else:
-            eta_post = self._cavi_scan(fts, x, y_one_hot, eta_pred, eta_pred, num_iters, sigma_z, g)
+            eta_post = self._cavi_scan(fts, x, y_one_hot, eta_pred, eta_pred, num_iters, g)
 
         tmp = cho_solve(L, jnp.concatenate([eta_post, jnp.eye(d)], axis=-1))
         mu_new = tmp[:, :-d]
@@ -508,27 +478,29 @@ class IBProbit(eqx.Module):
 
     def predictive_variance(self, features: Array) -> Array:
         """Per-input predictive variance of the latent score w^T f:
-            v(f) = sigma_z^2 + f^T (q I + Sigma) f  =  sigma_z^2 + q ||f||^2 + f^T Sigma f.
+            v(f) = 1 + f^T (Qhat + Sigma) f.
         This is the (class-shared) denominator squared of the moderated-probit predictive
-        (Sigma is class-independent, so v is one scalar per input, not per class). It sums
-        epistemic (f^T Sigma f), process-noise-floor (q ||f||^2) and aleatoric (sigma_z^2)
-        terms; large for inputs in feature directions the posterior does not constrain, so
-        it doubles as an epistemic OOD score (higher => more OOD). (n,)."""
+        (both Sigma and Qhat are class-independent, so v is one scalar per input, not per
+        class). It sums epistemic (f^T Sigma f), process-noise-floor (f^T Qhat f) and
+        aleatoric (the gauge-fixed sigma_z^2 = 1) terms; large for inputs in feature
+        directions the posterior does not constrain, so it doubles as an epistemic OOD
+        score (higher => more OOD). (n,)."""
         fts = features.astype(jnp.float32)
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
-        return self.sigma_z2 + jnp.sum((self.q * fts + (fts @ self.Sigma)) * fts, axis=-1)
+        var = jnp.sum(mm_update(fts, self.Qhat + self.Sigma) * fts, axis=-1)
+        return 1.0 + var
 
     def _predictive_logits(self, features: Array) -> Array:
         """Raw moderated-probit predictive logit (BEFORE the loss_type transform):
-            logit = mu^T f / sqrt( sigma_z^2 + f^T (q I + Sigma) f ).
-        The process-noise floor q ||f||^2 keeps the denominator from collapsing as the
-        posterior covariance Sigma does. Shared by ``__call__``, the ``learn_q`` gradient
-        step, and the BMR gate so they all consume the SAME predictive. (n, K)."""
+            logit = mu^T f / sqrt( 1 + f^T (Qhat + Sigma) f ).
+        The process-noise floor f^T Qhat f keeps the denominator from collapsing as the
+        posterior covariance Sigma does. Shared by ``__call__``, the responsibility and
+        the gate so they all consume the SAME predictive. (n, K)."""
         fts = features.astype(jnp.float32)
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
         scores = mm_loss(fts, self.mu)
-        var = jnp.sum((self.q * fts + (fts @ self.Sigma)) * fts, axis=-1)
-        return scores / jnp.sqrt(self.sigma_z2 + var)[:, None]
+        var = jnp.sum(mm_update(fts, self.Qhat + self.Sigma) * fts, axis=-1)
+        return scores / jnp.sqrt(1.0 + var)[:, None]
 
     def _loss_from_logits(self, logits: Array, y_one_hot: Array) -> Tuple[Array, Array]:
         """Map raw moderated logits -> (loss, beta * transformed logits) under
@@ -560,9 +532,12 @@ class IBProbit(eqx.Module):
         return loss, self.beta * logits
 
     def _gate_from_logits(self, raw: Array, y: Array) -> Array:
-        """Per-data-point BMR gate from the raw moderated predictive, evaluated at the
-        TRUE label: g_i = Phi(mu~_i) / (Phi(mu~_i) + 1/2),  mu~_i = raw[i, y_i].
-        In (0, 2/3): well-predicted -> 2/3, badly-predicted -> 0. Returns (n, 1)."""
+        """The submitted paper's fixed-1/2 BMR gate, from the raw moderated predictive
+        evaluated at the TRUE label: g_i = Phi(mu~_i) / (Phi(mu~_i) + 1/2), mu~_i =
+        raw[i, y_i]. In (0, 2/3): well-predicted -> 2/3, badly-predicted -> 0. (n, 1).
+
+        ``update`` now gates on the responsibility instead; this is kept as the
+        baseline the eps-mixture gate is compared against."""
         s = jnp.take_along_axis(raw, y[:, None], axis=1)   # (n,1) true-class score
         p1 = self.cdf(s)
         return p1 / (p1 + 0.5)
@@ -576,21 +551,6 @@ class IBProbit(eqx.Module):
         log_num = jnp.log1p(-eps) - loss_vec                          # log((1-eps) p_model(y))
         log_den = jnp.logaddexp(log_num, jnp.log(eps) - log_K)
         return jnp.exp(log_num - log_den)[:, None]
-
-    def _preq_objective(self, loss_vec: Array, log_q: Array) -> Array:
-        """Prequential objective for the in-update log_q SGD step: the mixture predictive NLL
-        at the current (fixed) eps when the mixture is active, else the plain predictive NLL,
-        plus the Inverse-Gamma anchor on q. ``loss_vec`` is the per-point plain predictive
-        NLL. eps is no longer gradient-trained -- it is set by the conjugate Beta update."""
-        if self.use_eps:
-            eps = self.eps
-            log_K = jnp.log(self.mu.shape[-1])
-            obj = -jnp.logaddexp(jnp.log1p(-eps) - loss_vec, jnp.log(eps) - log_K).mean()
-        else:
-            obj = loss_vec.mean()
-        if self.anchor_weight > 0.0:
-            obj = obj + self.anchor_weight * (log_q + self.anchor_mode * jnp.exp(-log_q))
-        return obj
 
     def _mixture_logp(self, raw: Array) -> Array:
         """(n, K) log mixture predictive log[ (1-eps) softmax(beta * transform(raw)) + eps/K ].
