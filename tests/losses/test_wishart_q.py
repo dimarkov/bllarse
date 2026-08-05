@@ -290,3 +290,122 @@ def test_surprise_rate_normalizes_by_d_times_K():
 
     assert recovered == pytest.approx(float(log_SBF) / (d * K), rel=1e-4)
     assert abs(recovered - float(log_SBF) / K) > 1e-3, "must not be the /K normalization"
+
+
+def test_q_recursion_at_the_prior_is_the_plain_conjugate_update():
+    """With gamma = E[p_c] at t=0, the update is the convex combination of
+    sec 5.5(c). Check it against the formula written out longhand."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
+    Qhat, Lambda_pred, _, Sigma_new, Delta = _random_state(jr.key(5), d, K)
+    S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    Psi0, nu0 = lf._q_seed()
+
+    Psi_n, nu_n, _, _, gamma = lf._q_recursion(Qhat, Lambda_pred, Sigma_new, Delta, K)
+
+    assert jnp.allclose(nu_n, (1 - gamma) * lf.nu + gamma * nu0 + K, rtol=1e-5)
+    assert jnp.allclose(Psi_n, (1 - gamma) * lf.Psi + gamma * Psi0 + S, rtol=1e-4)
+
+
+def test_q_recursion_keeps_psi_pd_and_nu_above_d_plus_one():
+    d, K, N = 13, 4, 32
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9, warmup=0)
+    keys = jr.split(jr.key(6), 2)
+    fts, y = jr.normal(keys[0], (N, d - 1)), jr.randint(keys[1], (N,), 0, K)
+    for _ in range(8):
+        lf = lf.update(fts, y, num_iters=4)
+        assert float(lf.nu) > d + 1, float(lf.nu)
+        assert (jnp.linalg.eigvalsh(lf.Psi) > 0).all()
+        assert jnp.isfinite(lf.Qhat).all()
+
+
+def _with_sigma(lf, Sigma):
+    import equinox as eqx
+    return eqx.tree_at(lambda m: m.Sigma, lf, Sigma)
+
+
+def test_isotropic_reduction_matches_the_scalar_spec():
+    """With isotropic Psi and Sigma the matrix recursion must reproduce
+    q-update-spec sec 5.5's scalar one coordinate-wise. This pins the
+    generalization against the spec it generalizes."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9)
+    lf = _with_sigma(lf, jnp.eye(d) * 0.5)
+
+    Qhat = lf.Qhat
+    Lambda_pred = jnp.linalg.inv(lf.Sigma + Qhat)
+    Sigma_new = jnp.eye(d) * 0.4
+    Delta = jnp.zeros((d, K))                     # no drift -> S is purely the covariance part
+
+    S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    assert jnp.allclose(S, jnp.diag(jnp.diagonal(S)), atol=1e-6), "isotropic in => diagonal out"
+
+    g = float(jnp.diagonal(Qhat)[0]) * float(jnp.diagonal(Lambda_pred)[0])
+    s_scalar = K * (g * 0.5 + g * 0.4 * g)
+    assert float(jnp.diagonal(S)[0]) == pytest.approx(s_scalar, rel=1e-4)
+
+
+def test_qhat_contracts_under_a_stationary_head():
+    """q-update-spec sec 6: the recursion contracts toward q = 0 when the head is not
+    moving -- the estimator does not mistake its own tracking noise for drift. The
+    contraction is CUBIC in the Kalman gain, so it is invisible at realistic drift
+    rates; this constructs a large-gain state deliberately rather than running a long
+    realistic loop and hoping."""
+    d, K, N = 9, 4, 64
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=0.5, rho=0.99, warmup=0)
+    keys = jr.split(jr.key(7), 2)
+    fts, y = jr.normal(keys[0], (N, d - 1)), jr.randint(keys[1], (N,), 0, K)
+
+    lf = lf.update(fts, y, num_iters=8)          # settle off the mu=0 seed
+    first = float(jnp.trace(lf.Qhat))
+    for _ in range(6):
+        lf = lf.update(fts, y, num_iters=8)      # same batch every step: no real drift
+    assert float(jnp.trace(lf.Qhat)) < first
+
+
+def test_warmup_defers_the_q_recursion():
+    d, K, N = 9, 4, 24
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9, warmup=2)
+    keys = jr.split(jr.key(8), 2)
+    fts, y = jr.normal(keys[0], (N, d - 1)), jr.randint(keys[1], (N,), 0, K)
+
+    Psi0 = lf.Psi
+    lf = lf.update(fts, y, num_iters=4)
+    assert jnp.array_equal(lf.Psi, Psi0), "step 0 is inside warmup"
+    lf = lf.update(fts, y, num_iters=4)
+    assert jnp.array_equal(lf.Psi, Psi0), "step 1 is inside warmup"
+    lf = lf.update(fts, y, num_iters=4)
+    assert not jnp.array_equal(lf.Psi, Psi0), "step 2 must engage the recursion"
+
+
+def test_pc_posterior_moves_with_gamma():
+    d, K, N = 9, 4, 24
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9, warmup=0)
+    keys = jr.split(jr.key(9), 2)
+    fts, y = jr.normal(keys[0], (N, d - 1)), jr.randint(keys[1], (N,), 0, K)
+    before = float(lf.p_a + lf.p_b)
+    lf = lf.update(fts, y, num_iters=4)
+    assert float(lf.p_a + lf.p_b) > before, "one soft count per step must accumulate"
+
+
+def test_update_runs_under_jit_and_scan():
+    import equinox as eqx
+    from jax import lax
+    d, K, N = 9, 4, 24
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9, warmup=1)
+    keys = jr.split(jr.key(10), 2)
+    fts = jr.normal(keys[0], (3, N, d - 1))
+    ys = jr.randint(keys[1], (3, N), 0, K)
+    params, static = eqx.partition(lf, eqx.is_array)
+
+    @eqx.filter_jit
+    def run(params, fts, ys):
+        def body(p, batch):
+            m = eqx.combine(p, static).update(batch[0], batch[1], num_iters=4)
+            return eqx.filter(m, eqx.is_array), None
+        out, _ = lax.scan(body, params, (fts, ys))
+        return out
+
+    out = run(params, fts, ys)
+    final = eqx.combine(out, static)
+    assert jnp.isfinite(final.mu).all() and jnp.isfinite(final.Psi).all()

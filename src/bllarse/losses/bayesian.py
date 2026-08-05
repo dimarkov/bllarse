@@ -454,6 +454,43 @@ class IBProbit(eqx.Module):
         log_Sbar = self._log_bayes_factor(S, Psi, nu, K) / (d * K)
         return nn.sigmoid(jnp.log(p_a) - jnp.log(p_b) + log_Sbar)
 
+    def _q_recursion(self, Qhat: Array, Lambda_pred: Array, Sigma_new: Array,
+                     Delta: Array, K: int) -> Tuple[Array, Array, Array, Array, Array]:
+        """Steps 5-8 of q-update-spec sec 8: the conjugate hyper-updates.
+
+        S_t | Q ~ Wishart_d(Q, K), whose conjugate is the Inverse-Wishart, so absent
+        forgetting the update is nu += K, Psi += S_t. VarSMiLe replaces the fixed EMA
+        discount with the inferred rate gamma:
+
+            nu_t  = (1 - gamma) nu_{t-1}  + gamma nu_0  + K
+            Psi_t = (1 - gamma) Psi_{t-1} + gamma Psi_0 + S_t
+
+        At large gamma this lands on (Psi_0 + S_t, nu_0 + K) -- the prior plus this
+        batch -- so a detected change discards the stale drift estimate. gamma is the
+        variational responsibility q(c_t = 1), so it doubles as the soft count for the
+        Beta on the change rate p_c.
+
+        Note the Beta on p_c gets ONE count per step here where the diagonal
+        formulation got d, so p_c identifies roughly d times slower and the prior mean
+        1 - rho carries more of the weight for longer. rho bounds the memory either
+        way; this is a rate-of-identification change, not a stability one. Worth
+        logging p_c's trajectory as a diagnostic.
+
+        Returns (Psi_new, nu_new, p_a_new, p_b_new, gamma)."""
+        Psi0, nu0 = self._q_seed()
+        pa0, pb0 = self._pc_seed()
+
+        S = self._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+        gamma = self._surprise_rate(S, self.Psi, self.nu, self.p_a, self.p_b, K)
+
+        nu_new = (1.0 - gamma) * self.nu + gamma * nu0 + K
+        Psi_new = (1.0 - gamma) * self.Psi + gamma * Psi0 + S
+        Psi_new = 0.5 * (Psi_new + Psi_new.T)
+
+        p_a_new = pa0 + self.rho * (self.p_a - pa0) + gamma
+        p_b_new = pb0 + self.rho * (self.p_b - pb0) + (1.0 - gamma)
+        return Psi_new, nu_new, p_a_new, p_b_new, gamma
+
     def calibrate(self, features: Array, y: Array, *, num_iters: int = 8, loss_type: int = 2) -> "IBProbit":
         """Temperature scaling via Newton steps on beta, using held-out (val) data.
         """
@@ -469,89 +506,60 @@ class IBProbit(eqx.Module):
         beta_new, _ = lax.scan(newton_step, self.beta, jnp.arange(num_iters))
         return eqx.tree_at(lambda m: m.beta, self, beta_new)
 
-    def update(self, features: Array, y: Array, *, num_iters: int = 32, px: Optional[bool] = None) -> "IBProbit":
-        """One recursive-Bayesian / CAVI minibatch update.
+    def update(self, features: Array, y: Array, *, num_iters: int = 32,
+               px: Optional[bool] = None) -> "IBProbit":
+        """One recursive-Bayesian / CAVI minibatch update, in the order of
+        q-update-spec sec 8:
 
-        PREDICT: the previous posterior, inflated by the process noise, is this
-        batch's prior -- ``Sigma_pred = Sigma + Qhat`` (no persistent anchor), with
-        ``Qhat`` the Inverse-Wishart mean of Q.
-        UPDATE: assimilate the batch at the gauge-fixed latent scale sigma_z^2 = 1; the
-        posterior precision is closed-form, the mean comes from the CAVI scan:
-            Lambda_post = inv(Sigma_pred) + X^T X
-            mu_post     = Lambda_post^{-1} ( inv(Sigma_pred) mu + X^T E[z] )
-        Sets (mu, Sigma) and posterior_ready=True.
+            0. PREDICTIVE  ungated, pre-update: the one-step-ahead prequential predictive
+            1. q(s)        responsibilities r_i from E[log eps] and that predictive
+            2. q(eps)      Beta discount-update with counts (1-r_i), r_i
+            3. PREDICT     Sigma_pred = Sigma + Qhat; Lambda_pred, eta_pred
+            4. UPDATE      Lambda_t, eta_t with r_i gating both moments; PX or plain CAVI
+            5-8.           S_t, the surprise, q(Q) and q(p_c)          [learn_q only]
 
-        ``px=True`` runs the parameter-expanded CAVI scan (``_cavi_scan_px``), which
-        collapses the slow scale mode and converges in far fewer iterations to the
-        SAME posterior as the plain scan. If left ``None`` it falls back to the
-        instance field ``self.px`` (so the training loop enables PX via construction
-        without passing a kwarg).
+        Step 0 must be ungated: the gate is derived from it, so gating first would
+        suppress the signal that forms it. Steps 5-8 follow step 4 because S_t needs
+        (mu_t, Sigma_t), and Qhat_t is consumed at t+1. They are deferred for the
+        first ``warmup`` steps -- at t=0 the predictive is uniform and Delta = mu_1 is
+        a full-size jump off the mu=0 seed, so the first batch reports a huge S and
+        would drive gamma to 1 on every coordinate.
 
-        Each observation i is softly down-weighted in BOTH the precision and the CAVI
-        mean by its responsibility ``r_i`` (the probability the point came from the
-        model rather than the contamination), giving a data-driven effective sample
-        size. The gate is held at 1 for the first ``self.warmup`` update steps -- on
-        the mu=0 seed every predictive is uniform, so the gate is uninformative.
-
-        The contamination rate ``eps`` is updated by a single CONJUGATE BETA step per
-        call (no gradient): the responsibilities ``r_i`` are soft Bernoulli counts,
-        ``eps_alpha += sum_i (1 - r_i)`` (contamination mass) and ``eps_beta += sum_i
-        r_i`` (model mass), so ``eps = eps_alpha/(eps_alpha+eps_beta)`` is the mean of
-        the Beta(1, 1/eps_init) posterior. The forgetting factor ``self.rho`` decays
-        the accumulated excess over the prior each step (``rho = 1 - B/N`` gives a
-        one-pass memory; ``rho = 1`` accumulates over the whole recursive pass);
-        counts are reset by ``reset_posterior``.
-
-        ``self.learn_q`` will switch the conjugate recursion on ``(Psi, nu)`` once it
-        lands; with it off, ``Qhat`` stays at its ``q0 I`` seed by construction.
-        """
+        r_i weights BOTH moments because a contaminated point contributes neither.
+        There is no gradient step anywhere in this method."""
         use_px = self.px if px is None else px
+        d, K = self.mu.shape[0], self.mu.shape[-1]
+        y_one_hot = nn.one_hot(y, K)
+        Qhat = self.Qhat
 
-        # One pre-update predictive pass, shared by the responsibility and the gate.
-        # The pre-step eps drives the responsibility (the Beta counts read pre-step eps).
+        # 0. PREDICTIVE -- ungated, pre-update, and the only predictive pass per batch.
         raw = self._predictive_logits(features)
-        loss_vec = self._loss_from_logits(raw, nn.one_hot(y, self.mu.shape[-1]))[0]
+        loss_vec = self._loss_from_logits(raw, y_one_hot)[0]
 
-        # Per-point responsibility r_i = P(point i from the model | label); drives both
-        # the Beta eps update and the assimilation gate.
-        r = self._eps_responsibility(loss_vec, self.eps)          # (n,1) in (0,1)
-
-        # Conjugate Beta update of the contamination rate: the r_i are soft Bernoulli
-        # counts -- eps_alpha += sum(1-r_i) (contamination mass), eps_beta += sum(r_i)
-        # (model mass) -- so eps = eps_alpha/(eps_alpha+eps_beta) is the Beta posterior
-        # mean. The prior Beta(1, 1/eps_init) is the seed. The forgetting factor rho
-        # decays the accumulated EXCESS over the prior before adding the batch counts:
-        # with rho = 1 - B/N (batch B, data size N) the steady-state concentration is
-        # ~N (a one-pass memory), so eps tracks recent data; rho=1 recovers unbounded
-        # accumulation.
-        r_flat = r[:, 0]
+        # 1-2. q(s) then q(eps). The two-argument _eps_responsibility is the ported
+        # Beta-mean form; Task 8 replaces it with the psi-form and drops the argument.
+        r = self._eps_responsibility(loss_vec, self.eps)             # (n,1)
         a0, b0 = self._eps_seed()
+        r_flat = r[:, 0]
         eps_alpha_new = a0 + self.rho * (self.eps_alpha - a0) + jnp.sum(1.0 - r_flat)
         eps_beta_new = b0 + self.rho * (self.eps_beta - b0) + jnp.sum(r_flat)
 
-        # Per-point gate (pre-step), held at g == 1 (un-gated) for the first
-        # ``warmup`` steps -- on the mu=0 seed the gate is uninformative.
+        # The gate IS the responsibility (sec 5.2); held at 1 through warmup.
         g = jnp.where(self.step >= self.warmup, r, jnp.float32(1.0))
 
         fts = features.astype(jnp.float32)
         fts = jnp.pad(fts, [(0, 0), (0, int(self.use_bias))], constant_values=1.0)
-        d = fts.shape[-1]
 
-        # PREDICT: previous posterior + process noise is this batch's prior.
-        Sigma_pred = self.Sigma + self.Qhat
-        Sigma_pred = 0.5 * (Sigma_pred + Sigma_pred.T)   # symmetrize for stability
+        # 3. PREDICT -- previous posterior inflated by the process noise.
+        Sigma_pred = self.Sigma + Qhat
+        Sigma_pred = 0.5 * (Sigma_pred + Sigma_pred.T)
         L = cho_factor(Sigma_pred)
         tmp = cho_solve(L, jnp.concatenate([self.mu, jnp.eye(d)], axis=-1))
-        eta_pred = tmp[:, :-d]
-        Lambda_pred = tmp[:, -d:]
+        eta_pred, Lambda_pred = tmp[:, :-d], tmp[:, -d:]
 
-        # UPDATE: posterior precision is closed-form; mean via the CAVI scan.
-        # The gate g weights point i in both moments: (g ⊙ X)^T X and g ⊙ E[z].
-        xxT = mm_update((g * fts).T, fts)
-        Lambda_new = Lambda_pred + xxT
-        Lambda_new = 0.5 * (Lambda_new + Lambda_new.T)   # symmetrize for stability
-        y_one_hot = nn.one_hot(y, self.mu.shape[-1])
-
+        # 4. UPDATE -- precision closed-form, mean by CAVI. sigma_z^2 === 1 (sec 5.7).
+        Lambda_new = Lambda_pred + mm_update((g * fts).T, fts)
+        Lambda_new = 0.5 * (Lambda_new + Lambda_new.T)
         L = cho_factor(Lambda_new)
         x = cho_solve(L, fts.T).T
         if use_px:
@@ -559,15 +567,26 @@ class IBProbit(eqx.Module):
                                           Lambda_pred, num_iters, g)
         else:
             eta_post = self._cavi_scan(fts, x, y_one_hot, eta_pred, eta_pred, num_iters, g)
-
         tmp = cho_solve(L, jnp.concatenate([eta_post, jnp.eye(d)], axis=-1))
-        mu_new = tmp[:, :-d]
-        Sigma_new = tmp[:, -d:]
+        mu_new, Sigma_new = tmp[:, :-d], tmp[:, -d:]
+
+        # 5-8. The conjugate hyper-updates on Q and p_c.
+        Psi_new, nu_new, p_a_new, p_b_new = self.Psi, self.nu, self.p_a, self.p_b
+        if self.learn_q:
+            Psi_r, nu_r, pa_r, pb_r, _ = self._q_recursion(
+                Qhat, Lambda_pred, Sigma_new, mu_new - self.mu, K)
+            engaged = self.step >= self.warmup
+            Psi_new = jnp.where(engaged, Psi_r, Psi_new)
+            nu_new = jnp.where(engaged, nu_r, nu_new)
+            p_a_new = jnp.where(engaged, pa_r, p_a_new)
+            p_b_new = jnp.where(engaged, pb_r, p_b_new)
 
         return eqx.tree_at(
-            lambda m: (m.mu, m.Sigma, m.step, m.posterior_ready, m.eps_alpha, m.eps_beta),
+            lambda m: (m.mu, m.Sigma, m.step, m.posterior_ready,
+                       m.eps_alpha, m.eps_beta, m.Psi, m.nu, m.p_a, m.p_b),
             self,
-            (mu_new, Sigma_new, self.step + 1, True, eps_alpha_new, eps_beta_new),
+            (mu_new, Sigma_new, self.step + 1, True,
+             eps_alpha_new, eps_beta_new, Psi_new, nu_new, p_a_new, p_b_new),
         )
 
     @property
