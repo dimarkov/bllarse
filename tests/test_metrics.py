@@ -1,8 +1,9 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import nn
 
-from bllarse import metrics
+from bllarse import detection, metrics
 
 
 def test_accuracy_perfect_and_zero():
@@ -140,3 +141,59 @@ def test_metrics_accept_float16_input():
     labels = jnp.zeros((10,), dtype=jnp.int32)
     assert np.isfinite(metrics.nll(logits, labels))
     assert np.isfinite(metrics.brier(logits, labels))
+
+
+def test_magnitude_scores_separate_a_pure_shift_that_msp_cannot_see():
+    """The reason max-logit and energy exist at all.
+
+    OOD here is the ID logit vector shifted by a constant. softmax is
+    shift-invariant, so the two sets have IDENTICAL predictive distributions and
+    MSP is exactly uninformative. The level, which the softmax normalizes away,
+    separates them perfectly. This is the concrete failure mode: an OOD input
+    whose logits are sharply peaked but small in magnitude reads as confident
+    under MSP.
+    """
+    rng = np.random.default_rng(11)
+    id_logits = rng.normal(size=(500, 8)).astype(np.float32) * 3.0
+    ood_logits = id_logits - 8.0  # same softmax, lower level
+
+    # Identical predictive distributions: MSP cannot do better than chance.
+    msp_id = np.asarray(metrics.msp_ood_score(id_logits))
+    msp_ood = np.asarray(metrics.msp_ood_score(ood_logits))
+    np.testing.assert_allclose(msp_id, msp_ood, atol=1e-5)
+    # Not exactly 0.5: the shift is applied in float32, so the two score arrays
+    # agree to 1e-5 without being bit-identical, and near-ties break arbitrarily
+    # instead of each taking the half credit an exact tie would get. The claim
+    # is "no better than chance", not "identical to the last bit".
+    assert detection.auroc(msp_id, msp_ood) == pytest.approx(0.5, abs=0.02)
+
+    # The shift is a constant, so it moves every point's level by the same
+    # amount -- but the levels themselves are spread out, so the two sets
+    # overlap and separation is strong rather than perfect. AUROC is the honest
+    # assertion, and it is what Fig 2 actually reports.
+    for score_fn in (metrics.energy_ood_score, metrics.max_logit_ood_score):
+        auroc = detection.auroc(
+            np.asarray(score_fn(id_logits)), np.asarray(score_fn(ood_logits))
+        )
+        assert auroc > 0.9, f"{score_fn.__name__} should see the level shift (got {auroc:.3f})"
+
+
+def test_magnitude_scores_reject_an_already_normalized_array():
+    """VBLL dumps log(predictive), not logits, under the same logit_kind as the
+    CE arm. logsumexp is then identically 0, which makes energy constant (AUROC
+    exactly 0.5) and max-logit a monotone transform of MSP. Both would return a
+    figure-shaped number, so the degenerate input has to raise."""
+    rng = np.random.default_rng(12)
+    log_probs = np.asarray(
+        nn.log_softmax(jnp.asarray(rng.normal(size=(200, 6)), dtype=jnp.float32), axis=-1)
+    )
+    for score_fn in (metrics.energy_ood_score, metrics.max_logit_ood_score):
+        with pytest.raises(ValueError, match="unnormalized"):
+            score_fn(log_probs)
+
+
+def test_magnitude_scores_accept_ordinary_logits():
+    rng = np.random.default_rng(13)
+    logits = rng.normal(size=(200, 6)).astype(np.float32) * 2.0
+    assert np.all(np.isfinite(np.asarray(metrics.energy_ood_score(logits))))
+    assert np.all(np.isfinite(np.asarray(metrics.max_logit_ood_score(logits))))

@@ -127,3 +127,61 @@ def entropy_ood_score(logits: Any) -> Array:
     logits = _f32(logits)
     log_p = nn.log_softmax(logits, axis=-1)
     return -jnp.sum(jnp.exp(log_p) * log_p, axis=-1)
+
+
+# --- Magnitude-based scores -------------------------------------------------
+#
+# msp/entropy read only the normalized predictive, so they discard the overall
+# level of the logit vector: softmax(z + c) = softmax(z). That level is not
+# noise. Writing log p(k|x) = z_k - logsumexp(z), the softmax keeps the
+# discriminative term and throws away logsumexp(z), which for a cross-entropy
+# classifier behaves like an unnormalized log-density (Grathwohl et al. 2019;
+# Liu et al. 2020). Concretely for a linear probe, z_k = w_k . phi(x) + b_k, so
+# the level tracks ||phi(x)|| and how well the features align with ANY class
+# direction -- OOD inputs often produce a sharply peaked but small logit vector,
+# which MSP scores as confident and these two score as OOD.
+#
+# Both are defined ONLY on unnormalized logits, which is why they are guarded.
+
+
+def _reject_normalized(logits: Array, score_name: str) -> None:
+    """Refuse an already-normalized array. Fails loudly rather than plausibly.
+
+    AdamW+CE and VBLL both dump under logit_kind="softmax_logits", but they are
+    not the same kind of array: CE writes raw pre-softmax logits, while VBLL
+    writes log(predictive) -- already normalized, because VBLL's predictive is a
+    Monte Carlo average of softmax samples and has no single logit vector behind
+    it. On a normalized array logsumexp is identically 0, so `energy_ood_score`
+    is constant (AUROC exactly 0.5) and `max_logit_ood_score` collapses to a
+    monotone transform of MSP (AUROC identical to it). Both return a
+    figure-shaped number instead of an error, so this is checked, not documented.
+    """
+    level = nn.logsumexp(logits, axis=-1)
+    if float(jnp.max(jnp.abs(level))) < 1e-3:
+        raise ValueError(
+            f"{score_name} needs unnormalized logits, but logsumexp is 0 to "
+            f"within 1e-3 on every row -- this array is already a normalized "
+            f"log-predictive (e.g. the VBLL arm's dump). {score_name} is "
+            f"degenerate on it; use msp_ood_score or entropy_ood_score, which "
+            f"are well defined for every arm."
+        )
+
+
+def energy_ood_score(logits: Any) -> Array:
+    """Negative free energy, -logsumexp(z). Higher = more OOD.
+
+    Liu et al. (2020). Unnormalized logits only -- see `_reject_normalized`.
+    """
+    logits = _f32(logits)
+    _reject_normalized(logits, "energy_ood_score")
+    return -nn.logsumexp(logits, axis=-1)
+
+
+def max_logit_ood_score(logits: Any) -> Array:
+    """Negated maximum logit. Higher = more OOD.
+
+    Hendrycks et al. (2022). Unnormalized logits only -- see `_reject_normalized`.
+    """
+    logits = _f32(logits)
+    _reject_normalized(logits, "max_logit_ood_score")
+    return -jnp.max(logits, axis=-1)
