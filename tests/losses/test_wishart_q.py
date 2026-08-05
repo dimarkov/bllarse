@@ -89,6 +89,77 @@ def test_key_is_accepted_but_not_carried():
     assert lf.reset(jr.key(1)).mu.shape == lf.mu.shape
 
 
+@pytest.mark.parametrize("bad", [0.0, -2.0])
+def test_nonpositive_kappa_is_rejected(bad):
+    with pytest.raises(ValueError, match="kappa must be positive"):
+        IBProbit(12, 5, key=jr.key(0), q_init=1e-3, kappa=bad)
+
+
+def _random_state(key, d, K, q_scale=1e-2):
+    """A plausible (Qhat, Lambda_pred, Sigma_new, Delta) tuple."""
+    k1, k2, k3 = jr.split(key, 3)
+    A = jr.normal(k1, (d, d))
+    Sigma_prev = A @ A.T / d + jnp.eye(d)
+    Qhat = q_scale * jnp.eye(d)
+    Lambda_pred = jnp.linalg.inv(Sigma_prev + Qhat)
+    Bm = jr.normal(k2, (d, d))
+    Sigma_new = Bm @ Bm.T / d + 0.5 * jnp.eye(d)
+    Delta = jr.normal(k3, (d, K)) * 0.1
+    return Qhat, Lambda_pred, Sigma_prev, Sigma_new, Delta
+
+
+def test_increment_statistic_vanishes_at_zero_process_noise():
+    """S_t = 0 when Qhat = 0. The naive mean-field statistic returns 2K*Sigma_jj > 0
+    here, which is the level error q-update-spec sec 5.5(a) exists to fix."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3)
+    _, _, Sigma_prev, Sigma_new, Delta = _random_state(jr.key(1), d, K)
+    Qhat = jnp.zeros((d, d))
+    Lambda_pred = jnp.linalg.inv(Sigma_prev)
+    S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    assert jnp.allclose(S, 0.0, atol=1e-9), jnp.abs(S).max()
+
+
+def test_increment_statistic_is_symmetric_psd():
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3)
+    Qhat, Lambda_pred, _, Sigma_new, Delta = _random_state(jr.key(2), d, K)
+    S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    assert jnp.allclose(S, S.T, atol=1e-6)
+    assert (jnp.linalg.eigvalsh(S) > -1e-6).all()
+
+
+def test_increment_statistic_diagonal_matches_the_scalar_spec():
+    """diag(S_t) must equal q-update-spec sec 5.5(a)'s per-component S_{t,j}:
+        S_j = ||(G Delta)_j.||^2 + K [ (G Sigma_{t-1})_jj + (G Sigma_t G')_jj ]"""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3)
+    Qhat, Lambda_pred, Sigma_prev, Sigma_new, Delta = _random_state(jr.key(3), d, K)
+    S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+
+    # precision="highest" because a bare @ runs at TF32 on this GPU while the
+    # implementation pins true F32 -- without it the REFERENCE is the inaccurate side.
+    def hp(a, b):
+        return jnp.matmul(a, b, precision="highest")
+
+    G = hp(Qhat, Lambda_pred)
+    expected = (jnp.sum(hp(G, Delta) ** 2, axis=-1)
+                + K * (jnp.diagonal(hp(G, Sigma_prev))
+                       + jnp.diagonal(hp(hp(G, Sigma_new), G.T))))
+    assert jnp.allclose(jnp.diagonal(S), expected, rtol=1e-4), (
+        jnp.abs(jnp.diagonal(S) - expected).max())
+
+
+def test_increment_statistic_grows_with_real_drift():
+    """A genuine mean shift must enter S_t and not shrink away with Qhat."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3)
+    Qhat, Lambda_pred, _, Sigma_new, Delta = _random_state(jr.key(4), d, K)
+    small = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    large = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, 10.0 * Delta)
+    assert jnp.trace(large) > jnp.trace(small)
+
+
 def test_moderated_predictive_is_the_exact_marginal():
     """q-update-spec sec 5.8: probit composed with a Gaussian conjugates EXACTLY, so
         E_{w ~ N(mu, Sigma + Qhat)}[Phi(w'f)] = Phi(mu'f / sqrt(1 + f'(Sigma + Qhat)f)).

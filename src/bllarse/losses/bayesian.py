@@ -123,6 +123,13 @@ class IBProbit(eqx.Module):
         del key
         self.q0 = q0
         self.kappa = float(num_classes if kappa is None else kappa)
+        if self.kappa <= 0.0:
+            raise ValueError(
+                f"kappa must be positive (got {self.kappa}): nu_0 = d + 1 + kappa and the "
+                "Inverse-Wishart mean Psi/(nu - d - 1) requires nu > d + 1. At kappa == 0 "
+                "the mean is 0/0; at kappa < 0 the scale factor cancels and returns a "
+                "plausible q0 * I for a distribution whose mean does not exist."
+            )
         self.learn_q = bool(learn_q)
         self.warmup = int(warmup)
         self.loss_type = int(loss_type)
@@ -354,6 +361,39 @@ class IBProbit(eqx.Module):
 
         eta_new, _ = lax.scan(step_fn, eta_pred, jnp.arange(num_iters))
         return eta_new
+
+    def _increment_statistic(self, Qhat: Array, Lambda_pred: Array,
+                             Sigma_new: Array, Delta: Array) -> Array:
+        """Expected squared increment S_t = sum_k E[(W_t - W_{t-1})_k (W_t - W_{t-1})_k'].
+
+        q-update-spec sec 5.5(a), kept in matrix form rather than reduced to its
+        diagonal. The mean-field family of sec 3 has no joint over (W_{t-1}, W_t), and
+        taking it literally gives ||Delta||^2 + K[Sigma_t + Sigma_{t-1}]_jj, which
+        stays positive at Q = 0: a model that cannot represent a stationary head will
+        always report that it is moving. The fix is exact and free -- conditional on
+        W_t the increment is independent of the batch (the emission touches only W_t),
+        so its posterior follows from PREDICT alone. With G = Qhat * Lambda_pred:
+
+            E[delta_k]  = G Delta_k
+            Cov(delta)  = G Sigma_{t-1} + G Sigma_t G'
+            S_t = (G Delta)(G Delta)' + K [ G Sigma_{t-1} + G Sigma_t G' ]
+
+        G Sigma_{t-1} is computed as Qhat - Qhat Lambda_pred Qhat, which it equals
+        because Sigma_{t-1} = Lambda_pred^-1 - Qhat. That form is symmetric by
+        inspection and avoids differencing near-equal matrices.
+
+        At Qhat = 0, G = 0 and S_t = 0. S_t is PSD: the first term is a rank-<=K outer
+        product, and Qhat - Qhat Lambda_pred Qhat factors as
+        Qhat^(1/2)(I - Qhat^(1/2) Lambda_pred Qhat^(1/2))Qhat^(1/2), PSD because
+        Lambda_pred = (Sigma_{t-1} + Qhat)^-1 <= Qhat^-1. So Psi stays PD with no
+        jitter. Returns (d, d)."""
+        K = Delta.shape[-1]
+        G = mm_update(Qhat, Lambda_pred)                    # (d,d), not symmetric
+        GD = mm_update(G, Delta)                            # (d,K)
+        A = Qhat - mm_update(G, Qhat)                       # = G Sigma_{t-1}, symmetric
+        Cv = mm_update(mm_update(G, Sigma_new), G.T)        # = G Sigma_t G'
+        S = mm_update(GD, GD.T) + K * (A + Cv)
+        return 0.5 * (S + S.T)
 
     def calibrate(self, features: Array, y: Array, *, num_iters: int = 8, loss_type: int = 2) -> "IBProbit":
         """Temperature scaling via Newton steps on beta, using held-out (val) data.
