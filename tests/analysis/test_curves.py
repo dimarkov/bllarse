@@ -169,3 +169,83 @@ def test_run_curve_omits_val_metrics_when_no_val_dump_exists(tmp_path):
     )
     row = curves.run_curve(tmp_path, "g", "testonly")[0]
     assert "val_nll" not in row
+
+
+def _write_pair_with_score(root, uid, *, id_score, ood_score, score_kind="predictive_variance",
+                           step=1, k=5):
+    """A VBLL-shaped run: log-predictive dumps carrying a native epistemic score."""
+    rng = np.random.default_rng(7)
+    for split, score in (("test", id_score), ("ood", ood_score)):
+        n = len(score)
+        base = rng.normal(size=(n, k)).astype(np.float32)
+        evaldump.write_dump(
+            root, "g", uid, step, base, base.argmax(axis=-1),
+            arm="vbll", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=100,
+            score=np.asarray(score, dtype=np.float32), score_kind=score_kind,
+        )
+
+
+def test_run_native_detection_uses_the_dumped_score_not_the_logits(tmp_path):
+    """The logits here are pure noise and carry no ID/OOD signal at all, so a
+    logit-derived score would score ~0.5. Only the dumped predictive variance
+    separates the two sets -- which is what makes this a real test that the
+    native array is being read rather than silently ignored."""
+    _write_pair_with_score(
+        tmp_path, "n1",
+        id_score=np.linspace(0.0, 1.0, 300),
+        ood_score=np.linspace(5.0, 6.0, 300),   # uniformly higher variance
+    )
+    out = curves.run_native_detection(tmp_path, "g", "n1")
+    assert set(out) == {"auroc", "fpr95", "aupr"}
+    assert out["auroc"] == pytest.approx(1.0), "a fully separated score must give AUROC 1"
+
+    # ...and the shared-score path over the SAME dumps sees nothing, confirming
+    # the separation came from the score array rather than the logits.
+    shared = curves.run_detection(tmp_path, "g", "n1", metrics.msp_ood_score)
+    assert abs(shared["auroc"] - 0.5) < 0.1
+
+
+def test_run_native_detection_raises_when_the_arm_has_no_native_score(tmp_path):
+    """AdamW+CE has no epistemic quantity by construction, so its dumps carry no
+    score. That must be a clear error rather than a crash deep in numpy."""
+    rng = np.random.default_rng(8)
+    for split in ("test", "ood"):
+        base = rng.normal(size=(200, 5)).astype(np.float32)
+        evaldump.write_dump(
+            tmp_path, "g", "n2", 1, base, base.argmax(axis=-1),
+            arm="adamw_ce", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=100,
+        )
+    with pytest.raises(ValueError, match="no native score"):
+        curves.run_native_detection(tmp_path, "g", "n2")
+
+
+def test_run_native_detection_refuses_mismatched_score_kinds(tmp_path):
+    rng = np.random.default_rng(9)
+    for split, kind in (("test", "predictive_variance"), ("ood", "epistemic_term")):
+        base = rng.normal(size=(100, 5)).astype(np.float32)
+        evaldump.write_dump(
+            tmp_path, "g", "n3", 1, base, base.argmax(axis=-1),
+            arm="vbll", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=100,
+            score=rng.random(100).astype(np.float32), score_kind=kind,
+        )
+    with pytest.raises(ValueError, match="score_kind differs"):
+        curves.run_native_detection(tmp_path, "g", "n3")
+
+
+def test_run_native_detection_keeps_the_checkpoint_guard(tmp_path):
+    """Both detection paths share _final_id_ood_pair, so the guard against
+    pairing two different checkpoints must hold for the native path too."""
+    rng = np.random.default_rng(10)
+    for split, step in (("test", 20), ("ood", 5)):
+        base = rng.normal(size=(100, 5)).astype(np.float32)
+        evaldump.write_dump(
+            tmp_path, "g", "n4", step, base, base.argmax(axis=-1),
+            arm="vbll", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=step * 100,
+            score=rng.random(100).astype(np.float32), score_kind="predictive_variance",
+        )
+    with pytest.raises(ValueError, match="different checkpoints"):
+        curves.run_native_detection(tmp_path, "g", "n4")
