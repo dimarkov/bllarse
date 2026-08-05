@@ -146,6 +146,17 @@ def main(args, on_dump=None):
             f"{len(x_train)}; this would train zero gradient steps per epoch. "
             f"Lower --batch-size or provide more training data."
         )
+    # Loaded once, before the loop: the OOD set is dumped at EVERY eval step, so
+    # re-reading the feature file per dump would cost more than the forward pass
+    # it feeds.
+    ood_f = ood_l = None
+    if args.ood_dataset:
+        ood_f, ood_l = load_cached_features(
+            args.cache_dir, args.model, args.ood_dataset, args.img_size,
+            eval_split_name(args.ood_dataset), hf_repo=hf_repo,
+        )
+        print(f"[vbll] OOD set {args.ood_dataset}: {len(ood_f)} samples")
+
     total_steps = args.epochs * n_batches
     schedule = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
     print(
@@ -204,6 +215,23 @@ def main(args, on_dump=None):
                         seed=args.seed, samples_seen=samples_seen,
                         score=score[sp_idx], score_kind="predictive_variance",
                     )
+                # OOD at every eval step, not only the last -- see the matching
+                # note in scripts/alternatives/probe.py. A single endpoint dump
+                # forced Fig 2's detection metrics to be read at a step no arm
+                # was tuned at, and the arms drift from that step by very
+                # different amounts.
+                if ood_f is not None:
+                    ood_logits, ood_score = _forward(
+                        head, ood_f, device, args.predictive_samples
+                    )
+                    head.train()
+                    evaldump.write_dump(
+                        args.dump_root, args.group_id, args.uid, step,
+                        ood_logits, ood_l,
+                        arm="vbll", split="ood", logit_kind="softmax_logits",
+                        seed=args.seed, samples_seen=samples_seen,
+                        score=ood_score, score_kind="predictive_variance",
+                    )
                 scalars = report_step(
                     run, step, samples_seen, epoch,
                     logits[test_idx], eval_l[test_idx],
@@ -217,20 +245,8 @@ def main(args, on_dump=None):
                     on_dump(dump_index, step, scalars)
                 dump_index += 1
 
-        if args.ood_dataset:
-            ood_f, ood_l = load_cached_features(
-                args.cache_dir, args.model, args.ood_dataset, args.img_size,
-                eval_split_name(args.ood_dataset), hf_repo=hf_repo,
-            )
-            ood_logits, ood_score = _forward(head, ood_f, device, args.predictive_samples)
-            evaldump.write_dump(
-                args.dump_root, args.group_id, args.uid, total_steps,
-                ood_logits, ood_l,
-                arm="vbll", split="ood", logit_kind="softmax_logits",
-                seed=args.seed, samples_seen=total_steps * args.batch_size,
-                score=ood_score, score_kind="predictive_variance",
-            )
-            print(f"[vbll] wrote OOD dump for {args.ood_dataset} ({len(ood_f)} samples)")
+        if ood_f is not None:
+            print(f"[vbll] wrote {len(schedule)} OOD dumps for {args.ood_dataset}")
 
 
 def build_argparser():

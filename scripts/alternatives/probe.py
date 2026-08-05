@@ -169,6 +169,17 @@ def main(args, on_dump=None):
     optimizer = optax.adamw(args.learning_rate, weight_decay=args.weight_decay)
     opt_state = optimizer.init(eqx.filter(head, eqx.is_array))
 
+    # Loaded once, before the loop: the OOD set is dumped at EVERY eval step
+    # (see the write below), and re-reading the feature file per dump would cost
+    # more than the forward pass it feeds.
+    ood_f = ood_l = None
+    if args.ood_dataset:
+        ood_f, ood_l = load_cached_features(
+            args.cache_dir, args.model, args.ood_dataset, img_size,
+            eval_split_name(args.ood_dataset), hf_repo=hf_repo,
+        )
+        print(f"[probe] OOD set {args.ood_dataset}: {len(ood_f)} samples")
+
     per_epoch = steps_per_epoch(len(train_f), args.batch_size)
     total_steps = args.epochs * per_epoch
     schedule = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
@@ -210,6 +221,22 @@ def main(args, on_dump=None):
                         arm=args.arm, split=split_name, logit_kind="softmax_logits",
                         seed=args.seed, samples_seen=samples_seen,
                     )
+                # OOD at every eval step, not only the last. This used to be a
+                # single dump at total_steps, on the grounds that "Fig 2 is a
+                # converged-endpoint figure" -- but these runs carry no early
+                # stopping, and the endpoint is not where the configuration was
+                # tuned. AdamW+CE on cifar100 peaks at step 1,786 of 30,000 and
+                # then nearly triples its NLL, so scoring detection at the last
+                # step measured that overfitting rather than the method. With a
+                # dump per step, detection can be read at the same step as any
+                # other metric, including the val-optimal one.
+                if ood_f is not None:
+                    evaldump.write_dump(
+                        args.dump_root, args.group_id, args.uid, step,
+                        _logits_for(head, loss_fn, ood_f, ood_l), ood_l,
+                        arm=args.arm, split="ood", logit_kind="softmax_logits",
+                        seed=args.seed, samples_seen=samples_seen,
+                    )
                 scalars = report_step(
                     run, step, samples_seen, epoch,
                     logits[test_idx], eval_l[test_idx],
@@ -223,20 +250,8 @@ def main(args, on_dump=None):
                     on_dump(dump_index, step, scalars)
                 dump_index += 1
 
-        # OOD dump: final point only. Fig 2 is a converged-endpoint figure.
-        if args.ood_dataset:
-            ood_f, ood_l = load_cached_features(
-                args.cache_dir, args.model, args.ood_dataset, img_size,
-                eval_split_name(args.ood_dataset), hf_repo=hf_repo,
-            )
-            ood_logits = _logits_for(head, loss_fn, ood_f, ood_l)
-            evaldump.write_dump(
-                args.dump_root, args.group_id, args.uid, total_steps,
-                ood_logits, ood_l,
-                arm=args.arm, split="ood", logit_kind="softmax_logits",
-                seed=args.seed, samples_seen=total_steps * args.batch_size,
-            )
-            print(f"[probe] wrote OOD dump for {args.ood_dataset} ({len(ood_f)} samples)")
+        if ood_f is not None:
+            print(f"[probe] wrote {len(schedule)} OOD dumps for {args.ood_dataset}")
 
 
 def build_argparser():

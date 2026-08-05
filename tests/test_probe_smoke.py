@@ -102,9 +102,22 @@ def test_probe_dumps_ood_scores_when_an_ood_dataset_is_given(fake_features, tmp_
     ])
     probe.main(args)
 
-    ood = [r for r in evaldump.iter_dumps(tmp_path / "dumps", "smoke", "smoke_ood")
-           if r.meta["split"] == "ood"]
-    assert len(ood) == 1, "OOD is dumped at the final point only"
+    dumps = list(evaldump.iter_dumps(tmp_path / "dumps", "smoke", "smoke_ood"))
+    ood_steps = sorted(r.meta["step"] for r in dumps if r.meta["split"] == "ood")
+    test_steps = sorted(r.meta["step"] for r in dumps if r.meta["split"] == "test")
+
+    # This asserted a single endpoint dump. That forced Fig 2's detection
+    # metrics to be read at the last step -- the only one with an OOD dump --
+    # even though these runs have no early stopping and the arms drift from
+    # their tuned operating point by very different amounts (AdamW+CE on
+    # cifar100 nearly triples its NLL after step 1,786 of 30,000; VBLL moves by
+    # 0.0003). One OOD dump per eval step lets detection be scored at the same
+    # step as every other metric.
+    assert ood_steps == test_steps, (
+        "OOD must be dumped at exactly the eval steps the test split is, so the "
+        "two can always be paired without comparing different checkpoints"
+    )
+    assert len(ood_steps) == 3
 
 
 def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(

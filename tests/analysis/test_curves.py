@@ -249,3 +249,43 @@ def test_run_native_detection_keeps_the_checkpoint_guard(tmp_path):
         )
     with pytest.raises(ValueError, match="different checkpoints"):
         curves.run_native_detection(tmp_path, "g", "n4")
+
+
+def _write_trajectory_with_ood(root, uid, steps, *, n=300, k=5):
+    """A run dumping test AND ood at every step, as the probe scripts now do."""
+    rng = np.random.default_rng(21)
+    for step in steps:
+        for split, sep in (("test", 4.0), ("val", 4.0), ("ood", 0.0)):
+            base = rng.normal(size=(n, k)).astype(np.float32)
+            # Separation grows with the step, so scoring at an early step must
+            # give a different answer from scoring at the last one.
+            base[:, 0] += sep * step / max(steps)
+            evaldump.write_dump(
+                root, "g", uid, step, base, base.argmax(axis=-1),
+                arm="adamw_ce", split=split, logit_kind="softmax_logits",
+                seed=137, samples_seen=step * 10,
+            )
+
+
+def test_run_detection_can_score_at_a_chosen_step(tmp_path):
+    """The endpoint is not automatically the right place to score: these runs
+    have no early stopping, so an arm that overfits is a different model at the
+    last step than at the one its hyperparameters were selected at."""
+    steps = [1, 5, 20]
+    _write_trajectory_with_ood(tmp_path, "t1", steps)
+
+    early = curves.run_detection(tmp_path, "g", "t1", metrics.msp_ood_score, step=1)
+    late = curves.run_detection(tmp_path, "g", "t1", metrics.msp_ood_score, step=20)
+    default = curves.run_detection(tmp_path, "g", "t1", metrics.msp_ood_score)
+
+    assert default == late, "no step means the final step"
+    assert early["auroc"] != late["auroc"], "scoring step must actually change the result"
+
+
+def test_run_detection_at_a_missing_step_says_what_is_available(tmp_path):
+    """Runs written before the OOD dump moved into the eval loop have only their
+    final step. Falling back to it silently would report a number from a
+    different checkpoint than the caller asked for."""
+    _write_trajectory_with_ood(tmp_path, "t2", [1, 5, 20])
+    with pytest.raises(ValueError, match="no test dump at step 7"):
+        curves.run_detection(tmp_path, "g", "t2", metrics.msp_ood_score, step=7)

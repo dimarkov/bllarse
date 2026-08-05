@@ -106,31 +106,53 @@ def run_curve(
     return rows
 
 
-def _final_id_ood_pair(root, group_id: str, uid: str) -> tuple[Any, Any]:
-    """The (test, ood) dump records at the final step, or raise saying why not."""
+def _id_ood_pair(root, group_id: str, uid: str, step: int | None = None) -> tuple[Any, Any]:
+    """The (test, ood) dump records at `step`, or at the final step if None.
+
+    `step` exists because the endpoint is not automatically the right place to
+    score. These runs carry no early stopping, and an arm that overfits is a
+    different model at the last step than at the one its hyperparameters were
+    selected at -- so a caller comparing arms should be able to ask for the
+    val-optimal step instead. Runs written before the OOD dump moved into the
+    eval loop have only the final step available, and asking for any other
+    raises rather than silently falling back to it.
+    """
     indexed = _by_split(root, group_id, uid)
     if "ood" not in indexed:
         raise ValueError(f"no ood-split dump found for {group_id}/{uid}")
     if "test" not in indexed:
         raise ValueError(f"no test-split dump found for {group_id}/{uid}")
 
-    id_step, ood_step = max(indexed["test"]), max(indexed["ood"])
-    if id_step != ood_step:
-        # Pairing scores from two different checkpoints would produce a
-        # plausible-looking AUROC that means nothing. A partial write or a
-        # changed eval schedule is the likely cause.
-        raise ValueError(
-            f"{group_id}/{uid}: final test dump is at step {id_step} but the "
-            f"final ood dump is at step {ood_step}; detection would compare "
-            f"different checkpoints"
-        )
-    return indexed["test"][id_step], indexed["ood"][ood_step]
+    if step is None:
+        id_step, ood_step = max(indexed["test"]), max(indexed["ood"])
+        if id_step != ood_step:
+            # Pairing scores from two different checkpoints would produce a
+            # plausible-looking AUROC that means nothing. A partial write or a
+            # changed eval schedule is the likely cause.
+            raise ValueError(
+                f"{group_id}/{uid}: final test dump is at step {id_step} but the "
+                f"final ood dump is at step {ood_step}; detection would compare "
+                f"different checkpoints"
+            )
+        return indexed["test"][id_step], indexed["ood"][ood_step]
+
+    for split in ("test", "ood"):
+        if step not in indexed[split]:
+            available = sorted(indexed[split])
+            raise ValueError(
+                f"{group_id}/{uid}: no {split} dump at step {step}. Available: "
+                f"{available[:3]}...{available[-1] if available else '-'} "
+                f"({len(available)} steps). A run written before the OOD dump "
+                f"moved into the eval loop has only its final step."
+            )
+    return indexed["test"][step], indexed["ood"][step]
 
 
 def run_detection(
-    root, group_id: str, uid: str, score_fn: Callable[[Any], Any]
+    root, group_id: str, uid: str, score_fn: Callable[[Any], Any],
+    step: int | None = None,
 ) -> dict[str, float]:
-    """Detection metrics at the final dumped point, from a shared score function.
+    """Detection metrics from a shared score function, at `step` (default: last).
 
     `score_fn` maps logits to a score under the project convention that higher
     means more OOD -- metrics.msp_ood_score or metrics.entropy_ood_score. Passing
@@ -140,13 +162,15 @@ def run_detection(
     This is Fig 2's PRIMARY comparison. `run_native_detection` answers the
     different question of whether each method's own epistemic quantity works.
     """
-    id_record, ood_record = _final_id_ood_pair(root, group_id, uid)
+    id_record, ood_record = _id_ood_pair(root, group_id, uid, step)
     return detection.detection_metrics(
         score_fn(id_record.logits), score_fn(ood_record.logits)
     )
 
 
-def run_native_detection(root, group_id: str, uid: str) -> dict[str, float]:
+def run_native_detection(
+    root, group_id: str, uid: str, step: int | None = None
+) -> dict[str, float]:
     """Detection metrics from the arm's OWN dumped epistemic score.
 
     Not a substitute for `run_detection` -- it deliberately breaks the
@@ -160,7 +184,7 @@ def run_native_detection(root, group_id: str, uid: str) -> dict[str, float]:
     native quantity (VBLL's predictive variance, IBProbit's epistemic term) and
     only the training script can produce it.
     """
-    id_record, ood_record = _final_id_ood_pair(root, group_id, uid)
+    id_record, ood_record = _id_ood_pair(root, group_id, uid, step)
     for record, side in ((id_record, "test"), (ood_record, "ood")):
         if record.score is None:
             raise ValueError(
