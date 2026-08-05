@@ -8,19 +8,25 @@ not this grid, and are listed only for the size spread the project spans):
 
     | dataset             | n_train    |
     |---------------------|-----------:|
+    | flowers102          |      1,020 |
     | oxford_pets         |      3,680 |
     | dtd                 |      3,760 |
-    | flowers102          |      7,169 |
     | stanford_cars       |      8,144 |
     | cifar10 / cifar100  |     50,000 |
     | food101             |     75,750 |
 
+flowers102 is 1,020, NOT the 7,169 this table used to say: that figure was the
+upstream config's "train" split, which is really val+test and is now the eval
+pool. See bllarse.features._TRAIN_SPLIT.
+
 imagenet1k is deliberately absent: it is a full-network finetuning dataset only
 and will be retuned separately for that.
 
-The steps/epoch and total-step columns this docstring used to carry are gone
-because batch_size and epochs are no longer sweep-wide constants -- both are
-resolved per dataset from bllarse_sweeps/tuned_hparams.json.
+batch_size and epochs are per dataset, not sweep-wide, so there is no meaningful
+steps/epoch column for the whole grid. (An earlier version of this docstring
+promised they were read from bllarse_sweeps/tuned_hparams.json; that file was
+never written, and the values live in TUNED below. Fig 1's datasets and Fig 2's
+are disjoint, so nothing is duplicated by holding them here.)
 """
 
 from itertools import product
@@ -39,15 +45,34 @@ DATASETS = {
 }
 SEEDS = list(range(137, 147))  # 10 seeds
 
+# tune_adamw_ce_<dataset>, best trial by val_nll. `epochs` expresses the
+# campaign's fixed 30,000-step budget at that trial's batch size -- it is a
+# restatement of the budget, not an independent knob, so epochs and batch_size
+# must be changed together or not at all.
+#
+# Tuned at dinov3_huge only and applied across all four rungs. space.py accepts
+# this deliberately (the backbones emit 384/768/1024/1280-dim features, so a
+# config optimal at one is not guaranteed optimal at another) on the grounds
+# that the paper's arguments centre on huge. It has to be stated in the paper
+# rather than buried -- the non-huge rungs are not independently tuned.
+TUNED = {
+    "oxford_pets": dict(batch_size=128, learning_rate=0.0022431794946575047,
+                        weight_decay=0.09213439181199469, epochs=1072),
+    "food101": dict(batch_size=512, learning_rate=0.00185267542687323,
+                    weight_decay=0.028923149962120948, epochs=205),
+    "flowers102": dict(batch_size=256, learning_rate=0.029852910202981524,
+                       weight_decay=0.05834095151443068, epochs=10000),
+    "stanford_cars": dict(batch_size=1024, learning_rate=0.0038738131845282697,
+                          weight_decay=0.09787226845735203, epochs=4286),
+    "dtd": dict(batch_size=64, learning_rate=0.006377989537373754,
+                weight_decay=0.01477022869531366, epochs=518),
+}
+
 BASE = dict(
     enable_mlflow=True,
     mlflow_experiment="bllarse-probing",
     arm="adamw_ce",
-    epochs=40,
     n_dumps=40,
-    batch_size=512,
-    learning_rate=1e-3,
-    weight_decay=1e-4,
     val_fraction=0.1,
 )
 
@@ -59,6 +84,7 @@ def create_configs():
     ):
         configs.append(dict(
             **BASE,
+            **TUNED[dataset],
             model=model,
             dataset=dataset,
             num_classes=num_classes,

@@ -52,11 +52,36 @@ def test_fig1_sweeps_exclude_imagenet(path):
 
 
 @pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])
-def test_fig2_sweep_sizes_match_the_plan(path):
-    # 4 backbones x 3 (ID, OOD) pairs x 10 seeds.
-    # Three pairs, not two ID datasets: CIFAR-10 appears twice, against SVHN
-    # (far-OOD) and against CIFAR-100 (near-OOD).
-    assert len(get_module_from_source_path(path).create_configs()) == 120
+def test_fig2_sweep_sizes_match_its_backbone_list(path):
+    """|MODELS| x 3 (ID, OOD) pairs x 10 seeds.
+
+    Three pairs, not two ID datasets: CIFAR-10 appears twice, against SVHN
+    (far-OOD) and against CIFAR-100 (near-OOD).
+
+    This asserted a flat 120 -- the full four-backbone ladder. It is reduced to
+    dinov3_huge because that is the only backbone the kl_ratio campaign TUNED,
+    and Fig 2 (unlike Fig 1) has no backbone axis, so three extra untuned rungs
+    would quadruple the compute without adding an axis to the figure. Features
+    for all four rungs do exist on Raven -- the ladder is a compute decision,
+    not a data one. Deriving the count from the module's own MODELS keeps the
+    arithmetic pinned while letting the ladder be restored by editing one list.
+    """
+    mod = get_module_from_source_path(path)
+    assert len(mod.create_configs()) == len(mod.MODELS) * 3 * len(mod.SEEDS)
+
+
+@pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])
+def test_fig2_arms_cover_identical_backbones_and_pairs(path):
+    """The two arms must sweep the same grid or the comparison is not matched.
+
+    Checked per-arm against a fixed expectation rather than by diffing the two
+    modules, so that editing BOTH arms in the same wrong way still fails.
+    """
+    configs = get_module_from_source_path(path).create_configs()
+    assert {c["model"] for c in configs} == {"dinov3_huge"}
+    assert {(c["dataset"], c["ood_dataset"]) for c in configs} == {
+        ("cifar10", "svhn"), ("cifar10", "cifar100"), ("cifar100", "svhn"),
+    }
 
 
 @pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])

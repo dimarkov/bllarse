@@ -260,9 +260,13 @@ def build_argparser():
         help="eta / prior_scale, where eta is the KL multiplier in "
              "regularization_weight = eta / N. The default 1.0 combined with "
              "the default --prior-scale 1.0 gives eta = 1, the textbook ELBO "
-             "and this script's previous behaviour. Measured optimum is ~1e-5: "
-             "vbll needs a strongly tempered posterior to be competitive, which "
-             "is a finding about the method, not a tuning detail.",
+             "and this script's previous behaviour. There is no single measured "
+             "optimum: across the seven tuned datasets it spans 2.3e-7 to "
+             "2.5e-3, with the coarse 10/100-class sets tolerating ~1e-3 and the "
+             "fine-grained ones wanting ~1e-7. The corresponding eta spans 9e-8 "
+             "to 1.19, so 'vbll needs a strongly tempered posterior' holds for "
+             "most datasets but not all -- cifar10's optimum sits essentially at "
+             "the untempered eta = 1.",
     )
     p.add_argument(
         "--predictive-samples", type=int, default=200,
