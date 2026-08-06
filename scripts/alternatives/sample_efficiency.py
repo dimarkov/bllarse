@@ -233,7 +233,7 @@ def _eval_batches(loss_fn, features, labels, eval_batch_size, loss_type, head=No
 # ── IBProbit helpers ─────────────────────────────────────────────────────────
 
 @eqx.filter_jit
-def _ibprobit_update_scan(loss_fn, features, labels, num_update_iters, alpha, update_method="update"):
+def _ibprobit_update_scan(loss_fn, features, labels, num_update_iters, update_method="update"):
     """Run sequential IBProbit updates over stacked sub-batches using lax.scan.
 
     Args:
@@ -248,7 +248,7 @@ def _ibprobit_update_scan(loss_fn, features, labels, num_update_iters, alpha, up
     def step(dynamic, batch):
         f, l = batch
         loss_fn = eqx.combine(dynamic, static)
-        new_loss_fn = getattr(loss_fn, update_method)(f, l, num_iters=num_update_iters, alpha=alpha)
+        new_loss_fn = getattr(loss_fn, update_method)(f, l, num_iters=num_update_iters)
         new_dynamic, _ = eqx.partition(new_loss_fn, eqx.is_array)
         return new_dynamic, None
 
@@ -267,9 +267,6 @@ def run_ibprobit_sequential(
 ):
     """Retrain from scratch at each step on all accumulated data.
 
-    alpha is set automatically to ibprobit_batch_size / n_samples so that
-    each mini-batch contributes proportionally to the posterior update.
-
     Returns list of dicts with keys: n_samples, train_acc/ece/nll, test_acc/ece/nll, beta.
     """
     label = {"update": "IBProbit", "update_cavi": "IBProbit (CAVI-EMA)", "update_bmr": "IBProbit (BMR)"}.get(update_method, update_method)
@@ -285,8 +282,6 @@ def run_ibprobit_sequential(
         step_end  = (step + 1) * step_size
         n_samples = step_end
 
-        alpha = 1e-2 * ibprobit_batch_size / n_samples
-
         # Reset from scratch and train on all accumulated data
         key, step_key = jr.split(key)
         # pre-Wishart default; this script is not part of the q study
@@ -298,8 +293,8 @@ def run_ibprobit_sequential(
         acc_f = jnp.array(train_features[acc_indices[:used]]).reshape(n_sub, ibprobit_batch_size, -1)
         acc_l = jnp.array(train_labels  [acc_indices[:used]]).reshape(n_sub, ibprobit_batch_size)
 
-        print(f"\nStep {step + 1}/{max_batches} | n_samples={n_samples:,} | alpha={alpha:.4f} | updating...")
-        loss_fn = _ibprobit_update_scan(loss_fn, acc_f, acc_l, num_update_iters, alpha, update_method)
+        print(f"\nStep {step + 1}/{max_batches} | n_samples={n_samples:,} | updating...")
+        loss_fn = _ibprobit_update_scan(loss_fn, acc_f, acc_l, num_update_iters, update_method)
 
         # Temperature scaling on a subsample of training data, sized to match the test set
         val_nll_before = val_nll_after = float("nan")

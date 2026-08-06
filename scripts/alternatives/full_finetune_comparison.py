@@ -520,7 +520,7 @@ def probe_micro_batch_size(backbone, args, embed_dim, num_classes, img_size,
     last_ok = None
     while bs <= max_bs:
         try:
-            loss_fn = build_ibprobit(args, embed_dim, num_classes, key)
+            loss_fn = build_ibprobit(args, embed_dim, num_classes, key, batch_size=bs)
             images = jnp.zeros((bs, 3, img_size, img_size), dtype=jnp.float32)
             labels = jnp.zeros((bs,), dtype=jnp.int32)
             if args.optimizer in ("ivon", "evon") and args.estimator == "hutchinson":
