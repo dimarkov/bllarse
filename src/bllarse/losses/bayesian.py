@@ -136,7 +136,16 @@ class IBProbit(eqx.Module):
         # storing it either.
         del key
         self.q0 = q0
-        self.kappa = float(num_classes if kappa is None else kappa)
+        # kappa defaults to 0.5, NOT the num_classes this class first shipped with. At
+        # kappa = K the prior carries a full batch's worth of transition evidence every
+        # step, which pins Q at its q0 seed: the recursion is already dominated by the
+        # K*Qhat covariance floor (an exact fixed point), and a K-weight prior on top
+        # removes what little room the O(Qhat^2) drift term had. At kappa = 0.5 the
+        # prior carries half a pseudo-observation against K real ones, so the
+        # likelihood dominates and Q is free to move. The prior MEAN is unchanged --
+        # Psi_0/kappa = q0 * I for any kappa -- so this shifts only the prior's weight,
+        # not the operating point it starts from.
+        self.kappa = float(0.5 if kappa is None else kappa)
         if self.kappa <= 0.0:
             raise ValueError(
                 f"kappa must be positive (got {self.kappa}): nu_0 = d + 1 + kappa and the "
@@ -177,8 +186,9 @@ class IBProbit(eqx.Module):
         """Isotropic Inverse-Wishart prior on Q with E_0[Q] = q0 * I.
 
         With nu_0 = d + 1 + kappa the mean is Psi_0 / (nu_0 - d - 1) = Psi_0 / kappa,
-        so Psi_0 = q0 * kappa * I. kappa is the prior pseudo-count, defaulting to K so
-        the prior carries the weight of one batch's worth of transition evidence."""
+        so Psi_0 = q0 * kappa * I. kappa is the prior pseudo-count, defaulting to 0.5 --
+        half a pseudo-observation against the K the likelihood contributes per step, so
+        the data dominates. The mean is q0 * I for every kappa; only the weight moves."""
         d = self.mu.shape[0] if d is None else d
         Psi0 = (self.q0 * self.kappa) * jnp.eye(d, dtype=jnp.float32)
         nu0 = jnp.asarray(d + 1.0 + self.kappa, dtype=jnp.float32)

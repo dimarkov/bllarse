@@ -1112,7 +1112,7 @@ def build_argparser():
     parser.add_argument("--q-init", type=float, default=None,
                         help="override q0 directly; pass 1/D to reproduce the pre-Wishart regime")
     parser.add_argument("--kappa", type=float, default=None,
-                        help="Inverse-Wishart prior pseudo-count (default: num_classes, i.e. one batch's weight)")
+                        help="Inverse-Wishart prior pseudo-count (default: 0.5, i.e. half a pseudo-observation against the K the likelihood adds per step)")
     parser.add_argument("--warmup", type=int, default=1,
                         help="defer the gate and the q recursion for the first N steps (the mu=0 seed is uninformative)")
     parser.add_argument("--eps-init", type=float, default=0.01,

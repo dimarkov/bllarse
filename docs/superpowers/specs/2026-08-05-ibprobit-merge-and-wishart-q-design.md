@@ -168,9 +168,19 @@ Seeded isotropically at the spec's derived scale. With `nu_0 = d + 1 + kappa`:
 
 ```
 Psi_0 = q_0 * kappa * I            so  E_0[Q] = q_0 * I
-q_0   = alpha^2 / B                (q-update-spec §5.5e), alpha default 1e-3
-kappa = K                          prior carries the weight of one batch
+q_0   = alpha^2 / B                (q-update-spec §5.5e), alpha default 0.1
+kappa = 0.5                        prior stays lighter than one batch
 ```
+
+Both defaults moved off their originally specified values (`alpha = 1e-3`,
+`kappa = K`) in response to §4.8. `alpha` sets where `q_0` sits; `kappa` sets how
+hard the prior holds it there. At `kappa = K` the prior contributes as much
+transition evidence per step as the entire batch, compounding the covariance floor
+that already pins `Q`. At `kappa = 0.5` it contributes half a pseudo-observation
+against `K` real ones, so the likelihood dominates. Note `kappa` scales `Psi_0` and
+`nu_0` together, so `E_0[Q] = q_0 * I` regardless — this changes the prior's weight,
+never the point it starts from. `nu_0 = d + 1.5` sits just above the `nu > d + 1`
+bound, so early-step `Qhat` is admissible but high-variance.
 
 `q_init` overrides `q_0` so the old `1/D` regime stays reachable for the §12.5 A/B.
 `nu_t` only ever grows from `nu_0` by convex combination plus `K`, so `nu > d + 1`
@@ -179,9 +189,9 @@ holds for all `t` by construction and the mean never fails to exist.
 Constructor changes, relative to the ported signature:
 
 ```
-added:    alpha: float = 1e-3          prior scale, q_0 = alpha^2 / batch_size
+added:    alpha: float = 0.1           prior scale, q_0 = alpha^2 / batch_size
           batch_size: int              B; required when q_init is not given
-          kappa: float = None          prior pseudo-count, defaults to num_classes
+          kappa: float = None          prior pseudo-count, defaults to 0.5
 removed:  sigma_z2_init, hyper_lr, anchor_weight, anchor_mode, bmr_gate, learn_eps
 renamed:  bmr_warmup -> warmup         default 1, so the mu=0 seed step is skipped
 kept:     q_init (overrides q_0), eps_init, rho, px, loss_type, learn_q (new meaning)

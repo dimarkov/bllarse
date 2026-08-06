@@ -48,11 +48,19 @@ def test_alpha_default_is_off_the_inert_operating_point():
     assert old.q0 == pytest.approx(1e-6 / B)
 
 
-def test_kappa_defaults_to_num_classes():
+def test_kappa_default_leaves_the_prior_outweighed_by_the_data():
+    """The kappa default is load-bearing, so pin it. At kappa = K the prior contributes
+    as much transition evidence per step as the whole batch does, which holds Q at its
+    q0 seed on top of the covariance floor that already does so. The default is 0.5 --
+    half a pseudo-observation against K real ones -- so the likelihood dominates."""
     D, K, B = 12, 5, 32
     lf = IBProbit(D, K, key=jr.key(0), alpha=1e-3, batch_size=B)
-    assert lf.kappa == float(K)
-    assert float(lf.nu) == pytest.approx(D + 1 + 1 + K)   # d = D + 1 with bias
+    assert lf.kappa == 0.5, f"default kappa appears to have changed: {lf.kappa}"
+    assert lf.kappa < K, "the prior must stay lighter than one batch of evidence"
+    assert float(lf.nu) == pytest.approx(D + 1 + 1 + 0.5)   # d = D + 1 with bias
+    # kappa scales Psi_0 and nu_0 together, so the prior mean is q0 * I regardless
+    d, q0 = D + 1, 1e-6 / B
+    assert jnp.allclose(lf.Qhat, q0 * jnp.eye(d), rtol=1e-5)
 
 
 def test_pc_prior_mean_is_one_minus_rho():
