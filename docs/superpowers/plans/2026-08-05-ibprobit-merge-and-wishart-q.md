@@ -1600,8 +1600,11 @@ The block is `ood_evaluation.py:451-472`, `full_finetune_comparison.py:1099-1118
                    help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
     p.add_argument("--no-learn-q", action="store_true",
                    help="hold Q at its isotropic prior q0*I (the ablation arm); default infers it")
-    p.add_argument("--alpha", type=float, default=1e-3,
-                   help="prior scale on the process noise: q0 = alpha^2 / batch_size (q-update-spec 5.5e)")
+    p.add_argument("--alpha", type=float, default=0.1,
+                   help="prior scale on the process noise: q0 = alpha^2 / batch_size "
+                        "(q-update-spec 5.5e). At alpha=1e-3 the q recursion is inert "
+                        "(learn_q on/off give identical mu); 0.1 puts q0 near the "
+                        "pre-Wishart 1/D operating point.")
     p.add_argument("--q-init", type=float, default=None,
                    help="override q0 directly; pass 1/D to reproduce the pre-Wishart regime")
     p.add_argument("--kappa", type=float, default=None,
