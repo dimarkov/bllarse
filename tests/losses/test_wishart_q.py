@@ -475,3 +475,41 @@ def test_increment_statistic_drift_term_responds_to_delta():
     base = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
     moved = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, 5.0 * Delta)
     assert float(jnp.trace(moved)) > float(jnp.trace(base))
+
+
+def test_eps_responsibility_uses_the_psi_form():
+    """sec 5.2: r_i = sigmoid(E[log(1-eps)] - E[log eps] + log phat + log K), with the
+    expectations under the Beta -- NOT its mean. Makes the update an exact stationary
+    point of the free energy."""
+    from jax.scipy.special import digamma
+    import equinox as eqx
+
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, eps_init=0.05)
+    lf = eqx.tree_at(lambda m: (m.eps_alpha, m.eps_beta), lf,
+                     (jnp.float32(3.0), jnp.float32(97.0)))
+    loss_vec = jnp.array([0.1, 2.0, 8.0], dtype=jnp.float32)
+
+    dig_ab = digamma(lf.eps_alpha + lf.eps_beta)
+    E_log_eps = digamma(lf.eps_alpha) - dig_ab
+    E_log_1meps = digamma(lf.eps_beta) - dig_ab
+    from jax import nn as jnn
+    expected = jnn.sigmoid(E_log_1meps - E_log_eps - loss_vec + jnp.log(K))
+
+    got = lf._eps_responsibility(loss_vec)
+    assert got.shape == (3, 1)
+    assert jnp.allclose(got[:, 0], expected, atol=1e-6)
+
+
+def test_eps_responsibility_orders_by_fit():
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, eps_init=0.05)
+    r = lf._eps_responsibility(jnp.array([0.01, 1.0, 20.0], dtype=jnp.float32))[:, 0]
+    assert r[0] > r[1] > r[2]
+    assert (r > 0).all() and (r < 1).all()
+
+
+def test_dead_helpers_are_gone():
+    lf = IBProbit(9, 4, key=jr.key(0), q_init=1e-3)
+    assert not hasattr(lf, "_gate_from_logits")
+    assert not hasattr(lf, "_preq_objective")

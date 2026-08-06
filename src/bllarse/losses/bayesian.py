@@ -208,14 +208,6 @@ class IBProbit(eqx.Module):
         the mean of the conjugate Beta posterior (fixed at eps_init when eps is not learned)."""
         return self.eps_alpha / (self.eps_alpha + self.eps_beta)
 
-    @property
-    def use_eps(self) -> bool:
-        """Static: whether the eps-contamination mixture floors the SCORING predictive.
-        The contamination rate is always estimated (the mixture is structural in the
-        recursion); ``eps_init <= 0`` only opts __call__ out of the floored predictive,
-        which is how the bare moderated probit stays testable."""
-        return self.eps_init > 0.0
-
     def _eps_seed(self) -> Tuple[float, float]:
         """Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init)."""
         return 1.0, (1.0 / self.eps_init if self.eps_init > 0.0 else 100.0)
@@ -546,9 +538,8 @@ class IBProbit(eqx.Module):
         raw = self._predictive_logits(features)
         loss_vec = self._loss_from_logits(raw, y_one_hot)[0]
 
-        # 1-2. q(s) then q(eps). The two-argument _eps_responsibility is the ported
-        # Beta-mean form; Task 8 replaces it with the psi-form and drops the argument.
-        r = self._eps_responsibility(loss_vec, self.eps)             # (n,1)
+        # 1-2. q(s) then q(eps): the psi-form responsibility (sec 5.2).
+        r = self._eps_responsibility(loss_vec)                       # (n,1)
         a0, b0 = self._eps_seed()
         r_flat = r[:, 0]
         eps_alpha_new = a0 + self.rho * (self.eps_alpha - a0) + jnp.sum(1.0 - r_flat)
@@ -659,26 +650,27 @@ class IBProbit(eqx.Module):
 
         return loss, self.beta * logits
 
-    def _gate_from_logits(self, raw: Array, y: Array) -> Array:
-        """The submitted paper's fixed-1/2 BMR gate, from the raw moderated predictive
-        evaluated at the TRUE label: g_i = Phi(mu~_i) / (Phi(mu~_i) + 1/2), mu~_i =
-        raw[i, y_i]. In (0, 2/3): well-predicted -> 2/3, badly-predicted -> 0. (n, 1).
+    def _eps_responsibility(self, loss_vec: Array) -> Array:
+        """Per-point responsibility r_i = q(s_i = 0) = P(point i came from the model).
 
-        ``update`` now gates on the responsibility instead; this is kept as the
-        baseline the eps-mixture gate is compared against."""
-        s = jnp.take_along_axis(raw, y[:, None], axis=1)   # (n,1) true-class score
-        p1 = self.cdf(s)
-        return p1 / (p1 + 0.5)
+        q-update-spec sec 5.2. The CAVI stationary point wants the Beta's EXPECTED LOG,
+        not its mean:
 
-    def _eps_responsibility(self, loss_vec: Array, eps: Array) -> Array:
-        """Per-point responsibility r_i = P(point from model | label) under the
-        eps-contamination mixture: (1-eps) p / ((1-eps) p + eps/K), p = exp(-loss_i)
-        the model's prob at the true label. In (0,1): well-predicted -> ~1, badly-predicted
-        -> 0; uniform (p=1/K) -> 1-eps. log-space for stability. Returns (n,1)."""
+            r_i = sigmoid( E[log(1-eps)] - E[log eps] + log phat(y_i | f_i) + log K )
+            E[log eps] = digamma(a) - digamma(a + b)
+
+        with eps ~ Beta(eps_alpha, eps_beta), eps_alpha the contamination mass. phat is
+        the pre-update, marginalised, one-step-ahead predictive, so log phat = -loss_vec.
+        Strict CAVI would recompute r_i in the inner loop; using the prequential
+        predictive instead makes r_i an out-of-sample judgement and stops a point
+        certifying its own inlier status. Deliberate.
+
+        In (0,1): well-predicted -> ~1, badly-predicted -> ~0. Returns (n, 1)."""
+        dig_ab = digamma(self.eps_alpha + self.eps_beta)
+        E_log_eps = digamma(self.eps_alpha) - dig_ab
+        E_log_1meps = digamma(self.eps_beta) - dig_ab
         log_K = jnp.log(self.mu.shape[-1])
-        log_num = jnp.log1p(-eps) - loss_vec                          # log((1-eps) p_model(y))
-        log_den = jnp.logaddexp(log_num, jnp.log(eps) - log_K)
-        return jnp.exp(log_num - log_den)[:, None]
+        return nn.sigmoid(E_log_1meps - E_log_eps - loss_vec + log_K)[:, None]
 
     def _mixture_logp(self, raw: Array) -> Array:
         """(n, K) log mixture predictive log[ (1-eps) softmax(beta * transform(raw)) + eps/K ].
@@ -696,15 +688,12 @@ class IBProbit(eqx.Module):
         # losses) but IGNORED: the branch is fixed by the instance field
         # `self.loss_type`, so the convergence target cannot drift across calls.
         logits = self._predictive_logits(features)
-        if self.use_eps:
-            # Score the floored mixture: return log p_eps as the "logits" (softmax is then a
-            # no-op), so loss = -log p_eps(y) and any downstream NLL/Brier/ECE see the mixture.
-            log_p_eps = self._mixture_logp(logits)
-            loss = -jnp.take_along_axis(log_p_eps, y[:, None], axis=1)[:, 0]
-            return (loss, log_p_eps) if with_logits else loss
-        y_one_hot = nn.one_hot(y, self.mu.shape[-1])
-        loss, logits_t = self._loss_from_logits(logits, y_one_hot)
-        return (loss, logits_t) if with_logits else loss
+        # Score the floored mixture: return log p_eps as the "logits" (softmax is then a
+        # no-op), so loss = -log p_eps(y) and any downstream NLL/Brier/ECE see the mixture.
+        # Structural now (sec 5.2): under the contamination model the gate IS r_i, always.
+        log_p_eps = self._mixture_logp(logits)
+        loss = -jnp.take_along_axis(log_p_eps, y[:, None], axis=1)[:, 0]
+        return (loss, log_p_eps) if with_logits else loss
 
 class MultinomialPolyaGamma(eqx.Module):
 

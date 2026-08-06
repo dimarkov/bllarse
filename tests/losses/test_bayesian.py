@@ -153,21 +153,23 @@ def test_ibprobit_px_instance_field_drives_scan():
 
 
 def test_ibprobit_predictive_denominator():
-    """Predictive (train grad AND eval) is mu^T f / sqrt(1 + f^T (Qhat+Sigma) f).
-    eps_init=0 opts __call__ out of the floored mixture so the bare score is visible."""
+    """Predictive score (train grad AND eval) is mu^T f / sqrt(1 + f^T (Qhat+Sigma) f),
+    the raw moderated logit _predictive_logits computes and every internal consumer
+    (the responsibility, the gate, __call__) shares. __call__ now always scores the
+    floored mixture on top of this (the mixture is structural, sec 5.2), so the bare
+    formula is checked directly against _predictive_logits rather than through __call__."""
     key = jr.PRNGKey(0)
     D, C, N = 6, 3, 128
-    m = IBProbit(D, C, key=key, q_init=1.0 / D, eps_init=0.0, loss_type=0).update(
-        # loss_type 0 -> raw moderated score (instance field)
+    m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=0).update(
         jr.normal(jr.PRNGKey(1), (N, D)), jr.randint(jr.PRNGKey(2), (N,), 0, C), num_iters=8)
-    f = jr.normal(jr.PRNGKey(5), (32, D)); y = jr.randint(jr.PRNGKey(6), (32,), 0, C)
+    f = jr.normal(jr.PRNGKey(5), (32, D))
     fts = _pad(f)
 
     scores = fts @ m.mu
     var = jnp.sum((fts @ (m.Qhat + m.Sigma)) * fts, -1)
     expected = scores / jnp.sqrt(1.0 + var)[:, None]
 
-    _, logits = m(f, y, with_logits=True)  # beta=1, instance loss_type=0 -> raw moderated score
+    logits = m._predictive_logits(f)
     # mm_loss uses the TF32 dot preset, so tolerate ~1e-3 vs a full-precision matmul.
     assert jnp.allclose(logits, expected, rtol=1e-2, atol=1e-2)
 
@@ -225,34 +227,22 @@ def test_ibprobit_loss_type_is_instance_field_not_call_arg():
 
 
 def test_ibprobit_call_with_logits_unchanged_after_refactor():
-    """Factoring __call__ into _predictive_logits + _loss_from_logits must leave the
-    public with_logits output identical: for loss_type=2 it is logcdf(raw)-logcdf(-raw),
-    raw being the moderated score from _predictive_logits. eps_init=0 opts out of the
-    floored mixture predictive so the bare transform is what __call__ returns."""
+    """__call__ is built from _predictive_logits + _mixture_logp (the mixture is
+    structural now, sec 5.2): its public with_logits output must match calling those two
+    pieces directly, log p_eps = _mixture_logp(_predictive_logits(f))."""
     key = jr.PRNGKey(0)
     D, C, N = 6, 3, 128
-    m = IBProbit(D, C, key=key, q_init=1.0 / D, eps_init=0.0).update(   # default loss_type=2
+    m = IBProbit(D, C, key=key, q_init=1.0 / D).update(   # default loss_type=2
         jr.normal(jr.PRNGKey(1), (N, D)), jr.randint(jr.PRNGKey(2), (N,), 0, C), num_iters=8)
     f = jr.normal(jr.PRNGKey(5), (16, D)); y = jr.randint(jr.PRNGKey(6), (16,), 0, C)
 
     _, logits_t = m(f, y, with_logits=True)
     raw = m._predictive_logits(f)
-    expected = m.logcdf(raw) - m.logcdf(-raw)   # loss_type 2 transform, beta = 1
+    expected = m._mixture_logp(raw)
     assert jnp.allclose(logits_t, expected, rtol=1e-5, atol=1e-5)
 
 
 # --- per-data-point assimilation gate ----------------------------------------
-
-def test_ibprobit_gate_effective_sample_size():
-    """Effective N = sum(g) is strictly positive and strictly below N (each g < 2/3)."""
-    key = jr.PRNGKey(0)
-    D, C, N = 6, 4, 200
-    m = IBProbit(D, C, key=key, q_init=1.0 / D)
-    x, y = _near_separable(D, C, N)
-    m1 = m.update(x, y, num_iters=100)
-    g = m1._gate_from_logits(m1._predictive_logits(x), y)
-    assert 0.0 < float(g.sum()) < float(N)
-
 
 def test_ibprobit_gate_warmup_skips_early_steps():
     """With warmup=2 the first two updates are un-gated (step 0,1 < 2) and equal a
@@ -313,16 +303,21 @@ def test_ibprobit_gate_runs_under_scan_jit():
 
 
 def test_ibprobit_eps_responsibility_shape():
-    """r_i = (1-eps) p / ((1-eps) p + eps/K) in (0,1), decreasing in the per-point loss,
-    and equal to 1-eps at the uniform point p = 1/K."""
+    """r_i = sigmoid(E[log(1-eps)] - E[log eps] - loss_i + log K), eps ~ Beta(a,b), the
+    psi-form CAVI stationary point (sec 5.2, NOT the Beta mean). In (0,1), decreasing in
+    the per-point loss; at the uniform point (loss = log K) it reduces to
+    sigmoid(E[log(1-eps)] - E[log eps])."""
+    from jax.scipy.special import digamma
     D, C = 6, 5
     m = IBProbit(D, C, key=jr.PRNGKey(0), q_init=1.0 / D, eps_init=0.1)
-    eps = float(m.eps)
     loss_vec = jnp.array([0.0, jnp.log(C), 20.0])            # p = 1, 1/K, ~0
-    r = m._eps_responsibility(loss_vec, m.eps)[:, 0]
+    r = m._eps_responsibility(loss_vec)[:, 0]
     assert jnp.all((r > 0.0) & (r < 1.0))
     assert r[0] > r[1] > r[2]                                # decreasing in loss
-    assert jnp.allclose(r[1], 1.0 - eps, atol=1e-5)          # uniform -> 1-eps
+    dig_ab = digamma(m.eps_alpha + m.eps_beta)
+    E_log_eps = digamma(m.eps_alpha) - dig_ab
+    E_log_1meps = digamma(m.eps_beta) - dig_ab
+    assert jnp.allclose(r[1], nn.sigmoid(E_log_1meps - E_log_eps), atol=1e-6)  # uniform point
 
 
 def test_ibprobit_eps_mixture_normalized_and_uniform_seed():
@@ -339,8 +334,10 @@ def test_ibprobit_eps_tail_bound():
     """The mixture floors p_eps(y) >= eps/K, so -log p_eps(y) <= log(K/eps) even for a
     confidently-wrong prediction -- the unbounded-NLL tail the floor exists to fix. The
     bound is read off the model's own eps because the conjugate Beta step moves it
-    during update(). The un-floored probit loss (eps_init=0 opts __call__ out of the
-    mixture) exceeds that same bound somewhere on the same wrong labels."""
+    during update(). The bare (un-floored) probit loss -- computed directly via
+    _loss_from_logits on the SAME predictive, since __call__ no longer has a way to
+    bypass the now-structural mixture -- exceeds that same bound somewhere on the same
+    wrong labels, showing the floor is load-bearing rather than vacuous."""
     D, C, N = 4, 5, 200
     x, y = _near_separable(D, C, N)
     m = IBProbit(D, C, key=jr.PRNGKey(0), q_init=1.0 / D,
@@ -349,9 +346,10 @@ def test_ibprobit_eps_tail_bound():
     loss, _ = m(x, y_wrong, with_logits=True)
     bound = float(jnp.log(C / m.eps))
     assert jnp.all(loss <= bound + 1e-4)
-    m_plain = IBProbit(D, C, key=jr.PRNGKey(0), q_init=1.0 / D,
-                       eps_init=0.0).update(x, y, num_iters=200)
-    assert float(m_plain(x, y_wrong).max()) > bound
+
+    raw = m._predictive_logits(x)
+    bare_loss = m._loss_from_logits(raw, nn.one_hot(y_wrong, C))[0]
+    assert float(bare_loss.max()) > bound
 
 
 def test_ibprobit_eps_beta_prior_seed():
@@ -360,7 +358,6 @@ def test_ibprobit_eps_beta_prior_seed():
     m = IBProbit(6, 4, key=jr.PRNGKey(0), q_init=1e-2, eps_init=0.01)
     assert float(m.eps_alpha) == 1.0 and float(m.eps_beta) == 100.0
     assert jnp.allclose(m.eps, 1.0 / 101.0, atol=1e-6)
-    assert m.use_eps is True
 
 
 def test_ibprobit_eps_beta_conjugate_update():
@@ -375,7 +372,7 @@ def test_ibprobit_eps_beta_conjugate_update():
 
     raw = m1._predictive_logits(x)
     loss_vec = m1._loss_from_logits(raw, nn.one_hot(y, C))[0]
-    r = m1._eps_responsibility(loss_vec, m1.eps)[:, 0]
+    r = m1._eps_responsibility(loss_vec)[:, 0]
     a_exp = m1.eps_alpha + jnp.sum(1.0 - r)
     b_exp = m1.eps_beta + jnp.sum(r)
     assert jnp.allclose(m2.eps_alpha, a_exp, atol=1e-4)
@@ -400,7 +397,7 @@ def test_ibprobit_eps_forgetting_factor_decays_excess():
 
     raw = m1._predictive_logits(x)
     loss_vec = m1._loss_from_logits(raw, nn.one_hot(y, C))[0]
-    r = m1._eps_responsibility(loss_vec, m1.eps)[:, 0]
+    r = m1._eps_responsibility(loss_vec)[:, 0]
     a_exp = a0 + rho * (m1.eps_alpha - a0) + jnp.sum(1.0 - r)
     b_exp = b0 + rho * (m1.eps_beta - b0) + jnp.sum(r)
     assert jnp.allclose(m2.eps_alpha, a_exp, atol=1e-4)
