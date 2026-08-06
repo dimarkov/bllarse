@@ -34,8 +34,18 @@ def benchmark_loss_vs_iterations(key):
 
     # Initialize models
     key, subkey = jr.split(key)
+    # IBProbit.__call__ no longer honours a per-call loss_type -- the branch is
+    # fixed at construction by self.loss_type -- so measuring the IBProbit_1/2/3
+    # columns needs three independently constructed heads, one per loss_type.
+    # loss_type=0 is now rejected by the constructor guard (see the ValueError in
+    # IBProbit.__init__), so the sweep covers only the supported {1, 2, 3}
+    # (CBM, CBC, mixed).
+    ibp_keys = jr.split(subkey, 3)
     # pre-Wishart default; this script is not part of the q study
-    ib_probit = IBProbit(n_features, n_classes, key=subkey, q_init=1.0 / n_features)
+    ib_probits = {
+        lt: IBProbit(n_features, n_classes, key=k, q_init=1.0 / n_features, loss_type=lt)
+        for lt, k in zip((1, 2, 3), ibp_keys)
+    }
     key, subkey = jr.split(key)
     ib_pg = IBPolyaGamma(n_features, n_classes, key=subkey)
     key, subkey = jr.split(key)
@@ -43,17 +53,19 @@ def benchmark_loss_vs_iterations(key):
 
     n_iters_range = jnp.arange(1, 128)[::4]
     losses = {
-        "IBProbit_0": [], "IBProbit_1": [], "IBProbit_2": [], "IBProbit_3": [],
+        "IBProbit_1": [], "IBProbit_2": [], "IBProbit_3": [],
         "IBPG_0": [], "IBPG_1": [], "IBPG_2": [], "IBPG_3": [],
         "MPG_0": [], "MPG_1": []
     }
 
     for n_iters in n_iters_range:
-        for loss_type in range(4):
-            # Update and compute loss for IBModels
-            loss = ib_probit.update(X, y, num_iters=n_iters)(X, y, loss_type=loss_type).mean()
+        for loss_type in (1, 2, 3):
+            # Each loss_type gets its own IBProbit head (see above); __call__
+            # takes no loss_type argument since it would be ignored anyway.
+            loss = ib_probits[loss_type].update(X, y, num_iters=n_iters)(X, y).mean()
             losses[f"IBProbit_{loss_type}"].append(loss)
-            
+
+        for loss_type in range(4):
             loss = ib_pg.update(X, y, num_iters=n_iters)(X, y, loss_type=loss_type).mean()
             losses[f"IBPG_{loss_type}"].append(loss)
 

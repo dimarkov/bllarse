@@ -179,8 +179,11 @@ def evaluate_model(model, lm_head, input_ids, attention_mask, labels):
     if valid_hidden.shape[0] == 0:
         return jnp.array(float('inf')), jnp.array(0.0), jnp.array(0.0)
     
-    # Get logits
-    _, logits = lm_head(valid_hidden, valid_labels, with_logits=True, loss_type=3)
+    # Get logits. lm_head is always an IBProbit instance here (the only implemented
+    # --loss-fn branch in main(); IBPolyaGamma is advertised but unimplemented and
+    # raises), and IBProbit's convergence branch is fixed by self.loss_type, so no
+    # loss_type is passed.
+    _, logits = lm_head(valid_hidden, valid_labels, with_logits=True)
     
     # Compute metrics
     vocab_size = logits.shape[-1]
@@ -255,8 +258,8 @@ def train_epoch(
                 valid_hidden, valid_labels, num_iters=num_update_iters
             )
         
-        # Compute loss
-        loss = current_lm_head(valid_hidden, valid_labels, loss_type=3).mean()
+        # Compute loss. current_lm_head is always IBProbit (see evaluate_model).
+        loss = current_lm_head(valid_hidden, valid_labels).mean()
         total_loss += loss
     
     avg_loss = total_loss / n_batches if n_batches > 0 else 0.0

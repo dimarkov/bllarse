@@ -211,7 +211,13 @@ def load_or_compute_features(cache_path, model, dataset_split, ds_config, img_si
 # ── Evaluation helpers ────────────────────────────────────────────────────────
 
 def _eval_batches(loss_fn, features, labels, eval_batch_size, loss_type, head=None):
-    """Return (acc, ece, nll) over the given feature/label arrays."""
+    """Return (acc, ece, nll) over the given feature/label arrays.
+
+    Shared by both arms below (IBProbit with head=None, CrossEntropy with a linear
+    head), so loss_type keeps being forwarded even though IBProbit itself ignores it
+    (self.loss_type fixes its branch) -- CrossEntropy's __call__ also ignores it, but
+    the parameter stays for symmetry with the rest of this generic helper.
+    """
     n = len(features)
     all_logits, all_labels = [], []
     for start in range(0, n, eval_batch_size):
@@ -305,7 +311,9 @@ def run_ibprobit_sequential(
             cal_f = train_features[indices[:step_end]][perm[:n_cal]]
             cal_l = train_labels  [indices[:step_end]][perm[:n_cal]]
             _, _, val_nll_before = _eval_batches(loss_fn, cal_f, cal_l, eval_batch_size, loss_type)
-            loss_fn = loss_fn.calibrate(jnp.array(cal_f), jnp.array(cal_l), num_iters=num_calibration_iters, loss_type=loss_type)
+            # loss_fn here is always the IBProbit head; calibrate() has no loss_type
+            # parameter (it is IBProbit-only, unlike __call__).
+            loss_fn = loss_fn.calibrate(jnp.array(cal_f), jnp.array(cal_l), num_iters=num_calibration_iters)
             _, _, val_nll_after = _eval_batches(loss_fn, cal_f, cal_l, eval_batch_size, loss_type)
             print(f"  Calibration (n_cal={n_cal:,}): nll {val_nll_before:.4f} → {val_nll_after:.4f}  beta={float(loss_fn.beta):.4f}")
 

@@ -514,12 +514,17 @@ class IBProbit(eqx.Module):
         p_b_new = pb0 + self.rho * (self.p_b - pb0) + (1.0 - gamma)
         return Psi_new, nu_new, p_a_new, p_b_new, gamma
 
-    def calibrate(self, features: Array, y: Array, *, num_iters: int = 8, loss_type: int = 2) -> "IBProbit":
+    def calibrate(self, features: Array, y: Array, *, num_iters: int = 8) -> "IBProbit":
         """Temperature scaling via Newton steps on beta, using held-out (val) data.
+
+        No ``loss_type`` parameter: unlike ``__call__`` (kept generic for interface
+        parity with the classical/PolyaGamma losses), this method is IBProbit-only,
+        so a dead per-call override had no reason to exist here -- ``self.loss_type``
+        already fixes the branch ``lf(...)`` scores.
         """
         def nll(b):
             lf = eqx.tree_at(lambda m: m.beta, self, b)
-            return lf(features, y, loss_type=loss_type).mean()
+            return lf(features, y).mean()
 
         def newton_step(b, _):
             g = grad(nll)(b)

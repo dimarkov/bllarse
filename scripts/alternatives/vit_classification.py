@@ -418,7 +418,12 @@ def iterate_feature_batches(features, labels, batch_size, key=None, progress=Fal
 
 
 def evaluate_model(loss_fn, test_features, test_labels, batch_size, loss_type, head=None):
-    """Evaluate model on cached test features."""
+    """Evaluate model on cached test features.
+
+    loss_fn is either IBProbit or CrossEntropy (--loss-fn), so loss_type keeps being
+    forwarded for the generic call signature; IBProbit ignores it (self.loss_type
+    fixes its branch).
+    """
     all_logits = []
     all_labels = []
 
@@ -454,6 +459,10 @@ def train_epoch(
 
     For IBProbit: uses CAVI updates (head/opt_state/optimizer are None).
     For CrossEntropy: runs gradient-based updates on the linear head.
+
+    loss_type keeps being forwarded to current_loss_fn -- the generic call signature
+    serves both classes -- even though IBProbit ignores it (self.loss_type fixes its
+    branch).
     """
     key, shuffle_key = jr.split(key)
 

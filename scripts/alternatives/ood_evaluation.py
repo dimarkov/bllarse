@@ -95,6 +95,10 @@ def collect_logits(loss_fn, features, labels, batch_size, loss_type=3, head=None
     for IBProbit; raw head logits scored through the loss for CE). For 200-class
     subsets (ImageNet-R/A), out-of-subset logits are pushed to MASK_NEG so the
     softmax/argmax is restricted to the subset (the standard protocol).
+
+    loss_fn is either IBProbit or CrossEntropy (--method), so loss_type keeps being
+    forwarded for the generic call signature; IBProbit ignores it (self.loss_type
+    fixes its branch).
     """
     subset_arr = np.asarray(subset) if subset is not None else None
     keep = None  # built lazily from the logits' class dimension
@@ -120,7 +124,11 @@ def collect_logits(loss_fn, features, labels, batch_size, loss_type=3, head=None
 
 def evaluate_features(loss_fn, features, labels, batch_size, loss_type=3, head=None,
                       subset=None, progress=False, desc="eval"):
-    """Evaluate a head/loss on cached features -> (acc, ece, nll)."""
+    """Evaluate a head/loss on cached features -> (acc, ece, nll).
+
+    Thin wrapper around collect_logits; see its docstring for why loss_type is
+    still forwarded even though IBProbit ignores it.
+    """
     logits, labels_c = collect_logits(loss_fn, features, labels, batch_size,
                                       loss_type=loss_type, head=head, subset=subset,
                                       progress=progress, desc=desc)

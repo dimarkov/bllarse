@@ -83,6 +83,11 @@ def augmentdata(img, key=None, **kwargs):
 
 
 def evaluate_model(data_augmentation, loss_fn, nnet, images, labels, loss_type=3):
+    # `loss_fn` is genuinely polymorphic here (Classical, IBProbit, IBPolyaGamma,
+    # MultinomialPolyaGamma all pass through this same helper), so `loss_type` stays
+    # in the signature and is forwarded unconditionally. IBProbit ignores it (the
+    # branch is fixed by its own `self.loss_type`); IBPolyaGamma/MultinomialPolyaGamma
+    # still honour it, so it cannot be dropped here.
     aug_images = data_augmentation(images, key=None)
     features = extract_features(nnet, aug_images)
     loss, logits = loss_fn(features, labels, with_logits=True, loss_type=loss_type)
@@ -201,7 +206,11 @@ def run_training(
     opt_state : Optional initial optimizer state
     last_layer : LastLayer wrapper (required for classical + tune_last_layer_only)
     tune_last_layer_only : If True, freeze backbone and only optimize last layer
-    loss_type : Loss type parameter for Bayesian losses (ignored for classical)
+    loss_type : Loss type parameter for Bayesian losses (ignored for classical, and
+        also ignored by IBProbit specifically -- its branch is pinned by the
+        instance field `self.loss_type` so the CAVI convergence target cannot
+        drift across calls; IBPolyaGamma/MultinomialPolyaGamma still honour it,
+        so this stays a real, forwarded parameter rather than dead weight)
     num_epochs : Number of training epochs
     batch_size : Batch size
     num_update_iters : Number of CAVI/PG iterations per batch (Bayesian only)
@@ -323,6 +332,9 @@ def run_training(
             def loss_fn(params, images, labels, *args, **kwargs):
                 nnet = get_nnet(params)
                 logits = extract_features(nnet, images)
+                # `updated_loss` may be Classical, IBProbit, IBPolyaGamma or
+                # MultinomialPolyaGamma (see is_bayesian_loss above) -- keep
+                # forwarding loss_type; IBProbit alone ignores it (self.loss_type).
                 return updated_loss(logits, labels, loss_type=loss_type).mean()
 
             loss_value, grads, opt_state = noisy_value_and_grad(
