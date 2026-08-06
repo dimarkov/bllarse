@@ -88,11 +88,15 @@ def test_dump_steps_spans_one_to_num_steps():
 
 
 def test_ood_dump_steps_subsamples_and_always_keeps_the_last():
+    # With every_k=2 on 7 elements, the naive stride happens to include the last.
     steps = np.array([1, 2, 4, 8, 16, 32, 64])
     chosen = protocol.ood_dump_steps(steps, every_k=2)
-    assert chosen[0] == 1
-    assert chosen[-1] == 64  # the final step is never dropped by the stride
-    assert set(chosen).issubset(set(steps))
+    assert np.array_equal(chosen, np.array([1, 4, 16, 64]))
+
+    # With every_k=4 on 7 elements, the naive stride misses the last (indices
+    # 0, 4 give elements [1, 16]), so the append logic must run.
+    chosen = protocol.ood_dump_steps(steps, every_k=4)
+    assert np.array_equal(chosen, np.array([1, 16, 64]))
 
 
 def test_ood_dump_steps_disabled_returns_empty():
