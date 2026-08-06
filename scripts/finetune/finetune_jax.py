@@ -10,14 +10,25 @@ kernels via bllarse.finetune.jax_steps.
 """
 
 import argparse
+import gc
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 load_dotenv(".env.secrets", override=False)
 
-from bllarse.finetune import imagenet, protocol  # noqa: E402
+import equinox as eqx  # noqa: E402
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import optax  # noqa: E402
+from jax import random as jr  # noqa: E402
+
+from bllarse import evaldump, metrics  # noqa: E402
+from bllarse.finetune import imagenet, jax_steps, protocol  # noqa: E402
+from bllarse.losses import CrossEntropy  # noqa: E402
 
 # Fine-tuning resolution. DINOV3_DATASET_IMG_SIZES maps imagenet1k -> 512, but
 # that table exists for FROZEN FEATURE EXTRACTION; fine-tuning at 512 is ~5x the
@@ -135,19 +146,260 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--enable-mlflow", action="store_true")
     p.add_argument("--mlflow-experiment", default="bllarse-finetune")
+
+    p.add_argument("--optimizer", default="adamw", choices=["adamw"],
+                   help="Present because the shared micro-batch prober reads "
+                        "it. IVON/EVON live in full_finetune_comparison.py.")
+    p.add_argument("--estimator", default="sampling", choices=["sampling"],
+                   help="Present for the shared prober; see --optimizer.")
     return p
 
 
+def stream_micro_batches(train_split, ds_config, micro, img_size, mean, std,
+                         total_micro, seed, num_workers=16):
+    """Yield exactly `total_micro` micro-batches, reshuffling between passes.
+
+    The permutation comes from protocol.shuffled_indices (numpy), NOT jax.random,
+    so the PyTorch arm reproduces this exact order. Short trailing batches are
+    skipped to keep the jitted shape constant.
+    """
+    n = len(train_split)
+    labels_all = np.asarray(train_split[ds_config["label_key"]])
+    emitted, epoch = 0, 0
+    while emitted < total_micro:
+        order = protocol.shuffled_indices(n, seed, epoch)
+        for start in range(0, n - micro + 1, micro):
+            batch_idx = order[start:start + micro]
+            images = imagenet.load_images_uint8(
+                train_split, ds_config["img_key"], img_size, batch_idx,
+                num_workers=num_workers,
+            )
+            yield (jnp.asarray(imagenet.normalize_chunk(images, mean, std)),
+                   jnp.asarray(labels_all[batch_idx]))
+            emitted += 1
+            if emitted >= total_micro:
+                return
+        epoch += 1
+
+
+def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
+                      split, step, samples_seen, args, mean, std, key,
+                      subset=None):
+    """Forward one preloaded eval set in chunks and write its dump.
+
+    Returns the scalar metrics so the caller can drive `on_dump` and MLflow.
+    Normalization happens per chunk (imagenet.normalize_chunk), so the float32
+    expansion only ever covers `--eval-chunk` images at a time.
+
+    `subset`, if given, restricts scoring to those class indices: every other
+    logit is driven to -1e9 before the dump is written and before metrics are
+    computed, so both share the same masked view (OOD evaluation over
+    ImageNet-R/-A, which cover only 200 of the 1000 classes).
+    """
+    inference_bb = eqx.nn.inference_mode(backbone, True)
+    chunks = []
+    for start in range(0, len(labels), args.eval_chunk):
+        raw = images_uint8[start:start + args.eval_chunk]
+        imgs = jnp.asarray(imagenet.normalize_chunk(raw, mean, std))
+        labs = jnp.asarray(labels[start:start + args.eval_chunk])
+        if arm == "ibprobit":
+            logits = eval_logits_ibprobit(inference_bb, head_or_loss, imgs, labs,
+                                            key, bf16=args.bf16)
+        else:
+            logits = eval_logits_ce(inference_bb, head_or_loss, imgs, key,
+                                       bf16=args.bf16)
+        chunks.append(np.asarray(logits))
+    logits = np.concatenate(chunks, axis=0)
+
+    if subset is not None:
+        keep = np.zeros(logits.shape[-1], dtype=bool)
+        keep[np.asarray(subset)] = True
+        logits = np.where(keep, logits, -1e9)
+
+    evaldump.write_dump(
+        args.dump_root, args.group_id, args.uid, step,
+        logits, labels,
+        arm=arm, split=split,
+        logit_kind="moderated_score" if arm == "ibprobit" else "softmax_logits",
+        seed=args.seed, samples_seen=samples_seen,
+    )
+    return metrics.classification_metrics(logits, labels)
+
+
+@eqx.filter_jit
+def eval_logits_ce(backbone, head, images, key, bf16=False):
+    features = jax_steps.forward_features(backbone, images, key, bf16=bf16)
+    return jax.vmap(head)(features)
+
+
+@eqx.filter_jit
+def eval_logits_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
+    features = jax_steps.forward_features(backbone, images, key, bf16=bf16)
+    _, logits = loss_fn(features, labels, with_logits=True, loss_type=2)
+    return logits
+
+
 def main(args, on_dump=None) -> None:
-    """Fine-tune one arm. Filled in by Task 5.
+    """Fine-tune one arm: gradient accumulation to the target batch, eval dumps
+    of both val and test on a log-spaced step schedule.
 
     `on_dump(dump_index, step, scalars)` matches the hook
     bllarse.tuning.objective.evaluate passes, so the Phase 2 tuning campaign can
-    drive this script without a wrapper.
+    drive this script without a wrapper. Any exception `on_dump` raises (e.g.
+    objective.EarlyConvergence) propagates out of this loop uncaught -- the
+    caller is responsible for catching it.
     """
     check_img_size(args)
     check_arm_flags(args)
-    raise NotImplementedError("training loop lands in Task 5")
+    if args.uid is None:
+        args.uid = f"{args.model}_{args.arm}_seed{args.seed}"
+
+    # Heavy, GPU-oriented imports stay inside main(): this module is imported
+    # by the CPU-only test suite (and by --help), and equimo/datasets pull in
+    # a lot of machinery neither needs.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "alternatives"))
+    from vit_classification import (
+        DATASET_CONFIGS, EQUIMO_MODELS, IMAGENET_MEAN, IMAGENET_STD,
+        get_pretrained_backbone,
+    )
+    from datasets import load_dataset
+
+    ds_config = DATASET_CONFIGS[args.dataset]
+    embed_dim = EQUIMO_MODELS[args.model]["embed_dim"]
+    num_classes = ds_config["num_classes"]
+    mean, std = IMAGENET_MEAN, IMAGENET_STD
+
+    key = jr.PRNGKey(args.seed)
+    key, model_key, init_key, fwd_key = jr.split(key, 4)
+
+    ds = load_dataset(ds_config["hf_path"], name=ds_config.get("hf_config"))
+    train_split = ds["train"]
+    eval_split = ds[ds_config["test_split"]]
+
+    backbone = eqx.nn.inference_mode(get_pretrained_backbone(args.model, model_key), True)
+
+    micro = args.micro_batch_size
+    if micro is None:
+        from full_finetune_comparison import probe_micro_batch_size
+
+        key, probe_key = jr.split(key)
+        print("[finetune] probing maximal micro-batch size...")
+        micro = probe_micro_batch_size(
+            backbone, args, embed_dim, num_classes, args.img_size,
+            args.batch_size_init, args.batch_size_max, probe_key,
+        )
+        print(f"[finetune] probed micro-batch size: {micro}")
+    plan = resolve_plan(args, micro)
+    print(f"[finetune] arm={args.arm} effective_batch={plan['effective_batch']} "
+          f"= {plan['num_accum']} x micro {plan['micro']}, steps={plan['steps']}")
+
+    # Pinned val/test partition over the official validation split, preloaded
+    # once as uint8 and normalized per chunk at eval time.
+    val_idx, test_idx = imagenet.pinned_eval_split(
+        args.split_cache_dir, n=len(eval_split), val_fraction=args.val_fraction
+    )
+    eval_labels_all = np.asarray(eval_split[ds_config["label_key"]])
+    eval_sets = {}
+    for name, idx in (("val", val_idx), ("test", test_idx)):
+        eval_sets[name] = (
+            imagenet.load_images_uint8(eval_split, ds_config["img_key"],
+                                       args.img_size, idx),
+            eval_labels_all[idx],
+        )
+        print(f"[finetune] preloaded {name}: {len(idx)} images")
+
+    if args.arm == "ce":
+        loss_fn = CrossEntropy(args.label_smooth, num_classes)
+        head = eqx.nn.Linear(embed_dim, num_classes, key=init_key)
+        head_lr = args.head_lr if args.head_lr is not None else args.lr
+        param_labels = (
+            jax.tree.map(lambda _: "backbone", eqx.filter(backbone, eqx.is_array)),
+            jax.tree.map(lambda _: "head", eqx.filter(head, eqx.is_array)),
+        )
+        optimizer = optax.multi_transform(
+            {
+                "backbone": optax.adamw(args.lr, weight_decay=args.weight_decay),
+                # Head weight decay is 0 on every arm (design D6): VBLL's KL is
+                # its head regulariser and IBProbit runs no optimizer on the
+                # head at all, so a nonzero value here would be an asymmetry.
+                "head": optax.adamw(head_lr, weight_decay=0.0),
+            },
+            param_labels,
+        )
+        opt_state = optimizer.init(eqx.filter((backbone, head), eqx.is_array))
+    else:
+        from bllarse.losses import IBProbit
+        loss_fn = IBProbit(embed_dim, num_classes, key=init_key)
+        head = None
+        optimizer = optax.adamw(args.lr, weight_decay=args.weight_decay)
+        opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
+
+    dump_set = set(int(s) for s in plan["dump_steps"])
+    micro_iter = stream_micro_batches(
+        train_split, ds_config, plan["micro"], args.img_size, mean, std,
+        plan["steps"] * plan["num_accum"], args.seed,
+    )
+
+    dump_index = 0
+    for step in range(1, plan["steps"] + 1):
+        train_key = jr.fold_in(fwd_key, step)
+        grads_acc, all_fts, all_labels = None, [], []
+
+        for _ in range(plan["num_accum"]):
+            images, labels = next(micro_iter)
+            if args.arm == "ibprobit":
+                if step == 1:
+                    fts, _ = jax_steps.ibprobit_micro_forward_nograd(
+                        backbone, loss_fn, images, labels, train_key, bf16=args.bf16)
+                else:
+                    grads, fts, _ = jax_steps.ibprobit_micro_forward(
+                        backbone, loss_fn, images, labels, train_key, bf16=args.bf16)
+                    grads_acc = grads if grads_acc is None else jax_steps._tree_add(
+                        grads, grads_acc)
+                all_fts.append(fts)
+                all_labels.append(labels)
+            else:
+                grads, _ = jax_steps.ce_micro_grad(
+                    (backbone, head), loss_fn, images, labels, train_key,
+                    bf16=args.bf16)
+                grads_acc = grads if grads_acc is None else jax_steps._tree_add(
+                    grads, grads_acc)
+
+        if args.arm == "ibprobit":
+            if step > 1:
+                backbone, opt_state = jax_steps.apply_grads(
+                    backbone, grads_acc, opt_state, optimizer, plan["num_accum"])
+            loss_fn = loss_fn.update(
+                jnp.concatenate(all_fts), jnp.concatenate(all_labels),
+                num_iters=args.num_update_iters)
+            head_or_loss = loss_fn
+        else:
+            (backbone, head), opt_state = jax_steps.apply_grads(
+                (backbone, head), grads_acc, opt_state, optimizer, plan["num_accum"])
+            head_or_loss = head
+
+        if step in dump_set:
+            samples_seen = step * plan["effective_batch"]
+            scalars = {}
+            for name in ("val", "test"):
+                images_uint8, labels = eval_sets[name]
+                out = evaluate_and_dump(
+                    args.arm, backbone, head_or_loss, images_uint8, labels,
+                    split=name, step=step, samples_seen=samples_seen,
+                    args=args, mean=mean, std=std, key=fwd_key,
+                )
+                scalars.update({f"{name}_{k}": v for k, v in out.items()})
+            print(f"[finetune] step {step}/{plan['steps']} " + " ".join(
+                f"{k}={v:.4f}" for k, v in sorted(scalars.items())))
+            if on_dump is not None:
+                on_dump(dump_index, step, scalars)
+            dump_index += 1
+            jax.clear_caches()
+            gc.collect()
+
+    print(f"[finetune] done: {dump_index} dumps under "
+          f"{args.dump_root}/{args.group_id}/{args.uid}")
 
 
 if __name__ == "__main__":
