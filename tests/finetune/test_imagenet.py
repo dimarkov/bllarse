@@ -83,6 +83,30 @@ def test_normalize_chunk_produces_channels_first_float32():
     assert out == pytest.approx(np.ones_like(out))
 
 
+def test_normalize_chunk_distinguishes_h_and_w_axes():
+    # Non-square input (1, H=2, W=3, C=3) with position-dependent values.
+    # If H and W axes are swapped in transpose, output shape changes and values differ.
+    images = np.zeros((1, 2, 3, 3), dtype=np.uint8)
+    for h in range(2):
+        for w in range(3):
+            images[0, h, w, :] = (10 * h + w) % 256
+
+    out = imagenet.normalize_chunk(images, mean=np.zeros(3), std=np.ones(3))
+    assert out.shape == (1, 3, 2, 3)
+
+    # Expected output after transpose(0, 3, 1, 2): (1, 3, 2, 3)
+    # Channel dimension expanded from last axis, so all channels have the same values
+    # (since all channels were filled with the same position-dependent value).
+    expected = np.zeros((1, 3, 2, 3), dtype=np.float32)
+    for h in range(2):
+        for w in range(3):
+            val = float((10 * h + w) % 256) / 255.0
+            for c in range(3):
+                expected[0, c, h, w] = val
+
+    np.testing.assert_allclose(out, expected)
+
+
 def test_normalize_chunk_applies_mean_and_std():
     images = np.full((1, 4, 4, 3), 255, dtype=np.uint8)
     mean = np.array([0.5, 0.5, 0.5])
@@ -91,10 +115,29 @@ def test_normalize_chunk_applies_mean_and_std():
     assert out == pytest.approx(np.full_like(out, 2.0))
 
 
+def test_ood_sizes_and_keys_define_full_suite():
+    # Verify the OOD suite composition: R 30k + A 7.5k + V2 10k = 47,500 images total.
+    # OOD_SIZES must match OOD_KEYS and sum to 47,500.
+    assert set(imagenet.OOD_SIZES.keys()) == set(imagenet.OOD_KEYS)
+    assert imagenet.OOD_SIZES["imagenet_r"] == 30_000
+    assert imagenet.OOD_SIZES["imagenet_a"] == 7_500
+    assert imagenet.OOD_SIZES["imagenet_v2"] == 10_000
+    assert sum(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS) == 47_500
+
+
+def test_ood_subset_keys_excludes_v2():
+    # R and A cover 200 ImageNet classes; logits outside these 200 are masked.
+    # V2 spans all 1000 classes and must never be logit-masked.
+    assert imagenet.OOD_SUBSET_KEYS == frozenset({"imagenet_r", "imagenet_a"})
+    assert "imagenet_v2" not in imagenet.OOD_SUBSET_KEYS
+
+
 def test_memory_budget_of_a_full_ood_preload_stays_under_slurm_mem():
-    # 47,500 images (R 30k + A 7.5k + V2 10k) at 224px. Documents WHY uint8:
+    # Full OOD suite (R 30k + A 7.5k + V2 10k) at 224px. Documents WHY uint8:
     # float32 would be 28.6 GB against --mem=40G with the model also resident.
-    n, size = 47_500, 224
+    n = sum(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS)
+    assert n == 47_500
+    size = 224
     uint8_gb = n * size * size * 3 / 1024**3
     assert uint8_gb < 8.0
     assert uint8_gb * 4 > 25.0  # the float32 equivalent genuinely does not fit
