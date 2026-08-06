@@ -34,7 +34,8 @@ def benchmark_loss_vs_iterations(key):
 
     # Initialize models
     key, subkey = jr.split(key)
-    ib_probit = IBProbit(n_features, n_classes, key=subkey)
+    # pre-Wishart default; this script is not part of the q study
+    ib_probit = IBProbit(n_features, n_classes, key=subkey, q_init=1.0 / n_features)
     key, subkey = jr.split(key)
     ib_pg = IBPolyaGamma(n_features, n_classes, key=subkey)
     key, subkey = jr.split(key)
@@ -82,7 +83,8 @@ def benchmark_runtimes(key):
     n_samples_range = jnp.arange(100, 1100, 100)
     runtimes_data = {"IBProbit": [], "IBPG": [], "MPG": []}
 
-    ib_probit = IBProbit(n_features, n_classes, key=key)
+    # pre-Wishart default; this script is not part of the q study
+    ib_probit = IBProbit(n_features, n_classes, key=key, q_init=1.0 / n_features)
     ib_pg = IBPolyaGamma(n_features, n_classes, key=key)
     mpg = MultinomialPolyaGamma(n_features, n_classes, key=key)
 
@@ -128,7 +130,8 @@ def benchmark_runtimes(key):
     for n_features in n_features_range:
         X, y, *_ = generate_data(key, n_samples, n_features, n_classes)
         
-        ib_probit = IBProbit(n_features, n_classes, key=key)
+        # pre-Wishart default; this script is not part of the q study
+        ib_probit = IBProbit(n_features, n_classes, key=key, q_init=1.0 / n_features)
         ib_pg = IBPolyaGamma(n_features, n_classes, key=key)
         mpg = MultinomialPolyaGamma(n_features, n_classes, key=key)
 
@@ -171,7 +174,8 @@ def benchmark_runtimes(key):
     for n_classes in n_classes_range:
         X, y, *_ = generate_data(key, n_samples, n_features, n_classes)
         
-        ib_probit = IBProbit(n_features, n_classes, key=key)
+        # pre-Wishart default; this script is not part of the q study
+        ib_probit = IBProbit(n_features, n_classes, key=key, q_init=1.0 / n_features)
         ib_pg = IBPolyaGamma(n_features, n_classes, key=key)
         mpg = MultinomialPolyaGamma(n_features, n_classes, key=key)
 
@@ -229,7 +233,8 @@ def benchmark_gradient_runtimes(key):
             X, y, *_ = generate_data(key, n_samples, n_features, n_classes)
             
             # IBProbit
-            ib_probit = IBProbit(n_features, n_classes, key=key)
+            # pre-Wishart default; this script is not part of the q study
+            ib_probit = IBProbit(n_features, n_classes, key=key, q_init=1.0 / n_features)
             for loss_type in loss_types["IBProbit"]:
                 def loss_fn_probit(x):
                     return ib_probit(x, y, loss_type=loss_type).mean()
@@ -309,7 +314,8 @@ def benchmark_accuracy(key):
     
     # --- Bayesian Models ---
     key, subkey = jr.split(key)
-    ib_probit = IBProbit(n_features, n_classes, key=subkey)
+    # pre-Wishart default; this script is not part of the q study
+    ib_probit = IBProbit(n_features, n_classes, key=subkey, q_init=1.0 / n_features)
     updated_ib_probit = eqx.filter_jit(ib_probit.update)(X_train, y_train, num_iters=128)
     accs = []
     for loss_type in [0, 1, 2]:

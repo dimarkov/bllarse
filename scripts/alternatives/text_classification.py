@@ -242,7 +242,9 @@ def main(args):
     num_classes = ds_config["num_classes"]
     
     if args.loss_fn == "IBProbit":
-        loss_fn = IBProbit(embed_dim, num_classes, key=loss_key)
+        # pre-Wishart default; this script is not part of the q study
+        loss_fn = IBProbit(embed_dim, num_classes, key=loss_key,
+                            q_init=1.0 / embed_dim)
     elif args.loss_fn == "CrossEntropy":
         loss_fn = CrossEntropy(args.label_smooth, num_classes)
     else:

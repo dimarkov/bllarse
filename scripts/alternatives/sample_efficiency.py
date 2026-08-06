@@ -289,7 +289,9 @@ def run_ibprobit_sequential(
 
         # Reset from scratch and train on all accumulated data
         key, step_key = jr.split(key)
-        loss_fn = IBProbit(embed_dim, num_classes, key=step_key)
+        # pre-Wishart default; this script is not part of the q study
+        loss_fn = IBProbit(embed_dim, num_classes, key=step_key,
+                            q_init=1.0 / embed_dim)
         acc_indices = indices[:step_end]
         n_sub = n_samples // ibprobit_batch_size
         used  = n_sub * ibprobit_batch_size

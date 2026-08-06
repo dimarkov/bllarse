@@ -11,14 +11,12 @@ Features are loaded from the local cache or HF Hub (produced by
 precompute_features.py / precompute_ood_features.py).
 
 The CrossEntropy head is trained by AdamW with early stopping. The IBProbit
-posterior is built by a streaming process-noise CAVI pass: per minibatch, a
+posterior is built by a streaming recursive-Bayesian CAVI pass: per minibatch, a
 single CAVI update assimilates the batch and -- when the head is built with
-learn_q=True (the default; disable with --fix-q) -- that same update first takes
-the in-update prequential SGD step on the process noise q. sigma_z^2 is held
-fixed at --sigma-z2-init (the moderation floor; it is no longer a learnable
-parameter), which pins the scale degeneracy on its own. A weak Inverse-Gamma
-anchor on q (--anchor-weight, mode at the q init) keeps q from sliding.
---bmr-gate enables the per-data-point BMR smoothing gate (warm up via --bmr-warmup).
+learn_q=True (the default; disable with --no-learn-q) -- infers the process
+noise Q as a conjugate Inverse-Wishart posterior (prior scale q0 = alpha^2 /
+batch_size, or --q-init to override it directly). --warmup defers the gate and
+the Q recursion for the first N steps.
 
 One MLflow run per seed, nested under a parent run per method.
 
@@ -195,22 +193,19 @@ def _ce_epoch(loss_fn, head, opt_state, optimizer, feats, labels, batch_size, ke
 
 
 def _scalars_str(loss_fn):
-    """Learned-scalar readout: q always; eps only when the mixture is active (sigma_z^2 is
-    fixed at 1, so it is dropped)."""
-    s = f"q={float(loss_fn.q):.4g}"
-    if loss_fn.use_eps:
-        s += f" eps={float(loss_fn.eps):.4g}"
-    return s
+    """Learned-scalar readout: mean diagonal of Qhat, and eps (always live -- the
+    contamination mixture is structural now)."""
+    q_mean = float(jnp.trace(loss_fn.Qhat) / loss_fn.Qhat.shape[0])
+    return f"q={q_mean:.4g} eps={float(loss_fn.eps):.4g}"
 
 
 def stream_train_ibprobit(loss_fn, train_f, train_l, val_f, val_l, *, batch_size,
                           num_iters, epochs, patience, eval_bs, key, px=False):
-    """Streaming process-noise IBProbit trainer. Per minibatch, a single CAVI
+    """Streaming recursive-Bayesian IBProbit trainer. Per minibatch, a single CAVI
     ``update`` of (mu, Sigma); when the head was built with ``learn_q=True`` that
-    same update first takes the in-update prequential SGD step on ``log_q`` against
-    the pre-update (held-out) predictive (sigma_z^2 stays fixed at its init). The
-    streamed posterior is returned directly -- no separate optimizer or posterior
-    pass. Early-stops on val NLL; returns (best_loss_fn, best_epoch)."""
+    same update also advances the conjugate Inverse-Wishart posterior on the process
+    noise Q. The streamed posterior is returned directly -- no separate optimizer or
+    posterior pass. Early-stops on val NLL; returns (best_loss_fn, best_epoch)."""
     loss_fn = loss_fn.reset_posterior()
     n_batches = (len(train_f) + batch_size - 1) // batch_size
     best_val, best_loss_fn, best_epoch, patience_ctr = float("inf"), loss_fn, 0, 0
@@ -220,9 +215,8 @@ def stream_train_ibprobit(loss_fn, train_f, train_l, val_f, val_l, *, batch_size
         bar = tqdm(batches, total=n_batches, desc=f"IBProbit stream e{epoch + 1}/{epochs}", leave=False)
         for f, y in bar:
             loss_fn = loss_fn.update(f, y, num_iters=num_iters, px=px)
-            post = {"q": f"{float(loss_fn.q):.3g}"}
-            if loss_fn.use_eps:
-                post["eps"] = f"{float(loss_fn.eps):.3g}"
+            q_mean = float(jnp.trace(loss_fn.Qhat) / loss_fn.Qhat.shape[0])
+            post = {"q": f"{q_mean:.3g}", "eps": f"{float(loss_fn.eps):.3g}"}
             bar.set_postfix(**post)
 
         if val_f is None:
@@ -319,11 +313,9 @@ def main(args):
     if args.method == "IBProbit":
         eps_rho = max(0.0, 1.0 - args.batch_size / len(train_f))  # 1 - B/N: one-pass eps memory
         base = IBProbit(embed_dim, num_classes, key=jr.split(key)[1],
-                        q_init=args.q_init, sigma_z2_init=args.sigma_z2_init,
-                        learn_q=not args.fix_q, hyper_lr=args.hyper_lr,
-                        anchor_weight=args.anchor_weight,
-                        bmr_gate=args.bmr_gate, bmr_warmup=args.bmr_warmup,
-                        learn_eps=args.learn_eps, eps_init=args.eps_init, rho=eps_rho)
+                        q_init=args.q_init, alpha=args.alpha, batch_size=args.batch_size,
+                        kappa=args.kappa, learn_q=not args.no_learn_q, px=args.px,
+                        warmup=args.warmup, eps_init=args.eps_init, rho=eps_rho)
         loss_fn, selected_epoch = stream_train_ibprobit(
             base, train_f, train_l, es_val_f, es_val_l,
             batch_size=args.batch_size, num_iters=args.num_update_iters,
@@ -365,14 +357,11 @@ def main(args):
             params["patience"] = args.patience
         if args.method == "IBProbit":
             params.update(num_update_iters=args.num_update_iters, px=args.px,
-                          fix_q=args.fix_q, hyper_lr=args.hyper_lr,
-                          anchor_weight=args.anchor_weight,
-                          q_init=args.q_init, sigma_z2_init=args.sigma_z2_init,
-                          bmr_gate=args.bmr_gate, bmr_warmup=args.bmr_warmup,
-                          learn_eps=args.learn_eps, eps_init=args.eps_init,
+                          learn_q=not args.no_learn_q, alpha=args.alpha,
+                          q_init=args.q_init, kappa=args.kappa, warmup=args.warmup,
+                          eps_init=args.eps_init,
                           eps_rho=max(0.0, 1.0 - args.batch_size / len(train_f)))
-            if loss_fn.use_eps:
-                mlflow.log_metric("eps", float(loss_fn.eps))
+            mlflow.log_metric("eps", float(loss_fn.eps))
         else:
             params.update(lr=args.lr, weight_decay=args.weight_decay,
                           label_smooth=args.label_smooth)
@@ -450,26 +439,18 @@ def build_argparser():
     p.add_argument("--num-update-iters", type=int, default=128, help="CAVI mean iters per batch")
     p.add_argument("--px", action="store_true",
                    help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
-    p.add_argument("--fix-q", action="store_true",
-                   help="fix q at its init (disable the in-update self-tuning q gradient)")
-    p.add_argument("--hyper-lr", type=float, default=0.1,
-                   help="in-update prequential SGD step size for log_q")
-    p.add_argument("--anchor-weight", type=float, default=1e-3,
-                   help="Inverse-Gamma anchor strength on q (mode at its init); 0 = off")
+    p.add_argument("--no-learn-q", action="store_true",
+                   help="hold Q at its isotropic prior q0*I (the ablation arm); default infers it")
+    p.add_argument("--alpha", type=float, default=1e-3,
+                   help="prior scale on the process noise: q0 = alpha^2 / batch_size (q-update-spec 5.5e)")
     p.add_argument("--q-init", type=float, default=None,
-                   help="process-noise q init / fixed value (default 1/D, the LayerNorm-scale floor)")
-    p.add_argument("--sigma-z2-init", type=float, default=1.0,
-                   help="fixed sigma_z^2 (the moderation floor; not a learnable parameter)")
-    # per-data-point BMR smoothing gate
-    p.add_argument("--bmr-gate", action="store_true",
-                   help="enable the per-data-point BMR smoothing gate in the CAVI update")
-    p.add_argument("--bmr-warmup", type=int, default=0,
-                   help="skip the BMR gate for the first N update steps (the mu=0 seed gate is useless)")
-    # epsilon-contamination mixture (robust likelihood / learned BMR gate; floors the NLL tail)
-    p.add_argument("--learn-eps", action="store_true",
-                   help="self-tune the eps-contamination weight in-update via conjugate Beta(1, 1/eps_init) updating")
-    p.add_argument("--eps-init", type=float, default=0.0,
-                   help="with --learn-eps sets the Beta(1, 1/eps_init) prior (mean ~ eps_init); else the fixed eps (>0 activates the mixture). Forgetting rho = 1 - B/N set automatically.")
+                   help="override q0 directly; pass 1/D to reproduce the pre-Wishart regime")
+    p.add_argument("--kappa", type=float, default=None,
+                   help="Inverse-Wishart prior pseudo-count (default: num_classes, i.e. one batch's weight)")
+    p.add_argument("--warmup", type=int, default=1,
+                   help="defer the gate and the q recursion for the first N steps (the mu=0 seed is uninformative)")
+    p.add_argument("--eps-init", type=float, default=0.01,
+                   help="Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init). Forgetting rho = 1 - B/N set automatically.")
     # Infra
     p.add_argument("--run-id", default=None, help="Parent MLflow run ID")
     p.add_argument("--experiment-name", default="bllarse")

@@ -215,7 +215,9 @@ def main(args, m_config, o_config):
         loss_fn = CrossEntropy(args.label_smooth, m_config['num_classes'])
     elif args.loss_fn == 'IBProbit':
         key, _key = jr.split(key)
-        loss_fn = IBProbit(m_config['embed_dim'], m_config['num_classes'], key=_key)
+        # pre-Wishart default; this script is not part of the q study
+        loss_fn = IBProbit(m_config['embed_dim'], m_config['num_classes'], key=_key,
+                            q_init=1.0 / m_config['embed_dim'])
 
     if args.nodataaug:
         _augdata = lambda img, key=None, **kwargs: augdata(img, key=None, **kwargs)

@@ -322,7 +322,9 @@ def run_experiment(args):
                             key_init, key_train = jr.split(key)
 
                             # Initialize fresh IBProbit head
-                            loss_fn = IBProbit(embed_dim, num_classes, key=key_init)
+                            # pre-Wishart default; this script is not part of the q study
+                            loss_fn = IBProbit(embed_dim, num_classes, key=key_init,
+                                                q_init=1.0 / embed_dim)
 
                             start_t = time.time()
                             trained_loss_fn, trained_nnet, _, _ = run_training(

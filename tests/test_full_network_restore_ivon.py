@@ -124,7 +124,8 @@ def _build_backbone(config: Dict[str, Any]) -> Tuple[eqx.Module, str, int]:
 def _build_ibprobit_head(embed_dim: int, dataset: str) -> IBProbit:
     num_classes = _NUM_CLASSES[dataset]
     key = jr.PRNGKey(0)
-    return IBProbit(embed_dim, num_classes, key=key)
+    # pre-Wishart default; this script is not part of the q study
+    return IBProbit(embed_dim, num_classes, key=key, q_init=1.0 / embed_dim)
 
 
 def _rebuild_optimizer(config: Dict[str, Any], dataset: str):

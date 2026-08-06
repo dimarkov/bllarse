@@ -619,10 +619,8 @@ def main(args):
             }
             if args.loss_fn == "IBProbit":
                 log_params.update(
-                    px=args.px, fix_q=args.fix_q, hyper_lr=args.hyper_lr,
-                    anchor_weight=args.anchor_weight, q_init=args.q_init,
-                    sigma_z2_init=args.sigma_z2_init, bmr_gate=args.bmr_gate,
-                    bmr_warmup=args.bmr_warmup, learn_eps=args.learn_eps,
+                    px=args.px, learn_q=not args.no_learn_q, alpha=args.alpha,
+                    q_init=args.q_init, kappa=args.kappa, warmup=args.warmup,
                     eps_init=args.eps_init,
                     eps_rho=max(0.0, 1.0 - batch_size / n_train),
                 )
@@ -643,11 +641,9 @@ def main(args):
             eps_rho = max(0.0, 1.0 - batch_size / n_train)
             loss_fn = IBProbit(
                 embed_dim, num_classes, key=loss_key,
-                q_init=args.q_init, sigma_z2_init=args.sigma_z2_init,
-                learn_q=not args.fix_q, hyper_lr=args.hyper_lr,
-                anchor_weight=args.anchor_weight, px=args.px,
-                bmr_gate=args.bmr_gate, bmr_warmup=args.bmr_warmup,
-                learn_eps=args.learn_eps, eps_init=args.eps_init, rho=eps_rho,
+                q_init=args.q_init, alpha=args.alpha, batch_size=batch_size,
+                kappa=args.kappa, learn_q=not args.no_learn_q, px=args.px,
+                warmup=args.warmup, eps_init=args.eps_init, rho=eps_rho,
             )
             num_update_iters = params["num_update_iters"]
         elif args.loss_fn == "CrossEntropy":
@@ -708,14 +704,14 @@ def main(args):
                 "nll": f"{float(nll):.4f}",
             }
 
-            # Surface the self-tuned IBProbit scalars (q always; eps only when the
-            # eps-contamination mixture is active -- sigma_z^2 is fixed, so it is dropped).
+            # Surface the self-tuned IBProbit scalars: the mean diagonal of Qhat, and
+            # eps (always live -- the contamination mixture is structural now).
             if args.loss_fn == "IBProbit":
-                metrics["q"] = float(loss_fn.q)
-                postfix["q"] = f"{float(loss_fn.q):.3g}"
-                if loss_fn.use_eps:
-                    metrics["eps"] = float(loss_fn.eps)
-                    postfix["eps"] = f"{float(loss_fn.eps):.3g}"
+                q_mean = float(jnp.trace(loss_fn.Qhat) / loss_fn.Qhat.shape[0])
+                metrics["q"] = q_mean
+                postfix["q"] = f"{q_mean:.3g}"
+                metrics["eps"] = float(loss_fn.eps)
+                postfix["eps"] = f"{float(loss_fn.eps):.3g}"
 
             # Model selection by val NLL when early stopping, else by test NLL
             selection_nll = nll
@@ -805,24 +801,18 @@ def build_argparser():
     # --- IBProbit head knobs (mirror scripts/alternatives/ood_evaluation.py) ---
     parser.add_argument("--px", action="store_true",
                         help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
-    parser.add_argument("--fix-q", action="store_true",
-                        help="fix q at its init (disable the in-update self-tuning q gradient)")
-    parser.add_argument("--hyper-lr", type=float, default=0.1,
-                        help="in-update prequential SGD step size for log_q")
-    parser.add_argument("--anchor-weight", type=float, default=1e-3,
-                        help="Inverse-Gamma anchor strength on q (mode at its init); 0 = off")
+    parser.add_argument("--no-learn-q", action="store_true",
+                        help="hold Q at its isotropic prior q0*I (the ablation arm); default infers it")
+    parser.add_argument("--alpha", type=float, default=1e-3,
+                        help="prior scale on the process noise: q0 = alpha^2 / batch_size (q-update-spec 5.5e)")
     parser.add_argument("--q-init", type=float, default=None,
-                        help="process-noise q init / fixed value (default 1/D, the LayerNorm-scale floor)")
-    parser.add_argument("--sigma-z2-init", type=float, default=1.0,
-                        help="fixed sigma_z^2 (the moderation floor; not a learnable parameter)")
-    parser.add_argument("--bmr-gate", action="store_true",
-                        help="enable the per-data-point BMR smoothing gate in the CAVI update")
-    parser.add_argument("--bmr-warmup", type=int, default=0,
-                        help="skip the BMR gate for the first N update steps (the mu=0 seed gate is useless)")
-    parser.add_argument("--learn-eps", action="store_true",
-                        help="self-tune the eps-contamination weight in-update via conjugate Beta(1, 1/eps_init) updating")
-    parser.add_argument("--eps-init", type=float, default=0.0,
-                        help="with --learn-eps sets the Beta(1, 1/eps_init) prior (mean ~ eps_init); else the fixed eps (>0 activates the mixture). Forgetting rho = 1 - B/N is set automatically.")
+                        help="override q0 directly; pass 1/D to reproduce the pre-Wishart regime")
+    parser.add_argument("--kappa", type=float, default=None,
+                        help="Inverse-Wishart prior pseudo-count (default: num_classes, i.e. one batch's weight)")
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="defer the gate and the q recursion for the first N steps (the mu=0 seed is uninformative)")
+    parser.add_argument("--eps-init", type=float, default=0.01,
+                        help="Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init). Forgetting rho = 1 - B/N is set automatically.")
     parser.add_argument("--label-smooth", type=float, default=0.0, help="Label smoothing (for CrossEntropy)")
     parser.add_argument("--device", type=str, default="gpu", help="Device to use")
     parser.add_argument("--experiment-name", type=str, default="bllarse", help="MLflow experiment name")

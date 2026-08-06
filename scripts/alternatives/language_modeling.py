@@ -323,7 +323,9 @@ def main(args):
     print(f"Initializing Bayesian LM head: {embed_dim} -> {vocab_size}")
     
     if args.loss_fn == "IBProbit":
-        lm_head = IBProbit(embed_dim, vocab_size, key=lm_key)
+        # pre-Wishart default; this script is not part of the q study
+        lm_head = IBProbit(embed_dim, vocab_size, key=lm_key,
+                            q_init=1.0 / embed_dim)
     else:
         raise ValueError(f"Unknown loss function: {args.loss_fn}")
     

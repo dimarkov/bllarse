@@ -13,8 +13,8 @@ from bllarse.losses.bayesian import IBProbit
 
 def _kwargs():
     """Exactly the kwarg set the three scripts construct with."""
-    return dict(alpha=1e-3, batch_size=32, learn_q=True, px=True,
-                warmup=1, eps_init=0.01, rho=0.9)
+    return dict(q_init=None, alpha=1e-3, batch_size=32, kappa=None,
+                learn_q=True, px=True, warmup=1, eps_init=0.01, rho=0.9)
 
 
 def test_scripts_kwargs_construct_a_head():
