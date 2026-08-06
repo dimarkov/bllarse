@@ -33,6 +33,21 @@ def test_batch_size_required_when_q_init_absent():
         IBProbit(12, 5, key=jr.key(0))
 
 
+def test_alpha_default_is_off_the_inert_operating_point():
+    """The alpha default is load-bearing, so pin it. At alpha=1e-3 the recursion is
+    provably inert -- q0 = 1e-6/B puts the drift signal at ~1e-8 of S_t, and
+    learn_q=True vs False give bit-identical mu over 40 steps. The default was raised
+    to 0.1 (q0 = 0.01/B, near the pre-Wishart 1/D operating point) for that reason.
+    Every other test passes alpha explicitly, so nothing else would catch a revert."""
+    D, K, B = 12, 5, 32
+    lf = IBProbit(D, K, key=jr.key(0), batch_size=B)
+    assert lf.q0 == pytest.approx(0.01 / B), (
+        f"default alpha appears to have changed: q0={lf.q0}, expected {0.01 / B}")
+    # explicitly passing the old value must still be reachable for the q0 A/B
+    old = IBProbit(D, K, key=jr.key(0), alpha=1e-3, batch_size=B)
+    assert old.q0 == pytest.approx(1e-6 / B)
+
+
 def test_kappa_defaults_to_num_classes():
     D, K, B = 12, 5, 32
     lf = IBProbit(D, K, key=jr.key(0), alpha=1e-3, batch_size=B)
