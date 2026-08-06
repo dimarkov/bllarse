@@ -379,6 +379,32 @@ strengthens the OOD argument by making the moderation denominator a learned
 Mahalanobis form — that claim is about expressiveness in principle, not about
 what is exercised while `Qhat` stays pinned near `q0*I`.
 
+### 4.9 Consequence: `loss_type=3` collapses onto `loss_type=2`
+
+Making the contamination mixture structural (§4.1) means `__call__` always scores
+through `_mixture_logp`, which consumes only the *transformed logits* returned by
+`_loss_from_logits`, never its loss value. For `loss_type=2` those logits are
+`logcdf(x) - logcdf(-x)`; for `loss_type=3` they are `logits1 - logcdf(-x)` with
+`logits1 = logcdf(x)` — algebraically the same expression. The mixed loss's
+distinguishing part, `loss_cbm - softplus(loss_cbm - loss_cbc) + log(2)`, lives in
+the loss branch that `_mixture_logp` does not read.
+
+Measured (d=8, K=4, 8 CAVI iters, mean loss):
+
+| `loss_type` | mean loss |
+|---|---|
+| 1 (CBM) | 0.949715316 |
+| 2 (CBC) | 0.878441095 |
+| 3 (mixed) | 0.878441095 |
+
+So `loss_type` now has two distinguishable values through `__call__`, not three.
+Before the mixture became structural, `eps_init=0.0` routed to `_loss_from_logits`
+directly and 3 was distinct. This is moot for the shipping path — the repo owner
+ruled that IBProbit heads use the default CBC, and the inert per-call `loss_type`
+kwargs were retired accordingly — but it means a future sweep over `loss_type`
+will silently produce duplicate columns for 2 and 3, and `benchmarks/bayesian_losses.py`
+does exactly that. Left as-is deliberately; recorded so it is not rediscovered as a bug.
+
 ## 5. Testing
 
 Commit 1 is verified by the ported suite passing, minus the one recomputed pin.
