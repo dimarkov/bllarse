@@ -165,16 +165,6 @@ def test_increment_statistic_diagonal_matches_the_scalar_spec():
         jnp.abs(jnp.diagonal(S) - expected).max())
 
 
-def test_increment_statistic_grows_with_real_drift():
-    """A genuine mean shift must enter S_t and not shrink away with Qhat."""
-    d, K = 9, 4
-    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3)
-    Qhat, Lambda_pred, _, Sigma_new, Delta = _random_state(jr.key(4), d, K)
-    small = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
-    large = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, 10.0 * Delta)
-    assert jnp.trace(large) > jnp.trace(small)
-
-
 def test_moderated_predictive_is_the_exact_marginal():
     """q-update-spec sec 5.8: probit composed with a Gaussian conjugates EXACTLY, so
         E_{w ~ N(mu, Sigma + Qhat)}[Phi(w'f)] = Phi(mu'f / sqrt(1 + f'(Sigma + Qhat)f)).
@@ -453,17 +443,43 @@ def test_q_recursion_has_a_fixed_point_at_the_covariance_floor():
     EXACT fixed point of the gamma=0 update: Psi(1 + K/(nu-d-1))/(nu-d-1+K) = Psi/(nu-d-1).
     So the estimator sits at its seed and the only forcing is the O(Qhat^2) drift term.
     Pinned deliberately: this is a real, measured property of the recursion, not an
-    aspiration, and a future change to the statistic should have to confront it."""
+    aspiration, and a future change to the statistic or the recursion should have to
+    confront it.
+
+    Exercised through the real `_increment_statistic` and `_q_recursion`, not
+    hand-derived arithmetic. `Delta=0` (mu did not move) and
+    `Sigma_new = Sigma_prev + Qhat` (the M-step added no precision, e.g. every point
+    in the batch got gated out) make `_increment_statistic` GENUINELY return `K*Qhat`
+    -- checked directly below before trusting the rest. `(Psi, nu)` are moved off the
+    prior first, because at t=0 (Psi == Psi0, nu == nu0) the convex combination in
+    `_q_recursion` collapses to the fixed point for ANY gamma, which would let this
+    pass without actually isolating the gamma=0 case (see
+    test_q_recursion_convex_combination_off_the_prior). `(p_a, p_b)` are set to an
+    extreme ratio so the surprise rate gamma computed by the real code underflows
+    toward 0, rather than being asserted or hardcoded."""
+    import equinox as eqx
     d, K = 9, 4
     lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
     Psi0, nu0 = lf._q_seed()
+    lf = eqx.tree_at(lambda m: (m.Psi, m.nu, m.p_a, m.p_b), lf,
+                     (Psi0 * 0.7, nu0 + 5.0, jnp.float32(1e-30), jnp.float32(1.0)))
+
     Qhat = lf.Qhat
-    S = K * Qhat                                  # the leading-order statistic
-    nu_t = (1 - 0.0) * lf.nu + 0.0 * nu0 + K      # gamma = 0
-    Psi_t = lf.Psi + S
-    Qhat_t = Psi_t / (nu_t - d - 1)
-    assert jnp.allclose(Qhat_t, Qhat, rtol=1e-5), (
-        "S = K*Qhat must reproduce Qhat exactly; if this fails the statistic changed")
+    Sigma_prev = lf.Sigma
+    Lambda_pred = jnp.linalg.inv(Sigma_prev + Qhat)
+    Sigma_new = Sigma_prev + Qhat                 # M-step added no precision
+    Delta = jnp.zeros((d, K))                     # -> mu did not move
+
+    S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    assert jnp.allclose(S, K * Qhat, rtol=1e-5), (
+        "construction failed to make the statistic genuinely equal K*Qhat")
+
+    Psi_n, nu_n, _, _, gamma = lf._q_recursion(Qhat, Lambda_pred, Sigma_new, Delta, K)
+    assert float(gamma) < 1e-4, "gamma must be ~0 to isolate the gamma=0 fixed point"
+    Qhat_new = Psi_n / (nu_n - d - 1.0)
+    assert jnp.allclose(Qhat_new, Qhat, rtol=1e-4), (
+        "S = K*Qhat must reproduce Qhat through the real recursion; if this fails the "
+        "statistic or the recursion changed")
 
 
 def test_increment_statistic_drift_term_responds_to_delta():

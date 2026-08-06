@@ -11,9 +11,6 @@ from functools import partial
 
 const = jnp.sqrt(2 / jnp.pi)
 
-def approx_cdf(x):
-    return nn.sigmoid(2 * const * (x + 0.044715 * x ** 3) )
-
 def approx_logcdf(x):
     z = 2 * const * (x + 0.044715 * x ** 3)
     return z - nn.softplus(z)
@@ -54,7 +51,8 @@ class IBProbit(eqx.Module):
     The process noise is a full matrix ``Q`` carried as a conjugate
     Inverse-Wishart posterior ``(Psi, nu)``; ``Qhat = Psi / (nu - d - 1)`` is its
     mean, the object the PREDICT step needs. Seeded isotropically at
-    ``E_0[Q] = q0 I``.
+    ``E_0[Q] = q0 I``. See ``_q_recursion``'s docstring for a MEASURED LIMITATION:
+    at the operating points measured so far this recursion barely moves ``Qhat``.
 
     The predictive (used at eval and by every internal gate) is the moderated probit
         logit_ik = mu_k^T f / sqrt( 1 + f^T (Qhat + Sigma) f ),
@@ -76,7 +74,6 @@ class IBProbit(eqx.Module):
     beta: Array            # scalar temperature (calibrate baseline only)
     # --- static-ish (non-array leaves) ---
     use_bias: bool
-    cdf: Callable
     logcdf: Callable
     posterior_ready: bool
     # --- static config ---
@@ -150,6 +147,13 @@ class IBProbit(eqx.Module):
         self.learn_q = bool(learn_q)
         self.warmup = int(warmup)
         self.loss_type = int(loss_type)
+        if self.loss_type not in (1, 2, 3):
+            raise ValueError(
+                f"loss_type must be 1 (CBM), 2 (CBC) or 3 (mixed), got {self.loss_type}. "
+                "The contamination responsibility reads exp(-loss) as a normalised "
+                "p_model(y), which holds only for the softmax losses; at loss_type=0 "
+                "(per-class BCE sum) the gate collapses and the head stops assimilating."
+            )
         self.px = bool(px)
         self.eps_init = float(eps_init)
         self.rho = float(rho)
@@ -159,7 +163,6 @@ class IBProbit(eqx.Module):
         self.step = jnp.zeros((), dtype=jnp.int32)
         self.beta = jnp.ones((), dtype=jnp.float32)
         self.use_bias = use_bias
-        self.cdf = approx_cdf if use_approx_cdf else norm.cdf
         self.logcdf = approx_logcdf if use_approx_cdf else norm.logcdf
         self.posterior_ready = False
 
@@ -205,7 +208,8 @@ class IBProbit(eqx.Module):
     @property
     def eps(self) -> Array:
         """Mixture contamination weight eps = eps_alpha / (eps_alpha + eps_beta) in (0, 1),
-        the mean of the conjugate Beta posterior (fixed at eps_init when eps is not learned)."""
+        the mean of the conjugate Beta posterior. eps is always inferred conjugately
+        (there is no learn_eps switch); eps_init only seeds the Beta prior's mean."""
         return self.eps_alpha / (self.eps_alpha + self.eps_beta)
 
     def _eps_seed(self) -> Tuple[float, float]:
@@ -442,6 +446,11 @@ class IBProbit(eqx.Module):
                        p_a: Array, p_b: Array, K: int) -> Array:
         """VarSMiLe's adaptive forgetting rate gamma for the process-noise node.
 
+        "Adaptive" describes the derivation, not necessarily observed behaviour: gamma
+        is computed correctly at every operating point measured so far, but the update
+        it feeds (``_q_recursion``) is close to inert there -- see that docstring's
+        MEASURED LIMITATION paragraph.
+
         q-update-spec sec 5.5(c): gamma = m Sbar / (1 + m Sbar) with m = E[p_c]/(1-E[p_c])
         = p_a/p_b, computed as a sigmoid of log(m) + log(Sbar) so it cannot overflow.
 
@@ -460,6 +469,16 @@ class IBProbit(eqx.Module):
                      Delta: Array, K: int) -> Tuple[Array, Array, Array, Array, Array]:
         """Steps 5-8 of q-update-spec sec 8: the conjugate hyper-updates.
 
+        MEASURED LIMITATION. In practice this node barely moves. When Qhat << Sigma the
+        covariance term of S_t is K*Qhat (first order in Qhat) while the drift signal is
+        O(Qhat^2) (second order), and S_t = K*Qhat is an EXACT fixed point of the gamma=0
+        update -- so Qhat sits at its seed and the only forcing is quadratically suppressed.
+        At alpha=1e-3 (q0 = alpha^2/B = 3.1e-8) this made learn_q=True and learn_q=False
+        give bit-identical mu over 40 steps; the default was raised to alpha=0.1, which
+        lifts the drift fraction of S_t from ~1.2e-8 to ~1.8e-5 but does not make the
+        mechanism responsive. Read "adaptive" and "inferred" below as descriptions of the
+        derivation, not of observed behaviour at these operating points.
+
         S_t | Q ~ Wishart_d(Q, K), whose conjugate is the Inverse-Wishart, so absent
         forgetting the update is nu += K, Psi += S_t. VarSMiLe replaces the fixed EMA
         discount with the inferred rate gamma:
@@ -468,9 +487,11 @@ class IBProbit(eqx.Module):
             Psi_t = (1 - gamma) Psi_{t-1} + gamma Psi_0 + S_t
 
         At large gamma this lands on (Psi_0 + S_t, nu_0 + K) -- the prior plus this
-        batch -- so a detected change discards the stale drift estimate. gamma is the
-        variational responsibility q(c_t = 1), so it doubles as the soft count for the
-        Beta on the change rate p_c.
+        batch -- so a detected change discards the stale drift estimate, WHEN gamma
+        actually reaches a large value; per the limitation above, at the measured
+        operating points S_t itself carries almost no drift signal to detect. gamma is
+        the variational responsibility q(c_t = 1), so it doubles as the soft count for
+        the Beta on the change rate p_c.
 
         Note the Beta on p_c gets ONE count per step here where the diagonal
         formulation got d, so p_c identifies roughly d times slower and the prior mean

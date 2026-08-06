@@ -73,10 +73,15 @@ def test_kwargs_alpha_matches_the_scripts_argparse_default():
     """
     import importlib
     import sys
-    sys.path.insert(0, "scripts/alternatives")
-    for mod in ("ood_evaluation", "full_finetune_comparison", "vit_classification"):
-        M = importlib.import_module(mod)
-        p = M.build_argparser() if hasattr(M, "build_argparser") else M.get_parser()
-        default = next(a.default for a in p._actions if a.dest == "alpha")
-        assert default == _kwargs()["alpha"], (
-            f"{mod} --alpha default {default} != _kwargs() alpha {_kwargs()['alpha']}")
+    from pathlib import Path
+    alt_dir = str(Path(__file__).resolve().parents[1] / "scripts" / "alternatives")
+    sys.path.insert(0, alt_dir)
+    try:
+        for mod in ("ood_evaluation", "full_finetune_comparison", "vit_classification"):
+            M = importlib.import_module(mod)
+            p = M.build_argparser() if hasattr(M, "build_argparser") else M.get_parser()
+            default = next(a.default for a in p._actions if a.dest == "alpha")
+            assert default == _kwargs()["alpha"], (
+                f"{mod} --alpha default {default} != _kwargs() alpha {_kwargs()['alpha']}")
+    finally:
+        sys.path.remove(alt_dir)

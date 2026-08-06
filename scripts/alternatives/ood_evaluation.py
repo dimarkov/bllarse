@@ -435,7 +435,7 @@ def build_argparser():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smooth", type=float, default=0.0, help="CrossEntropy only")
     p.add_argument("--patience", type=int, default=5)
-    # IBProbit streaming trainer (process-noise CAVI; q self-tuned in-update, sigma_z^2 fixed)
+    # IBProbit streaming trainer (process-noise CAVI; q self-tuned in-update, sigma_z^2 gauge-fixed at 1)
     p.add_argument("--num-update-iters", type=int, default=128, help="CAVI mean iters per batch")
     p.add_argument("--px", action="store_true",
                    help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")

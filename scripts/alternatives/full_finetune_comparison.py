@@ -16,8 +16,9 @@ gradient is taken against the current head and the backbone features are stored;
 after the accumulated trunk gradient is applied, those stored features are
 assimilated into the head in a SINGLE CAVI update over the whole target batch (so
 the grad forward pass is reused -- no second forward). Trunk gradients are w.r.t.
-the backbone only; the head scalars q and eps are self-tuned solely inside that
-one update() call.
+the backbone only; the head's process-noise matrix Q (Inverse-Wishart posterior)
+and contamination rate eps (Beta posterior) are updated by the conjugate
+recursion -- not a gradient step -- solely inside that one update() call.
 
 Both arms consume the identical shuffled data stream (same seed, same batch
 order) and share AdamW hyperparameters for the backbone.

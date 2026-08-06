@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 from jax import nn
 import equinox as eqx
 from bllarse.losses import IBProbit, IBPolyaGamma, MultinomialPolyaGamma
@@ -160,7 +161,11 @@ def test_ibprobit_predictive_denominator():
     formula is checked directly against _predictive_logits rather than through __call__."""
     key = jr.PRNGKey(0)
     D, C, N = 6, 3, 128
-    m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=0).update(
+    # loss_type is irrelevant here -- _predictive_logits (unlike __call__) does not
+    # consume it at all -- so any supported value does; loss_type=0 (per-class BCE) is
+    # no longer constructible (it breaks the contamination gate, see
+    # test_loss_type_zero_and_four_are_rejected), so use the CBM loss instead.
+    m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=1).update(
         jr.normal(jr.PRNGKey(1), (N, D)), jr.randint(jr.PRNGKey(2), (N,), 0, C), num_iters=8)
     f = jr.normal(jr.PRNGKey(5), (32, D))
     fts = _pad(f)
@@ -214,16 +219,32 @@ def test_ibprobit_reset_posterior_restores_seed():
 
 def test_ibprobit_loss_type_is_instance_field_not_call_arg():
     """loss_type is fixed at construction; a per-call loss_type is accepted but
-    ignored (enforces a single convergence target)."""
+    ignored (enforces a single convergence target). Instance field (1, CBM) and
+    passed-but-ignored arg (3, mixed) are kept deliberately different supported
+    values -- loss_type=0 no longer constructs, see
+    test_loss_type_zero_and_four_are_rejected."""
     key = jr.PRNGKey(0)
     D, C, N = 6, 3, 128
-    m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=0).update(
+    m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=1).update(
         jr.normal(jr.PRNGKey(1), (N, D)), jr.randint(jr.PRNGKey(2), (N,), 0, C), num_iters=8)
     f = jr.normal(jr.PRNGKey(5), (16, D)); y = jr.randint(jr.PRNGKey(6), (16,), 0, C)
 
-    _, logits_field = m(f, y, with_logits=True)               # uses instance loss_type=0
+    _, logits_field = m(f, y, with_logits=True)               # uses instance loss_type=1
     _, logits_ignored = m(f, y, with_logits=True, loss_type=3)  # passed 3 is ignored
     assert jnp.allclose(logits_field, logits_ignored)
+
+
+@pytest.mark.parametrize("bad_loss_type", [0, 4])
+def test_loss_type_zero_and_four_are_rejected(bad_loss_type):
+    """loss_type must be 1 (CBM), 2 (CBC) or 3 (mixed) -- constructor-time, not just at
+    call time. _eps_responsibility reads exp(-loss) as a normalised p_model(y), which
+    holds for the softmax losses (1/2/3) but not loss_type=0 (a per-class BCE sum,
+    not a normalised distribution over classes): the gate collapses and the head stops
+    assimilating. loss_type=4 is simply out of range and would otherwise fall through
+    _loss_from_logits' if/elif chain with no else, raising UnboundLocalError instead of
+    a clear error."""
+    with pytest.raises(ValueError, match="loss_type must be 1"):
+        IBProbit(6, 3, key=jr.PRNGKey(0), q_init=1.0 / 6, loss_type=bad_loss_type)
 
 
 def test_ibprobit_call_with_logits_unchanged_after_refactor():

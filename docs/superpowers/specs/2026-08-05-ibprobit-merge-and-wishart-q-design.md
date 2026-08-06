@@ -118,7 +118,10 @@ Matching argparse flags come out of `ood_evaluation.py`,
 them will fail loudly rather than silently do nothing.
 
 `bmr_warmup` survives, renamed `warmup`: BMR is gone from the vocabulary and it now
-defers the `q` recursion (§4.5 below) rather than the gate.
+defers both the gate and the `q` recursion (§4.5 below), not just the recursion —
+`update()` holds the gate at 1.0 and skips steps 5-8 for the same `step < warmup`
+condition (`bayesian.py` around the gate assignment and the `engaged` check in
+`update()`), and the CLI help strings for `--warmup` say so.
 
 `learn_q` survives as a name but changes meaning — see §4.6.
 
@@ -134,9 +137,11 @@ Cholesky per batch and K-parallel inner loop are untouched.
 It strengthens the OOD argument. The spec sells per-component `q` as an "ARD-like,
 axis-aligned uncertainty inflation". A full `Qhat` makes the moderation denominator
 a learned Mahalanobis form, `s(f) = sqrt(1 + f'(Qhat + Sigma)f)`, which is strictly
-more expressive along the same argument. It also collapses `d` independent nodes
-into one, which is the honest model: feature directions under a drifting backbone do
-not drift independently.
+more expressive along the same argument — in principle: see §4.8, which measures
+`Qhat` staying pinned near `q0*I` in practice, so this expressiveness is not yet
+observed to be exercised. It also collapses `d` independent nodes into one, which
+is the honest model: feature directions under a drifting backbone do not drift
+independently.
 
 ### 4.3 State and prior
 
@@ -329,6 +334,50 @@ This is same-order-as, not negligible-against, the Cholesky already being done �
 roughly 3x the per-batch dense linear algebra. At `d = 1281` that is ~1.5 GFLOP and
 irrelevant on GPU, but it is no longer the "handful of lgamma calls" the diagonal
 spec advertised. **The paper's complexity table must say so.**
+
+### 4.8 Measured limitation: the q recursion is close to inert
+
+In practice the node built in §4.4 barely moves `Qhat`. When `Qhat << Sigma` the
+covariance term of `S_t` is `K*Qhat` (first order in `Qhat`) while the drift signal
+is `O(Qhat^2)` (second order), and `S_t = K*Qhat` is an EXACT fixed point of the
+`gamma=0` update — so `Qhat` sits at its seed and the only forcing is quadratically
+suppressed. At `alpha=1e-3` (`q0 = alpha^2/B = 3.1e-8`) this made `learn_q=True` and
+`learn_q=False` give bit-identical `mu` over 40 steps; the default was raised to
+`alpha=0.1`, which lifts the drift fraction of `S_t` but does not make the mechanism
+responsive. Measured drift fractions of `S_t` (trace of the drift term over trace of
+the total statistic):
+
+| config | drift fraction of S_t |
+|---|---|
+| d=256, q0=1e-3 | 1.4e-4 |
+| d=768, q0=1e-3 | 4.5e-5 |
+| alpha=1e-3 default (q0=3.1e-8) | 1.2e-8 |
+| alpha=0.1 default (q0=3.1e-4) | 1.8e-5 |
+
+At `alpha=0.1` the drift term does respond to real drift (1.02e-5 -> 1.45e-5, a
++42% move on a 5x larger `Delta`), so the mechanism is not dead — but the
+covariance floor is five orders of magnitude larger and unmoved by the same
+perturbation, so the response is swamped rather than absent. This is not fixed by
+better tuning of `alpha`/`q0` alone: the floor and the drift term scale together
+(both carry a factor of `Qhat` through `G = Qhat*Lambda_pred`), so raising `q0`
+raises both terms, and the ratio between them is set by how `Qhat` compares to
+`Sigma`, not by `q0` in isolation.
+
+This follows from the `G`-form of the statistic (`G = Qhat*Lambda_pred ~=
+Qhat*Sigma^-1` when `Qhat << Sigma`), not from anything specific to the
+Inverse-Wishart generalization: the diagonal, per-component-Gamma formulation in
+`q-update-spec.md` §5.5 shares the same `G`-form sufficient statistic (§4.4 above),
+so it inherits the same first-order-covariance / second-order-drift split and the
+same inertness at small `Qhat`. It is not an artifact of generalizing to a full
+matrix.
+
+`_q_recursion`'s docstring in `bayesian.py` carries the same facts, next to the
+code; read "adaptive" and "inferred" there (and in `_surprise_rate`'s docstring)
+as descriptions of the derivation, not of observed behaviour at these operating
+points. See also the forward-reference from §4.2, which claims a full `Qhat`
+strengthens the OOD argument by making the moderation denominator a learned
+Mahalanobis form — that claim is about expressiveness in principle, not about
+what is exercised while `Qhat` stays pinned near `q0*I`.
 
 ## 5. Testing
 
