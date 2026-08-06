@@ -35,6 +35,18 @@ from bllarse.losses import CrossEntropy  # noqa: E402
 # cost for no benefit, so inheriting it must be impossible by accident.
 FINETUNE_IMG_SIZE = 224
 
+# fp16-safe mask sentinel for evaluate_and_dump's `subset` masking.
+# evaldump.write_dump stores logits as float16 (max finite magnitude 65504),
+# and float16(-1e9) OVERFLOWS to -inf: entropy_ood_score and fit_temperature
+# on such a row silently return NaN while msp_ood_score still looks healthy,
+# so a downstream figure would show a working MSP column next to a silently
+# NaN entropy column. -1e4 is ~340 sigma below any real logit and comfortably
+# inside float16's -65504 floor, so it round-trips as a large but finite
+# number. full_finetune_comparison.MASK_NEG = -1e9 is safe there ONLY because
+# that mask is applied at fp32 and used purely in-memory (softmax/argmax) --
+# it never round-trips through this fp16 dump path.
+MASK_NEG = -1e4
+
 
 def check_img_size(args) -> None:
     """Refuse a non-224 resolution unless it was asked for explicitly."""
@@ -127,6 +139,34 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="CAVI iterations per macro batch (IBProbit arm).")
     p.add_argument("--bf16", action="store_true")
 
+    # --- IBProbit head knobs (mirror scripts/alternatives/ood_evaluation.py) ---
+    # Copied VERBATIM (flag names, types, defaults, help text) from
+    # full_finetune_comparison.build_argparser: probe_micro_batch_size ->
+    # build_ibprobit reads all ten of these regardless of --arm, since the
+    # prober always builds an IBProbit head to find the heavier micro-step's
+    # memory ceiling. Do not invent defaults here -- copying keeps this script
+    # and full_finetune_comparison.py at one operating point.
+    p.add_argument("--px", action="store_true",
+                   help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
+    p.add_argument("--fix-q", action="store_true",
+                   help="fix q at its init (disable the in-update self-tuning q gradient)")
+    p.add_argument("--hyper-lr", type=float, default=0.1,
+                   help="in-update prequential SGD step size for log_q")
+    p.add_argument("--anchor-weight", type=float, default=1e-3,
+                   help="Inverse-Gamma anchor strength on q (mode at its init); 0 = off")
+    p.add_argument("--q-init", type=float, default=None,
+                   help="process-noise q init / fixed value (default 1/D, the LayerNorm-scale floor)")
+    p.add_argument("--sigma-z2-init", type=float, default=1.0,
+                   help="fixed sigma_z^2 (the moderation floor; not a learnable parameter)")
+    p.add_argument("--bmr-gate", action="store_true",
+                   help="enable the per-data-point BMR smoothing gate in the CAVI update")
+    p.add_argument("--bmr-warmup", type=int, default=0,
+                   help="skip the BMR gate for the first N update steps (the mu=0 seed gate is useless)")
+    p.add_argument("--learn-eps", action="store_true",
+                   help="self-tune the eps-contamination weight in-update via conjugate Beta(1, 1/eps_init) updating")
+    p.add_argument("--eps-init", type=float, default=0.0,
+                   help="with --learn-eps sets the Beta(1, 1/eps_init) prior (mean ~ eps_init); else the fixed eps (>0 activates the mixture). Forgetting rho = 1 - B/N set automatically.")
+
     p.add_argument("--n-dumps", type=int, default=protocol.DEFAULT_N_DUMPS)
     p.add_argument(
         "--ood-every-k-dumps", type=int, default=2,
@@ -192,8 +232,8 @@ def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
     expansion only ever covers `--eval-chunk` images at a time.
 
     `subset`, if given, restricts scoring to those class indices: every other
-    logit is driven to -1e9 before the dump is written and before metrics are
-    computed, so both share the same masked view (OOD evaluation over
+    logit is driven to MASK_NEG before the dump is written and before metrics
+    are computed, so both share the same masked view (OOD evaluation over
     ImageNet-R/-A, which cover only 200 of the 1000 classes).
     """
     inference_bb = eqx.nn.inference_mode(backbone, True)
@@ -214,7 +254,7 @@ def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
     if subset is not None:
         keep = np.zeros(logits.shape[-1], dtype=bool)
         keep[np.asarray(subset)] = True
-        logits = np.where(keep, logits, -1e9)
+        logits = np.where(keep, logits, MASK_NEG)
 
     evaldump.write_dump(
         args.dump_root, args.group_id, args.uid, step,
@@ -395,9 +435,16 @@ def main(args, on_dump=None) -> None:
             if on_dump is not None:
                 on_dump(dump_index, step, scalars)
             dump_index += 1
-            jax.clear_caches()
+            # gc.collect() only -- NOT jax.clear_caches() here. Dropping the
+            # compiled fwd+bwd graph plus the eval-chunk shapes on every dump
+            # (up to --n-dumps times a run) forces a full cold XLA recompile
+            # each time: this repo has no persistent compilation cache
+            # configured, so at --n-dumps 24 that is an estimated 20-70
+            # minutes of a 4-hour run. full_finetune_comparison.py only clears
+            # once, at the very end of a run, for the same reason -- see below.
             gc.collect()
 
+    jax.clear_caches()
     print(f"[finetune] done: {dump_index} dumps under "
           f"{args.dump_root}/{args.group_id}/{args.uid}")
 

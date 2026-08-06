@@ -25,6 +25,8 @@ surrounding control flow -- in particular "no optimizer step at step == 1" --
 checked against the real `main` loop.
 """
 
+import inspect
+import re
 import sys
 import types
 from pathlib import Path
@@ -38,11 +40,13 @@ import jax.numpy as jnp
 import equinox as eqx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "finetune"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "alternatives"))
 
 import finetune_jax as fj  # noqa: E402
 
-from bllarse import evaldump  # noqa: E402
+from bllarse import evaldump, metrics as bllarse_metrics  # noqa: E402
 from bllarse.finetune import jax_steps  # noqa: E402
+from bllarse.losses import IBProbit  # noqa: E402
 
 
 # --- Shared fakes -----------------------------------------------------------
@@ -189,6 +193,44 @@ def test_samples_seen_tracks_the_effective_batch(tmp_path):
     assert record.meta["samples_seen"] == 7168
 
 
+# --- auto-probe contract: build_argparser must cover what the prober reads -
+#
+# main()'s auto-probe path (when --micro-batch-size is omitted) calls
+# full_finetune_comparison.probe_micro_batch_size, which unconditionally
+# builds an IBProbit head via build_ibprobit -- regardless of --arm, since the
+# prober always measures the heavier of the two arms' micro-steps. That
+# function reads ten args.* attributes finetune_jax's build_argparser did not
+# originally define, so the auto-probe path raised AttributeError (masked by
+# an UnboundLocalError from build_ibprobit's `finally: del loss_fn`) on the
+# documented default invocation. The list below is DERIVED from the actual
+# source via a regex over `args.<name>` accesses, not hardcoded, so this test
+# keeps working if that attribute set changes again.
+
+
+def _args_attrs_touched(fn) -> set:
+    """Every `args.<name>` attribute access textually present in fn's source."""
+    return set(re.findall(r"\bargs\.([A-Za-z_][A-Za-z0-9_]*)\b", inspect.getsource(fn)))
+
+
+def test_probe_micro_batch_size_args_are_all_defined_on_finetune_jax_namespace():
+    import full_finetune_comparison as ffc  # noqa: E402 -- heavy, kept local to this test
+
+    touched = _args_attrs_touched(ffc.probe_micro_batch_size) | _args_attrs_touched(
+        ffc.build_ibprobit
+    )
+    # Sanity: the regex must actually have found the ten IBProbit knobs (and
+    # bf16/optimizer/estimator), or this test would trivially pass on zero
+    # attributes and catch nothing.
+    assert {"q_init", "px", "bmr_gate", "learn_eps", "bf16", "optimizer"} <= touched
+
+    args = fj.build_argparser().parse_args(["--arm", "ibprobit", "--batch-size", "4"])
+    missing = sorted(name for name in touched if not hasattr(args, name))
+    assert not missing, (
+        f"finetune_jax build_argparser is missing attributes the auto-probe "
+        f"path reads: {missing}"
+    )
+
+
 # --- evaluate_and_dump: exercises the REAL function, not a hand transcript -
 #
 # The brief's version of the "both splits" test called evaldump.write_dump
@@ -287,6 +329,40 @@ def test_evaluate_and_dump_subset_masks_logits_outside_the_subset(tmp_path):
     )
 
 
+def test_masked_logits_survive_the_fp16_dump_round_trip(tmp_path):
+    """MASK_NEG must not overflow float16 on the way to disk.
+
+    evaldump.write_dump stores logits as float16 (max finite magnitude
+    65504). The original choice of -1e9 OVERFLOWS to -inf there: softmax's
+    probability for that class then underflows to exactly 0.0, and
+    0.0 * (-inf) = NaN, so entropy_ood_score and fit_temperature go NaN on a
+    masked row while msp_ood_score (which never multiplies by the raw logit)
+    still looks healthy -- a downstream figure would show a working MSP
+    column next to a silently-NaN entropy column. This test must FAIL if
+    MASK_NEG reverts to -1e9 (verified by mutation in the fix report).
+    """
+    num_classes, n = 5, 8
+    rng = np.random.default_rng(11)
+    logits = rng.normal(size=(n, num_classes)).astype(np.float32)
+    keep = np.zeros(num_classes, dtype=bool)
+    keep[[0, 2]] = True
+    masked = np.where(keep, logits, fj.MASK_NEG)
+    labels = rng.integers(0, num_classes, size=(n,)).astype(np.int64)
+
+    path = evaldump.write_dump(
+        tmp_path, "g", "u", 1, masked, labels,
+        arm="ce", split="test", logit_kind="softmax_logits",
+        seed=137, samples_seen=4,
+    )
+    loaded = evaldump.load_dump(path).logits.astype(np.float32)
+
+    assert np.all(np.isfinite(loaded)), "the masked logits overflowed the fp16 dump"
+    entropy = np.asarray(bllarse_metrics.entropy_ood_score(loaded))
+    assert np.all(np.isfinite(entropy)), "entropy went NaN on a masked row"
+    temperature = bllarse_metrics.fit_temperature(loaded, labels)
+    assert np.isfinite(temperature), "fit_temperature went NaN on masked rows"
+
+
 # --- stream_micro_batches ---------------------------------------------------
 
 
@@ -332,7 +408,13 @@ def test_main_ce_arm_dumps_both_splits_at_every_scheduled_step(tmp_path, monkeyp
     argv = _base_argv(
         arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
         # imagenet.IMAGENET_N_TRAIN is patched to 8; epochs=1.0 * 8 // effective(4) = 2 steps.
-        epochs=1.0, batch_size=4, micro_batch_size=2,
+        # batch_size=5 (REQUESTED) deliberately differs from the ACHIEVED
+        # effective_batch=4 (accum_plan(5, 2) -> micro=2, num_accum=2,
+        # effective=4, since round(5/2)=2): with batch_size=4 == effective the
+        # samples_seen assertions below cannot tell "step * requested" apart
+        # from "step * achieved", so a bug that used args.batch_size directly
+        # would pass silently.
+        epochs=1.0, batch_size=5, micro_batch_size=2,
     )
     args = fj.build_argparser().parse_args(argv)
 
@@ -361,6 +443,114 @@ def test_main_ce_arm_dumps_both_splits_at_every_scheduled_step(tmp_path, monkeyp
             "val_acc", "val_ece", "val_nll", "val_brier",
             "test_acc", "test_ece", "test_nll", "test_brier",
         }
+
+
+def test_main_ce_arm_actually_trains_not_a_no_op(tmp_path, monkeypatch):
+    """Closes two mutations that survived the original suite:
+
+    (c) apply_grads never called at all -- CE training is a total no-op, and
+    (d) grads_acc divided by num_accum an extra time before apply_grads,
+        which already divides by num_accum internally (a silent 2x-too-small
+        update).
+
+    A simple "did the backbone/head change at all" check does NOT catch (d):
+    verified empirically that AdamW's per-parameter normalization
+    (m_hat / sqrt(v_hat)) is EXACTLY invariant to a constant rescale of the
+    gradient applied consistently from step 1 -- run twice, once correct and
+    once with the extra division, the final backbone params came out
+    bit-identical to 8 significant figures. So in addition to the "changed at
+    all" check, this test captures the exact grads pytree `main()` passes
+    into apply_grads at every step and compares it against an independently
+    summed reference built from the real (unmocked) per-micro-batch grads --
+    that is what actually distinguishes "summed once" from "summed then
+    halved again".
+    """
+    embed_dim, num_classes, img_size = 5, 3, 4
+    _install_fake_heavy_modules(
+        monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
+        train_n=8, eval_n=10,
+    )
+
+    grad_calls = []
+    apply_calls = []
+    dump_snapshots = []
+
+    real_ce_micro_grad = jax_steps.ce_micro_grad
+    real_apply_grads = jax_steps.apply_grads
+    real_evaluate_and_dump = fj.evaluate_and_dump
+
+    def capturing_ce_micro_grad(model, loss_fn, images, labels, key, bf16=False):
+        grads, loss = real_ce_micro_grad(model, loss_fn, images, labels, key, bf16=bf16)
+        grad_calls.append(jax.tree.map(lambda a: np.array(a), grads))
+        return grads, loss
+
+    def capturing_apply_grads(model, grads, opt_state, optimizer, num_accum):
+        # np.array(), not a bare identity tree.map: apply_grads donates
+        # `grads` (donate="all-except-first"), so a shallow snapshot would
+        # alias a buffer XLA frees/reuses inside this very call.
+        apply_calls.append((jax.tree.map(lambda a: np.array(a), grads), num_accum))
+        return real_apply_grads(model, grads, opt_state, optimizer, num_accum)
+
+    def capturing_evaluate_and_dump(arm, backbone, head_or_loss, *rest, **kw):
+        dump_snapshots.append((backbone, head_or_loss))
+        return real_evaluate_and_dump(arm, backbone, head_or_loss, *rest, **kw)
+
+    monkeypatch.setattr(jax_steps, "ce_micro_grad", capturing_ce_micro_grad)
+    monkeypatch.setattr(jax_steps, "apply_grads", capturing_apply_grads)
+    monkeypatch.setattr(fj, "evaluate_and_dump", capturing_evaluate_and_dump)
+
+    dump_root = tmp_path / "dumps"
+    split_cache = tmp_path / "splits"
+    argv = _base_argv(
+        arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
+        epochs=1.0, batch_size=5, micro_batch_size=2,
+    )
+    args = fj.build_argparser().parse_args(argv)
+    fj.main(args, on_dump=None)
+
+    num_accum, steps = 2, 2  # accum_plan(5, 2) -> micro=2, num_accum=2; 2 steps
+
+    # (c): apply_grads must actually run once per step, not be skipped.
+    assert len(apply_calls) == steps
+    assert len(grad_calls) == steps * num_accum
+
+    # (d): the grads apply_grads receives must be the raw, undivided sum of
+    # that step's micro-batch grads -- apply_grads (jax_steps.py, untouched)
+    # already divides by num_accum internally.
+    for step_idx, (received_grads, received_num_accum) in enumerate(apply_calls):
+        assert received_num_accum == num_accum
+        raw = grad_calls[step_idx * num_accum:(step_idx + 1) * num_accum]
+        expected = raw[0]
+        for other in raw[1:]:
+            expected = jax.tree.map(lambda a, b: a + b, expected, other)
+        for got, exp in zip(jax.tree.leaves(received_grads), jax.tree.leaves(expected)):
+            np.testing.assert_allclose(
+                got, exp, rtol=1e-6, atol=1e-8,
+                err_msg=(
+                    f"step {step_idx}: apply_grads did not receive the raw sum "
+                    f"of this step's micro-batch grads (it already divides by "
+                    f"num_accum internally -- dividing again before the call "
+                    f"halves every update)"
+                ),
+            )
+
+    # Documentation-level sanity check on top of the above: the trained
+    # params must actually differ from their known initial values. This
+    # alone would NOT have caught (d) (see docstring), but it is still the
+    # simplest and most direct way to catch a total no-op like (c) and any
+    # other bug that leaves the model completely unchanged.
+    key0 = jax.random.PRNGKey(int(args.seed))
+    key0, model_key0, init_key0, fwd_key0 = jax.random.split(key0, 4)
+    expected_initial_proj = jax.random.normal(model_key0, (3, embed_dim))
+    expected_initial_head = eqx.nn.Linear(embed_dim, num_classes, key=init_key0)
+
+    final_backbone, final_head = dump_snapshots[-1]
+    assert not np.allclose(
+        np.asarray(final_backbone.proj), np.asarray(expected_initial_proj)
+    ), "backbone params never changed -- training is a no-op"
+    assert not np.allclose(
+        np.asarray(final_head.weight), np.asarray(expected_initial_head.weight)
+    ), "head params never changed -- training is a no-op"
 
 
 def test_main_ibprobit_arm_skips_the_optimizer_step_at_step_one(tmp_path, monkeypatch):
@@ -400,28 +590,45 @@ def test_main_ibprobit_arm_skips_the_optimizer_step_at_step_one(tmp_path, monkey
         call_log.append("eval_logits")
         return jnp.zeros((images.shape[0], num_classes))
 
+    # loss_fn.update is the CAVI head update -- the only thing that arm does
+    # at step == 1, and it sets the leftmost point of every downstream curve.
+    # Wrapped (not faked) at the CLASS level, same as apply_grads: it still
+    # runs the real, CPU-safe computation, just counted.
+    real_update = IBProbit.update
+
+    def counting_update(self, *a, **kw):
+        call_log.append("update")
+        return real_update(self, *a, **kw)
+
     monkeypatch.setattr(jax_steps, "ibprobit_micro_forward", fake_forward)
     monkeypatch.setattr(jax_steps, "ibprobit_micro_forward_nograd", fake_forward_nograd)
     monkeypatch.setattr(jax_steps, "apply_grads", counting_apply_grads)
     monkeypatch.setattr(fj, "eval_logits_ibprobit", fake_eval_logits)
+    monkeypatch.setattr(IBProbit, "update", counting_update)
 
     dump_root = tmp_path / "dumps"
     split_cache = tmp_path / "splits"
     argv = _base_argv(
         arm="ibprobit", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
-        # 1.5 * 8 // 4 = 3 steps.
-        epochs=1.5, batch_size=4, micro_batch_size=2, num_update_iters=3,
+        # batch_size=5 requested, effective=4 achieved (see the CE test above
+        # for why); 1.5 * 8 // 4 = 3 steps either way.
+        epochs=1.5, batch_size=5, micro_batch_size=2, num_update_iters=3,
     )
     args = fj.build_argparser().parse_args(argv)
 
     fj.main(args, on_dump=None)
 
-    # step 1: forward_nograd x num_accum(2), NO apply_grads, then 2 eval calls.
-    # step 2 and 3: forward x2, exactly one apply_grads, then 2 eval calls.
+    # step 1: forward_nograd x num_accum(2), NO apply_grads, then update, then
+    # 2 eval calls. step 2 and 3: forward x2, exactly one apply_grads, update,
+    # then 2 eval calls. "update" appearing at EVERY step (including step 1,
+    # where it is the only thing IBProbit does) is the invariant closing the
+    # gap where a step-1 "skip loss_fn.update too" mutation previously
+    # survived: only counting apply_grads could not tell "correctly skipped
+    # the optimizer step" apart from "skipped everything at step 1".
     assert call_log == [
-        "forward_nograd", "forward_nograd", "eval_logits", "eval_logits",
-        "forward", "forward", "apply_grads", "eval_logits", "eval_logits",
-        "forward", "forward", "apply_grads", "eval_logits", "eval_logits",
+        "forward_nograd", "forward_nograd", "update", "eval_logits", "eval_logits",
+        "forward", "forward", "apply_grads", "update", "eval_logits", "eval_logits",
+        "forward", "forward", "apply_grads", "update", "eval_logits", "eval_logits",
     ]
 
     records = list(evaldump.iter_dumps(dump_root, "g", "u"))
