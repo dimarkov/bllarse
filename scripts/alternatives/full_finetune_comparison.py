@@ -255,6 +255,12 @@ def probe_micro_batch_size(backbone, args, embed_dim, num_classes, img_size,
     bs = init_bs
     last_ok = None
     while bs <= max_bs:
+        # Initialised before the try so a `finally: del loss_fn` can never
+        # raise UnboundLocalError over a real exception raised while
+        # constructing loss_fn itself (e.g. a TypeError from build_ibprobit) --
+        # that masking previously hid the real error behind a confusing
+        # UnboundLocalError.
+        loss_fn = None
         try:
             loss_fn = build_ibprobit(args, embed_dim, num_classes, key)
             images = jnp.zeros((bs, 3, img_size, img_size), dtype=jnp.float32)

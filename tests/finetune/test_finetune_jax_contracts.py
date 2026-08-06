@@ -28,6 +28,7 @@ checked against the real `main` loop.
 import inspect
 import re
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from PIL import Image
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import optax
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "finetune"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "alternatives"))
@@ -98,6 +100,30 @@ def _fake_images(n, size):
     ]
 
 
+def _fake_prefetch_iterator(iterator, n_prefetch=2):
+    """Stand-in for vit_classification.prefetch_iterator: the identical
+    queue/thread wrapping technique, duplicated so the fake module doesn't
+    need to import the real (heavier) one just for this one function."""
+    from queue import Queue
+    from threading import Thread
+
+    q = Queue(maxsize=n_prefetch)
+    sentinel = object()
+
+    def fill():
+        for item in iterator:
+            q.put(item)
+        q.put(sentinel)
+
+    t = Thread(target=fill, daemon=True)
+    t.start()
+    while True:
+        item = q.get()
+        if item is sentinel:
+            break
+        yield item
+
+
 def _install_fake_heavy_modules(monkeypatch, *, embed_dim, num_classes, img_size,
                                 train_n=8, eval_n=10):
     """Stand in for vit_classification and datasets so `main` never touches
@@ -124,6 +150,11 @@ def _install_fake_heavy_modules(monkeypatch, *, embed_dim, num_classes, img_size
         return DummyBackbone(proj=jax.random.normal(key, (3, embed_dim)))
 
     fake_vit.get_pretrained_backbone = get_pretrained_backbone
+    # stream_micro_batches (I5) imports prefetch_iterator from
+    # vit_classification -- duplicated here (same queue/thread technique as
+    # the real one in scripts/alternatives/vit_classification.py) so the fake
+    # module doesn't need the real, heavier one.
+    fake_vit.prefetch_iterator = _fake_prefetch_iterator
 
     train_split = FakeDatasetSplit(
         _fake_images(train_n, img_size), [i % num_classes for i in range(train_n)]
@@ -229,6 +260,48 @@ def test_probe_micro_batch_size_args_are_all_defined_on_finetune_jax_namespace()
         f"finetune_jax build_argparser is missing attributes the auto-probe "
         f"path reads: {missing}"
     )
+
+
+def test_main_ce_arm_auto_probes_via_the_local_ce_prober(tmp_path, monkeypatch):
+    """C1: the CE arm's auto-probe (no --micro-batch-size) must dispatch to
+    finetune_jax.probe_micro_batch_size_ce, NOT
+    full_finetune_comparison.probe_micro_batch_size -- the latter builds an
+    IBProbit head via build_ibprobit regardless of --arm, which is a TypeError
+    against this branch's IBProbit constructor (masked into an
+    UnboundLocalError by ffc's `finally: del loss_fn`). Monkeypatched to a
+    stub so no real probe runs.
+    """
+    embed_dim, num_classes, img_size = 5, 3, 4
+    _install_fake_heavy_modules(
+        monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
+        train_n=8, eval_n=10,
+    )
+    calls = []
+
+    def fake_prober(backbone, args, embed_dim_, num_classes_, img_size_,
+                    init_bs, max_bs, key):
+        calls.append((init_bs, max_bs))
+        return 2
+
+    monkeypatch.setattr(fj, "probe_micro_batch_size_ce", fake_prober)
+
+    dump_root = tmp_path / "dumps"
+    split_cache = tmp_path / "splits"
+    argv = [
+        "--arm", "ce", "--model", "fake_model", "--dataset", "fake",
+        "--img-size", str(img_size), "--allow-non-224",
+        "--epochs", "1.0", "--batch-size", "4",
+        "--dump-root", str(dump_root), "--group-id", "g", "--uid", "u",
+        "--split-cache-dir", str(split_cache), "--seed", "137",
+        "--ood-every-k-dumps", "0",
+        # --micro-batch-size deliberately omitted -- that's what triggers the
+        # auto-probe path this test targets.
+    ]
+    args = fj.build_argparser().parse_args(argv)
+    fj.main(args, on_dump=None)
+
+    assert len(calls) == 1, "probe_micro_batch_size_ce was not called exactly once"
+    assert calls[0] == (args.batch_size_init, args.batch_size_max)
 
 
 # --- evaluate_and_dump: exercises the REAL function, not a hand transcript -
@@ -391,6 +464,40 @@ def test_stream_micro_batches_drops_the_short_trailing_batch_and_reshuffles():
     for (images, labels), expected in zip(batches, expected_label_batches):
         assert images.shape == (micro, 3, img_size, img_size)
         np.testing.assert_array_equal(np.asarray(labels), expected)
+
+
+def test_stream_micro_batches_uses_the_prefetch_buffer(monkeypatch):
+    """I5: stream_micro_batches must actually route through
+    vit_classification.prefetch_iterator(n_prefetch=10). Order and count are
+    already covered by the sibling test above and are UNCHANGED by adding
+    prefetch (it's a concurrency change, not a correctness one) -- so a
+    version that dropped the wrap entirely would still pass that test. Only
+    spying on the call itself catches a revert.
+    """
+    import vit_classification
+
+    calls = []
+    real_prefetch_iterator = vit_classification.prefetch_iterator
+
+    def spy_prefetch_iterator(iterator, n_prefetch=2):
+        calls.append(n_prefetch)
+        return real_prefetch_iterator(iterator, n_prefetch=n_prefetch)
+
+    monkeypatch.setattr(vit_classification, "prefetch_iterator", spy_prefetch_iterator)
+
+    n, micro, img_size = 5, 2, 4
+    ds_config = {"img_key": "image", "label_key": "label"}
+    split = FakeDatasetSplit(_fake_images(n, img_size), list(range(n)))
+    mean, std = np.zeros(3), np.ones(3)
+
+    batches = list(fj.stream_micro_batches(
+        split, ds_config, micro, img_size, mean, std,
+        total_micro=3, seed=42, num_workers=2,
+    ))
+
+    assert len(batches) == 3, "the prefetch wrap must not change the total count"
+    assert calls, "stream_micro_batches never called prefetch_iterator"
+    assert all(n == 10 for n in calls), f"expected n_prefetch=10 every call, got {calls}"
 
 
 # --- main(): the real control flow, driven end to end with fakes -----------
@@ -646,3 +753,203 @@ def test_main_ibprobit_arm_skips_the_optimizer_step_at_step_one(tmp_path, monkey
         by_split.setdefault(r.meta["split"], set()).add(r.meta["step"])
         assert r.meta["logit_kind"] == "moderated_score"
     assert by_split["val"] == by_split["test"] == {1, 2, 3}
+
+
+# --- M5: default uid must not collide with fig1_curves.UID_RE's dataset ----
+
+
+def test_main_default_uid_includes_the_dataset_before_the_arm(tmp_path, monkeypatch):
+    """fig1_curves.UID_RE parses a uid as {model}_{dataset}_seed{seed}. The
+    old default {model}_{arm}_seed{seed} (e.g. dinov3_large_ce_seed137)
+    parses CLEANLY under that pattern with dataset="ce" -- a silent mislabel,
+    not a parse failure -- so this must check the actual VALUE main() assigns
+    to args.uid, not just that SOME uid gets set.
+    """
+    embed_dim, num_classes, img_size = 5, 3, 4
+    _install_fake_heavy_modules(
+        monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
+        train_n=8, eval_n=10,
+    )
+    dump_root = tmp_path / "dumps"
+    split_cache = tmp_path / "splits"
+    argv = [
+        "--arm", "ce", "--model", "fake_model", "--dataset", "fake",
+        "--img-size", str(img_size), "--allow-non-224",
+        "--epochs", "1.0", "--batch-size", "5", "--micro-batch-size", "2",
+        "--dump-root", str(dump_root), "--group-id", "g",
+        "--split-cache-dir", str(split_cache), "--seed", "137",
+        "--ood-every-k-dumps", "0",
+        # --uid deliberately omitted -- that's what triggers the default this
+        # test targets.
+    ]
+    args = fj.build_argparser().parse_args(argv)
+    assert args.uid is None
+
+    fj.main(args, on_dump=None)
+
+    assert args.uid == "fake_model_fake_ce_seed137"
+    records = list(evaldump.iter_dumps(dump_root, "g", args.uid))
+    assert records, "no dumps found under the assigned default uid"
+
+
+# --- I7: --head-lr's effective default -------------------------------------
+
+
+def test_main_ce_arm_head_lr_defaults_to_the_100x_trunk_rate(tmp_path, monkeypatch):
+    """--head-lr's argparse default stays None (check_arm_flags needs that
+    None sentinel to reject an explicit --head-lr on --arm ibprobit -- see
+    test_head_lr_is_rejected_for_the_ibprobit_arm, which passes exactly 1e-2
+    and must still be rejected), but the EFFECTIVE rate the CE optimizer's
+    head part receives when --head-lr is omitted must be
+    fj.DEFAULT_HEAD_LR (1e-2, matching full_finetune_comparison.py), not
+    args.lr (which would give the head and trunk the same rate -- the worst
+    end of the range this default is meant to avoid).
+    """
+    embed_dim, num_classes, img_size = 5, 3, 4
+    _install_fake_heavy_modules(
+        monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
+        train_n=8, eval_n=10,
+    )
+    real_adamw = optax.adamw
+    seen_lrs = []
+
+    def capturing_adamw(lr, *a, **kw):
+        seen_lrs.append(lr)
+        return real_adamw(lr, *a, **kw)
+
+    monkeypatch.setattr(fj.optax, "adamw", capturing_adamw)
+
+    dump_root = tmp_path / "dumps"
+    split_cache = tmp_path / "splits"
+    argv = _base_argv(
+        arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
+        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+    )
+    args = fj.build_argparser().parse_args(argv)
+    assert args.head_lr is None  # sentinel preserved for check_arm_flags
+
+    fj.main(args, on_dump=None)
+
+    assert fj.DEFAULT_HEAD_LR == pytest.approx(1e-2)
+    # optax.multi_transform builds "backbone" then "head" (dict insertion
+    # order in Python 3.7+), so seen_lrs[0] is the trunk rate and
+    # seen_lrs[1] is the head rate.
+    assert seen_lrs == [args.lr, fj.DEFAULT_HEAD_LR]
+
+
+# --- I6: train throughput report --------------------------------------------
+
+
+def test_main_reports_train_throughput_excluding_step_one(tmp_path, monkeypatch, capsys):
+    """main() must time only the post-compile steps (excluding step 1 from
+    both the accumulated total AND the divisor used for the mean) and report
+    images/second computed from the ACHIEVED effective batch, not the
+    requested --batch-size (batch_size=5 requested vs effective_batch=4
+    achieved with this config -- see the sibling dumps test for why that gap
+    matters and must not be conflated).
+
+    Two independently-controlled, well-separated delays catch two different
+    mutations: COMPILE_SLEEP (huge, step 1 only) would leak into the reported
+    total if the `step > 1` accumulation guard were dropped; STEP_SLEEP
+    (uniform, every post-compile step) would shift the reported mean/img-s if
+    the divisor used steps instead of steps - 1 -- a bare self-consistency
+    check (recomputing img/s from the SAME printed mean) cannot catch that
+    second one, since both numbers would still agree with each other even if
+    both are wrong the same way.
+    """
+    embed_dim, num_classes, img_size = 5, 3, 4
+    _install_fake_heavy_modules(
+        monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
+        train_n=8, eval_n=10,
+    )
+    real_ce_micro_grad = jax_steps.ce_micro_grad
+    NUM_ACCUM = 2  # accum_plan(5, 2) -> micro=2, num_accum=2 (matches the config below)
+    COMPILE_SLEEP = 1.0
+    STEP_SLEEP = 0.15
+    call_count = [0]
+
+    def timed_ce_micro_grad(*a, **kw):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            time.sleep(COMPILE_SLEEP)  # step 1's first micro-batch (compile)
+        elif call_count[0] > NUM_ACCUM:
+            time.sleep(STEP_SLEEP / NUM_ACCUM)  # every micro-batch of steps > 1
+        return real_ce_micro_grad(*a, **kw)
+
+    monkeypatch.setattr(jax_steps, "ce_micro_grad", timed_ce_micro_grad)
+
+    dump_root = tmp_path / "dumps"
+    split_cache = tmp_path / "splits"
+    # epochs=1.5, batch_size=5, micro=2 -> effective_batch=4, steps=3 (see
+    # test_main_ibprobit_arm_skips_the_optimizer_step_at_step_one for the same
+    # arithmetic on this arm's sibling). n_timed = steps - 1 = 2.
+    argv = _base_argv(
+        arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
+        epochs=1.5, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+    )
+    args = fj.build_argparser().parse_args(argv)
+    fj.main(args, on_dump=None)
+
+    out = capsys.readouterr().out
+    m = re.search(
+        r"train time: ([\d.]+)s total, ([\d.]+)ms/step.*?([\d.]+) img/s", out
+    )
+    assert m, f"expected a throughput report line in stdout, got:\n{out}"
+    total_time, mean_ms, img_per_sec = (
+        float(m.group(1)), float(m.group(2)), float(m.group(3))
+    )
+
+    steps, n_timed = 3, 2
+
+    # COMPILE_SLEEP must not be in the reported total -- if the `step > 1`
+    # accumulation guard were dropped, total_time would be >= COMPILE_SLEEP.
+    assert total_time < COMPILE_SLEEP, (
+        f"reported train time {total_time}s includes step 1's "
+        f"{COMPILE_SLEEP}s compile sleep -- step 1 was not excluded"
+    )
+    # ...and it should be close to n_timed * STEP_SLEEP (2 * 0.15s = 0.30s).
+    assert total_time == pytest.approx(n_timed * STEP_SLEEP, rel=0.3)
+
+    # The divisor must be n_timed = steps - 1 = 2, not steps = 3: dividing by
+    # 3 instead of 2 would report a mean ~33% too low (0.30s / 3 = 100ms vs
+    # the correct 0.30s / 2 = 150ms) -- well outside this tolerance.
+    assert mean_ms == pytest.approx(STEP_SLEEP * 1000.0, rel=0.2)
+
+    # effective_batch = 4: accum_plan(5, 2) -> micro=2, num_accum=2. A version
+    # that used args.batch_size (5, the REQUESTED batch) instead of
+    # plan["effective_batch"] (4, the ACHIEVED one) would fail this.
+    effective_batch = 4
+    expected_img_per_sec = effective_batch / (mean_ms / 1000.0)
+    assert img_per_sec == pytest.approx(expected_img_per_sec, rel=0.05)
+
+
+# --- M8: a diverged run must stop, not train silently to the full budget ---
+
+
+def test_main_raises_when_val_nll_is_not_finite_at_a_dump(tmp_path, monkeypatch):
+    embed_dim, num_classes, img_size = 5, 3, 4
+    _install_fake_heavy_modules(
+        monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
+        train_n=8, eval_n=10,
+    )
+    real_evaluate_and_dump = fj.evaluate_and_dump
+
+    def poisoned_evaluate_and_dump(arm, backbone, head_or_loss, *rest, split, **kw):
+        out = real_evaluate_and_dump(arm, backbone, head_or_loss, *rest, split=split, **kw)
+        if split == "val":
+            out = dict(out)
+            out["nll"] = float("nan")
+        return out
+
+    monkeypatch.setattr(fj, "evaluate_and_dump", poisoned_evaluate_and_dump)
+
+    dump_root = tmp_path / "dumps"
+    split_cache = tmp_path / "splits"
+    argv = _base_argv(
+        arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
+        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+    )
+    args = fj.build_argparser().parse_args(argv)
+
+    with pytest.raises(RuntimeError, match=r"step 1.*val_nll"):
+        fj.main(args, on_dump=None)

@@ -12,6 +12,7 @@ kernels via bllarse.finetune.jax_steps.
 import argparse
 import gc
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -47,6 +48,16 @@ FINETUNE_IMG_SIZE = 224
 # it never round-trips through this fp16 dump path.
 MASK_NEG = -1e4
 
+# full_finetune_comparison.py's --head-lr default: the fresh head needs ~100x
+# the trunk rate -- AdamW moves weights by ~lr/step, and the head's random
+# init scale (~0.015) would take thousands of 1e-4 steps to overwrite
+# otherwise. Kept as a fallback CONSTANT rather than argparse's `default=` so
+# check_arm_flags can still use `args.head_lr is not None` to tell "user
+# explicitly passed --head-lr" apart from "omitted" -- an ibprobit run that
+# explicitly passes even this same value must still be rejected, since its
+# head has no optimizer to receive it.
+DEFAULT_HEAD_LR = 1e-2
+
 
 def check_img_size(args) -> None:
     """Refuse a non-224 resolution unless it was asked for explicitly."""
@@ -72,6 +83,28 @@ def check_arm_flags(args) -> None:
             "[finetune] --head-lr is meaningless for --arm ibprobit: the head is "
             "updated in closed form by CAVI, not by the optimizer. Its head-side "
             "knob is --num-update-iters."
+        )
+
+
+def check_micro_batch_required(args) -> None:
+    """The auto-probe is unavailable for --arm ibprobit until it is merged.
+
+    Omitting --micro-batch-size makes main() auto-probe the largest micro
+    batch that fits. Doing that for the ibprobit arm needs a real IBProbit
+    head, but the IBProbit constructor on THIS branch only accepts
+    (input_dim, num_classes, *, key, use_bias, use_approx_cdf) -- it does not
+    yet have the q_init/px/bmr_gate/... knobs that land on the
+    ibprobit-process-noise worktree. Until that merges, --arm ibprobit must
+    pass --micro-batch-size explicitly; the ce arm still auto-probes fine via
+    probe_micro_batch_size_ce, which never touches IBProbit at all.
+    """
+    if args.arm == "ibprobit" and args.micro_batch_size is None:
+        raise SystemExit(
+            "[finetune] --micro-batch-size is required for --arm ibprobit: "
+            "the auto-probe is unavailable for this arm until the IBProbit "
+            "constructor on the ibprobit-process-noise worktree (with its "
+            "q_init/px/bmr_gate/... knobs) is merged. Pass --micro-batch-size "
+            "explicitly."
         )
 
 
@@ -128,7 +161,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-4, help="Trunk learning rate")
     p.add_argument(
         "--head-lr", type=float, default=None,
-        help="Head learning rate (CE arm only; IBProbit has no head optimizer).",
+        help="Head learning rate (CE arm only; IBProbit has no head "
+             f"optimizer). Defaults to DEFAULT_HEAD_LR={DEFAULT_HEAD_LR:g} "
+             "when omitted -- 100x the trunk --lr, matching "
+             "full_finetune_comparison.py: AdamW moves weights by ~lr/step, "
+             "and the head's random init scale (~0.015) would take "
+             "thousands of 1e-4 steps to overwrite otherwise.",
     )
     p.add_argument(
         "--weight-decay", type=float, default=1e-4,
@@ -184,9 +222,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=137)
     p.add_argument("--device", default="gpu")
 
-    p.add_argument("--enable-mlflow", action="store_true")
-    p.add_argument("--mlflow-experiment", default="bllarse-finetune")
-
     p.add_argument("--optimizer", default="adamw", choices=["adamw"],
                    help="Present because the shared micro-batch prober reads "
                         "it. IVON/EVON live in full_finetune_comparison.py.")
@@ -202,20 +237,36 @@ def stream_micro_batches(train_split, ds_config, micro, img_size, mean, std,
     The permutation comes from protocol.shuffled_indices (numpy), NOT jax.random,
     so the PyTorch arm reproduces this exact order. Short trailing batches are
     skipped to keep the jitted shape constant.
+
+    Each epoch's decode+resize is wrapped in vit_classification.prefetch_iterator
+    (n_prefetch=10, same as full_finetune_comparison.stream_batches), so JPEG
+    decode for the NEXT micro-batch runs on a background thread while the
+    current one trains -- without it, decode is inline on the main thread and
+    overlap is one micro-batch deep. The wrap is per-epoch (a fresh generator
+    and a fresh prefetch_iterator each time `order` is reshuffled), mirroring
+    full_finetune_comparison.py exactly, rather than one prefetch_iterator over
+    an unbounded stream.
     """
+    from vit_classification import prefetch_iterator
+
     n = len(train_split)
     labels_all = np.asarray(train_split[ds_config["label_key"]])
     emitted, epoch = 0, 0
     while emitted < total_micro:
         order = protocol.shuffled_indices(n, seed, epoch)
-        for start in range(0, n - micro + 1, micro):
-            batch_idx = order[start:start + micro]
-            images = imagenet.load_images_uint8(
-                train_split, ds_config["img_key"], img_size, batch_idx,
-                num_workers=num_workers,
-            )
-            yield (jnp.asarray(imagenet.normalize_chunk(images, mean, std)),
-                   jnp.asarray(labels_all[batch_idx]))
+
+        def _epoch_batches(order=order):
+            for start in range(0, n - micro + 1, micro):
+                batch_idx = order[start:start + micro]
+                images = imagenet.load_images_uint8(
+                    train_split, ds_config["img_key"], img_size, batch_idx,
+                    num_workers=num_workers,
+                )
+                yield (jnp.asarray(imagenet.normalize_chunk(images, mean, std)),
+                       jnp.asarray(labels_all[batch_idx]))
+
+        for images, labels in prefetch_iterator(_epoch_batches(), n_prefetch=10):
+            yield images, labels
             emitted += 1
             if emitted >= total_micro:
                 return
@@ -266,7 +317,7 @@ def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
                       subset=None):
     """Forward one preloaded eval set in chunks and write its dump.
 
-    Returns the scalar metrics so the caller can drive `on_dump` and MLflow.
+    Returns the scalar metrics so the caller can drive `on_dump`.
     Normalization happens per chunk (imagenet.normalize_chunk), so the float32
     expansion only ever covers `--eval-chunk` images at a time.
 
@@ -318,6 +369,58 @@ def eval_logits_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
     return logits
 
 
+def probe_micro_batch_size_ce(backbone, args, embed_dim, num_classes, img_size,
+                              init_bs, max_bs, key):
+    """Double the micro-batch size until the CE micro-step OOMs; return the
+    last size that fits. This is the per-forward micro-batch -- the target
+    (effective) batch is reached by gradient accumulation over several of
+    these.
+
+    Modelled on full_finetune_comparison.probe_micro_batch_size (same
+    doubling structure, OOM-substring detection, per-attempt
+    jax.clear_caches()+gc.collect(), and "even the smallest does not fit"
+    RuntimeError), but built on jax_steps.ce_micro_grad with a throwaway
+    eqx.nn.Linear head and CrossEntropy loss instead of build_ibprobit --
+    so, unlike that function, this one never constructs an IBProbit head and
+    does not depend on its constructor at all. See check_micro_batch_required
+    for why the ibprobit arm cannot use this (or any) auto-probe yet.
+    """
+    bf16 = args.bf16
+    loss_fn = CrossEntropy(args.label_smooth, num_classes)
+    bs = init_bs
+    last_ok = None
+    while bs <= max_bs:
+        # Initialised before the try, same reasoning as the fix to
+        # full_finetune_comparison.probe_micro_batch_size: a `finally: del
+        # head` must never raise UnboundLocalError over a real exception.
+        head = None
+        try:
+            key, head_key = jr.split(key)
+            head = eqx.nn.Linear(embed_dim, num_classes, key=head_key)
+            images = jnp.zeros((bs, 3, img_size, img_size), dtype=jnp.float32)
+            labels = jnp.zeros((bs,), dtype=jnp.int32)
+            _, loss = jax_steps.ce_micro_grad(
+                (backbone, head), loss_fn, images, labels, key, bf16=bf16)
+            jax.block_until_ready(loss)
+            last_ok = bs
+            print(f"[finetune] probe micro_batch_size={bs} OK")
+        except Exception as e:
+            msg = str(e)
+            if "RESOURCE_EXHAUSTED" in msg or "out of memory" in msg.lower() or "OOM" in msg:
+                print(f"[finetune] probe micro_batch_size={bs} OOM, backing off")
+                break
+            raise
+        finally:
+            del head
+            jax.clear_caches()
+            gc.collect()
+        bs *= 2
+
+    if last_ok is None:
+        raise RuntimeError(f"Even micro_batch_size={init_bs} does not fit in memory.")
+    return last_ok
+
+
 def main(args, on_dump=None) -> None:
     """Fine-tune one arm: gradient accumulation to the target batch, eval dumps
     of both val and test on a log-spaced step schedule.
@@ -330,8 +433,15 @@ def main(args, on_dump=None) -> None:
     """
     check_img_size(args)
     check_arm_flags(args)
+    check_micro_batch_required(args)
     if args.uid is None:
-        args.uid = f"{args.model}_{args.arm}_seed{args.seed}"
+        # fig1_curves.UID_RE parses a uid as {model}_{dataset}_seed{seed}. A
+        # uid of just {model}_{arm}_seed{seed} (e.g. dinov3_large_ce_seed137)
+        # parses CLEANLY under that pattern with dataset="ce" -- a silent
+        # mislabel, not a parse failure. Folding {dataset} in ahead of {arm}
+        # keeps that field correct; {arm} still rides along in the uid string
+        # (and, independently, in every dump's own meta["arm"]).
+        args.uid = f"{args.model}_{args.dataset}_{args.arm}_seed{args.seed}"
 
     # Heavy, GPU-oriented imports stay inside main(): this module is imported
     # by the CPU-only test suite (and by --help), and equimo/datasets pull in
@@ -360,11 +470,12 @@ def main(args, on_dump=None) -> None:
 
     micro = args.micro_batch_size
     if micro is None:
-        from full_finetune_comparison import probe_micro_batch_size
-
+        # check_micro_batch_required (above) already refused --arm ibprobit
+        # with no --micro-batch-size, so reaching here means --arm ce: the
+        # local CE-only prober never constructs an IBProbit head.
         key, probe_key = jr.split(key)
         print("[finetune] probing maximal micro-batch size...")
-        micro = probe_micro_batch_size(
+        micro = probe_micro_batch_size_ce(
             backbone, args, embed_dim, num_classes, args.img_size,
             args.batch_size_init, args.batch_size_max, probe_key,
         )
@@ -397,7 +508,7 @@ def main(args, on_dump=None) -> None:
     if args.arm == "ce":
         loss_fn = CrossEntropy(args.label_smooth, num_classes)
         head = eqx.nn.Linear(embed_dim, num_classes, key=init_key)
-        head_lr = args.head_lr if args.head_lr is not None else args.lr
+        head_lr = args.head_lr if args.head_lr is not None else DEFAULT_HEAD_LR
         param_labels = (
             jax.tree.map(lambda _: "backbone", eqx.filter(backbone, eqx.is_array)),
             jax.tree.map(lambda _: "head", eqx.filter(head, eqx.is_array)),
@@ -428,7 +539,9 @@ def main(args, on_dump=None) -> None:
     )
 
     dump_index = 0
+    train_time = 0.0
     for step in range(1, plan["steps"] + 1):
+        step_t0 = time.perf_counter()
         train_key = jr.fold_in(fwd_key, step)
         grads_acc, all_fts, all_labels = None, [], []
 
@@ -465,6 +578,13 @@ def main(args, on_dump=None) -> None:
                 (backbone, head), grads_acc, opt_state, optimizer, plan["num_accum"])
             head_or_loss = head
 
+        # Excludes eval/dump time below (banked before that block starts) and
+        # step 1 (JIT compilation, not steady-state throughput) -- mirrors
+        # full_finetune_comparison.run_arm's warmup exclusion.
+        step_time = time.perf_counter() - step_t0
+        if step > 1:
+            train_time += step_time
+
         if step in dump_set:
             samples_seen = step * plan["effective_batch"]
             scalars = {}
@@ -476,6 +596,14 @@ def main(args, on_dump=None) -> None:
                     args=args, mean=mean, std=std, key=fwd_key,
                 )
                 scalars.update({f"{name}_{k}": v for k, v in out.items()})
+            if not np.isfinite(scalars["val_nll"]):
+                # A diverged run would otherwise train silently to the full
+                # step budget, burning the rest of the wall-clock/compute
+                # budget on a broken model.
+                raise RuntimeError(
+                    f"[finetune] step {step}: val_nll={scalars['val_nll']!r} "
+                    f"is not finite -- the run has diverged."
+                )
             if step in ood_step_set:
                 for name, images_uint8, labels, subset in ood_sets:
                     evaluate_and_dump(
@@ -498,6 +626,22 @@ def main(args, on_dump=None) -> None:
             gc.collect()
 
     jax.clear_caches()
+
+    # Steady-state train throughput: probe_throughput.verdict needs a train
+    # img/s to compare against the loader's decode rate, and nothing else in
+    # this script produces one. n_timed excludes step 1 (JIT compilation);
+    # with plan["steps"] == 1 there is no post-compile step to time at all.
+    n_timed = plan["steps"] - 1
+    if n_timed > 0 and train_time > 0:
+        mean_step_time = train_time / n_timed
+        img_per_sec = plan["effective_batch"] / mean_step_time
+        print(f"[finetune] train time: {train_time:.3f}s total, "
+              f"{mean_step_time * 1000:.2f}ms/step (excl. step 1, compile), "
+              f"{img_per_sec:.2f} img/s")
+    else:
+        print(f"[finetune] train time: {train_time:.3f}s total "
+              f"(no post-compile step to report a rate for)")
+
     print(f"[finetune] done: {dump_index} dumps under "
           f"{args.dump_root}/{args.group_id}/{args.uid}")
 

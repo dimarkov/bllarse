@@ -132,12 +132,37 @@ def test_ood_subset_keys_excludes_v2():
     assert "imagenet_v2" not in imagenet.OOD_SUBSET_KEYS
 
 
-def test_memory_budget_of_a_full_ood_preload_stays_under_slurm_mem():
-    # Full OOD suite (R 30k + A 7.5k + V2 10k) at 224px. Documents WHY uint8:
-    # float32 would be 28.6 GB against --mem=40G with the model also resident.
-    n = sum(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS)
-    assert n == 47_500
+def test_memory_budget_of_the_real_preload_peak_stays_under_slurm_mem():
+    # M3: the full OOD suite alone (R 30k + A 7.5k + V2 10k = 47,500 images at
+    # 224px, ~6.66 GiB uint8) is NOT the real peak a finetune_jax.py run
+    # holds. It also keeps the val+test uint8 cache resident for the whole
+    # run (IMAGENET_N_VAL = 50,000 images, same 224px frame, ~7.0 GiB) --
+    # load_ood_sets and the val/test preload in main() are BOTH alive at
+    # once, never freed against each other. On top of that,
+    # imagenet.load_images_uint8's `np.stack(list(pool.map(...)))` holds the
+    # source Python list of per-image arrays AND the destination stacked
+    # array simultaneously until the list is garbage collected -- a
+    # transient DOUBLE copy of whichever set is decoding at that moment. The
+    # worst case is the largest single set (imagenet_r, 30k images)
+    # decoding last, stacked on top of everything already resident
+    # (val+test + every other OOD set already loaded).
     size = 224
-    uint8_gb = n * size * size * 3 / 1024**3
-    assert uint8_gb < 8.0
-    assert uint8_gb * 4 > 25.0  # the float32 equivalent genuinely does not fit
+    bytes_per_image = size * size * 3  # uint8, one image
+    ood_n = sum(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS)
+    assert ood_n == 47_500
+    val_test_n = imagenet.IMAGENET_N_VAL  # 50,000
+
+    resident_gb = (val_test_n + ood_n) * bytes_per_image / 1024**3
+    largest_single_set_n = max(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS)
+    transient_double_copy_gb = largest_single_set_n * bytes_per_image / 1024**3
+    peak_gb = resident_gb + transient_double_copy_gb
+
+    assert peak_gb < 40.0, (
+        f"real preload peak {peak_gb:.1f} GiB would OOM slurm_tune.sh's --mem=40G"
+    )
+    # Sanity: this is genuinely close to the limit (unlike the OOD-suite-only
+    # figure, ~6.66 GiB, which left the real risk invisible), not slack.
+    assert peak_gb > 12.0
+    # And the float32 equivalent of just resting memory (no double-copy)
+    # still does not fit, which is why the cache is uint8 at all.
+    assert resident_gb * 4 > 40.0

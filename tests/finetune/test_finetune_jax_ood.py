@@ -89,6 +89,30 @@ def _fake_images(n, size):
     ]
 
 
+def _fake_prefetch_iterator(iterator, n_prefetch=2):
+    """Stand-in for vit_classification.prefetch_iterator (I5): the identical
+    queue/thread wrapping technique, duplicated so the fake module doesn't
+    need to import the real (heavier) one just for this one function."""
+    from queue import Queue
+    from threading import Thread
+
+    q = Queue(maxsize=n_prefetch)
+    sentinel = object()
+
+    def fill():
+        for item in iterator:
+            q.put(item)
+        q.put(sentinel)
+
+    t = Thread(target=fill, daemon=True)
+    t.start()
+    while True:
+        item = q.get()
+        if item is sentinel:
+            break
+        yield item
+
+
 def _install_fake_ood_registry(monkeypatch, sizes, subset_labels):
     """Stand in for scripts/alternatives/precompute_ood_features.
 
@@ -244,6 +268,7 @@ def _install_fake_heavy_modules(monkeypatch, *, embed_dim, num_classes, img_size
         return DummyBackbone(proj=jax.random.normal(key, (3, embed_dim)))
 
     fake_vit.get_pretrained_backbone = get_pretrained_backbone
+    fake_vit.prefetch_iterator = _fake_prefetch_iterator
 
     train_split = FakeDatasetSplit(
         _fake_images(train_n, img_size), [i % num_classes for i in range(train_n)]

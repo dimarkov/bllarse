@@ -114,3 +114,41 @@ def test_head_lr_is_rejected_for_the_ibprobit_arm():
 
 def test_head_lr_is_accepted_for_the_ce_arm():
     fj.check_arm_flags(_args(head_lr=1e-2))  # must not raise
+
+
+def test_micro_batch_size_is_required_for_the_ibprobit_arm():
+    # C1: the auto-probe path for --arm ibprobit builds an IBProbit head via
+    # build_ibprobit, which this branch's IBProbit constructor cannot accept
+    # (see check_micro_batch_required's docstring) -- so it must be required
+    # explicitly rather than silently probed into a TypeError.
+    args = fj.build_argparser().parse_args(["--arm", "ibprobit", "--batch-size", "1024"])
+    with pytest.raises(SystemExit, match="--micro-batch-size"):
+        fj.check_micro_batch_required(args)
+
+
+def test_micro_batch_size_is_optional_for_the_ce_arm():
+    args = fj.build_argparser().parse_args(["--arm", "ce", "--batch-size", "1024"])
+    fj.check_micro_batch_required(args)  # must not raise
+
+
+def test_micro_batch_size_explicit_is_accepted_for_the_ibprobit_arm():
+    argv = ["--arm", "ibprobit", "--batch-size", "1024", "--micro-batch-size", "64"]
+    args = fj.build_argparser().parse_args(argv)
+    fj.check_micro_batch_required(args)  # must not raise
+
+
+def test_enable_mlflow_flags_were_removed():
+    # M1: --enable-mlflow / --mlflow-experiment were parsed but never read in
+    # main() -- a silently-ignored logging flag loses a run's telemetry
+    # without any error. Removed rather than wired, so passing them is now a
+    # loud argparse error instead of a silent no-op.
+    with pytest.raises(SystemExit):
+        fj.build_argparser().parse_args(
+            ["--arm", "ce", "--batch-size", "1024", "--enable-mlflow"]
+        )
+    with pytest.raises(SystemExit):
+        fj.build_argparser().parse_args(
+            ["--arm", "ce", "--batch-size", "1024", "--mlflow-experiment", "x"]
+        )
+
+

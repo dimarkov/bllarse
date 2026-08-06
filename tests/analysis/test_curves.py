@@ -172,10 +172,10 @@ def test_run_curve_omits_val_metrics_when_no_val_dump_exists(tmp_path):
 
 
 def _write_pair_with_score(root, uid, *, id_score, ood_score, score_kind="predictive_variance",
-                           step=1, k=5):
+                           step=1, k=5, ood_split="ood"):
     """A VBLL-shaped run: log-predictive dumps carrying a native epistemic score."""
     rng = np.random.default_rng(7)
-    for split, score in (("test", id_score), ("ood", ood_score)):
+    for split, score in (("test", id_score), (ood_split, ood_score)):
         n = len(score)
         base = rng.normal(size=(n, k)).astype(np.float32)
         evaldump.write_dump(
@@ -289,3 +289,66 @@ def test_run_detection_at_a_missing_step_says_what_is_available(tmp_path):
     _write_trajectory_with_ood(tmp_path, "t2", [1, 5, 20])
     with pytest.raises(ValueError, match="no test dump at step 7"):
         curves.run_detection(tmp_path, "g", "t2", metrics.msp_ood_score, step=7)
+
+
+# --- I4: ood_split, since finetune_jax.py writes split=f"ood_{name}" ------
+
+
+def test_run_detection_ood_split_reads_a_non_default_split_name(tmp_path):
+    """finetune_jax.py writes three OOD dumps under split="ood_imagenet_r"
+    (etc.), never a plain "ood" split, so without a configurable ood_split
+    none of those dumps could ever be read back by run_detection."""
+    rng = np.random.default_rng(5)
+    n, k = 300, 5
+    for split, loc in (("test", 6.0), ("ood_imagenet_r", 0.0)):
+        base = rng.normal(loc=0.0, size=(n, k)).astype(np.float32)
+        base[:, 0] += loc
+        evaldump.write_dump(
+            tmp_path, "g", "u9", 1, base, base.argmax(axis=-1),
+            arm="ce", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=100,
+        )
+    out = curves.run_detection(
+        tmp_path, "g", "u9", metrics.msp_ood_score, ood_split="ood_imagenet_r"
+    )
+    assert out["auroc"] > 0.8
+
+    # The default ("ood") must NOT see the custom-named split -- these are
+    # deliberately separate dump namespaces, not aliases of each other.
+    with pytest.raises(ValueError, match="no ood-split dump"):
+        curves.run_detection(tmp_path, "g", "u9", metrics.msp_ood_score)
+
+    # A missing custom split names itself in the error, not the default.
+    with pytest.raises(ValueError, match="ood_imagenet_a"):
+        curves.run_detection(
+            tmp_path, "g", "u9", metrics.msp_ood_score, ood_split="ood_imagenet_a"
+        )
+
+
+def test_run_detection_default_ood_split_is_unaffected(tmp_path):
+    """probe.py / probing_vbll.py write a plain split="ood" and pass no
+    ood_split argument at all -- that path must keep working exactly as
+    before."""
+    rng = np.random.default_rng(6)
+    n, k = 300, 5
+    for split, loc in (("test", 6.0), ("ood", 0.0)):
+        base = rng.normal(loc=0.0, size=(n, k)).astype(np.float32)
+        base[:, 0] += loc
+        evaldump.write_dump(
+            tmp_path, "g", "u9b", 1, base, base.argmax(axis=-1),
+            arm="ce", split=split, logit_kind="softmax_logits",
+            seed=137, samples_seen=100,
+        )
+    out = curves.run_detection(tmp_path, "g", "u9b", metrics.msp_ood_score)
+    assert out["auroc"] > 0.8
+
+
+def test_run_native_detection_ood_split_reads_a_non_default_split_name(tmp_path):
+    _write_pair_with_score(
+        tmp_path, "n6",
+        id_score=np.linspace(0.0, 1.0, 300),
+        ood_score=np.linspace(5.0, 6.0, 300),
+        ood_split="ood_imagenet_r",
+    )
+    out = curves.run_native_detection(tmp_path, "g", "n6", ood_split="ood_imagenet_r")
+    assert out["auroc"] == pytest.approx(1.0)
