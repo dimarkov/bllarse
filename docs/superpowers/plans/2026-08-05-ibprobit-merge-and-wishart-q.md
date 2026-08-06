@@ -403,7 +403,7 @@ From here the target is `docs/superpowers/specs/2026-08-05-ibprobit-merge-and-wi
 
 **Interfaces:**
 - Consumes: Tasks 1-3.
-- Produces: state fields `Psi (d,d)`, `nu ()`, `p_a ()`, `p_b ()` replacing `log_q` and `log_sigma_z2`; property `Qhat -> (d,d)`; static config `learn_q: bool`, `q0: float`, `kappa: float`, `warmup: int`, `alpha: float`; constructor `IBProbit(input_dim, num_classes, *, key, use_bias=True, use_approx_cdf=True, q_init=None, alpha=1e-3, batch_size=None, kappa=None, learn_q=True, loss_type=2, px=False, warmup=1, eps_init=0.01, rho=1.0)`; helpers `_q_seed() -> (Psi_0, nu_0)` and `_pc_seed() -> (p_a0, p_b0)`.
+- Produces: state fields `Psi (d,d)`, `nu ()`, `p_a ()`, `p_b ()` replacing `log_q` and `log_sigma_z2`; property `Qhat -> (d,d)`; static config `learn_q: bool`, `q0: float`, `kappa: float`, `warmup: int`, `alpha: float`; constructor `IBProbit(input_dim, num_classes, *, key, use_bias=True, use_approx_cdf=True, q_init=None, alpha=0.1, batch_size=None, kappa=None, learn_q=True, loss_type=2, px=False, warmup=1, eps_init=0.01, rho=1.0)`; helpers `_q_seed() -> (Psi_0, nu_0)` and `_pc_seed() -> (p_a0, p_b0)`.
 
 `sigma_z^2 === 1` (q-update-spec §5.7) removes the `sigma_z` argument from both scans; `_expected_z(pred, y_one_hot)` then takes the raw prediction, exactly as it did on this branch before the port. `learn_q=False` needs no branch in `Qhat`: since `Psi_0/(nu_0 - d - 1) = q0 * I` exactly, never updating `(Psi, nu)` holds `Qhat` at `q0 * I` by construction.
 
@@ -589,7 +589,7 @@ and the constructor:
         use_bias: bool = True,
         use_approx_cdf: bool = True,
         q_init: Optional[float] = None,
-        alpha: float = 1e-3,
+        alpha: float = 0.1,
         batch_size: Optional[int] = None,
         kappa: Optional[float] = None,
         learn_q: bool = True,
