@@ -160,16 +160,37 @@ already applied to the probing arms, where OOD was originally dumped only at the
 final step and the CIFAR-100-vs-SVHN comparison was confounded by CE's
 overfitting at that step.
 
-`OOD_KEYS` currently holds 11 sets: 8 ImageNet-C corruptions plus R, A, V2.
-**ImageNet-Sketch and ObjectNet, which results-plan Fig 6 asks for, are not
-wired.** Out of scope here; noted so the gap is not discovered at plotting time.
+**OOD sets are ImageNet-R, -A and -V2, evaluated in FULL — no subsampling.**
+The 8 ImageNet-C corruptions are dropped: C measures synthetic corruption
+robustness, which is a different axis from the natural distribution shift this
+figure is about, and it is the bulk of the OOD cost. Full sets also remove the
+sampling noise a 2,000-image cap injects into every point of the OOD
+trajectory, so the curve reflects the model rather than the draw.
 
-Volume, at `n_dumps = 24`: val 20 MB + test 80 MB per step -> 2.4 GB, plus 11
-OOD sets x 2000 images x 4 MB across 12 OOD evals -> ~530 MB. **~2.9 GB/run,
-~44 GB for 15 runs** on `/ptmp`. Eval forward passes add ~10% over training
-(1.46M eval forwards against 15.4M training forward-equivalents) and are
-excluded from reported train time, as the existing script already does for its
-OOD path.
+| set | images | classes |
+| --- | ---: | ---: |
+| ImageNet-R | 30,000 | 200 (logit-masked) |
+| ImageNet-A | 7,500 | 200 (logit-masked) |
+| ImageNet-V2 | 10,000 | 1,000 |
+
+**Consequence for the paper**: results-plan §2 Fig 6 names six sets — V2, R, A,
+Sketch, ObjectNet and C (severity-averaged). This design covers three. Sketch
+and ObjectNet were never wired; C is now a deliberate exclusion. results-plan
+needs the corresponding edit, or Fig 6 will not match its own specification.
+
+**Preloading must be uint8, not float32.** `load_eval_subset` currently
+normalizes on the host and returns float32. At 47,500 images x 3 x 224 x 224
+that is 28.6 GB, against `slurm_tune.sh`'s `--mem=40G` — it fits at 2,000/set
+and does not at full size. Keeping the host cache uint8 (7.1 GB) and deferring
+`(images - mean) / std` to the eval chunk loop is the fix. This is the kind of
+failure that appears three hours into a run, so it is a requirement, not an
+optimization.
+
+Volume, at `n_dumps = 24`: val 20 MB + test 80 MB per step -> 2.4 GB, plus 95
+MB per OOD eval x 12 -> ~1.14 GB. **~3.5 GB/run, ~53 GB for 15 runs** on
+`/ptmp`. Eval forward passes add ~12% over training (1.77M eval forwards
+against 15.4M training forward-equivalents) and are excluded from reported
+train time, as the existing script already does for its OOD path.
 
 ## 6. The PyTorch port
 
@@ -292,7 +313,8 @@ launch, not here.
 
 ## 10. Deferred
 
-- ImageNet-Sketch and ObjectNet OOD sets (results-plan Fig 6)
+- ImageNet-Sketch and ObjectNet OOD sets (results-plan Fig 6, §5)
+- Editing results-plan §2 Fig 6 down to the three sets this design evaluates
 - The FLOP model (results-plan §4.1), which decides whether Fig 7 runs at all
 - Folding `pytest`/`mlflow-skinny` into the image definitions instead of the
   `/ptmp/cheins/pylibs-*` workarounds
