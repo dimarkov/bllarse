@@ -414,7 +414,12 @@ def test_main_ce_arm_dumps_both_splits_at_every_scheduled_step(tmp_path, monkeyp
         # samples_seen assertions below cannot tell "step * requested" apart
         # from "step * achieved", so a bug that used args.batch_size directly
         # would pass silently.
-        epochs=1.0, batch_size=5, micro_batch_size=2,
+        # OOD is off here: this test is about the val/test schedule, not OOD,
+        # and leaving --ood-every-k-dumps at its default would make main()
+        # call load_ood_sets, which reaches out to precompute_ood_features
+        # (network) -- see test_finetune_jax_ood.py for the OOD-specific
+        # coverage.
+        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
 
@@ -503,7 +508,9 @@ def test_main_ce_arm_actually_trains_not_a_no_op(tmp_path, monkeypatch):
     split_cache = tmp_path / "splits"
     argv = _base_argv(
         arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
-        epochs=1.0, batch_size=5, micro_batch_size=2,
+        # OOD off -- this test is about the grads/apply_grads control flow,
+        # not OOD; see the note in the sibling test above.
+        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
     fj.main(args, on_dump=None)
@@ -611,8 +618,10 @@ def test_main_ibprobit_arm_skips_the_optimizer_step_at_step_one(tmp_path, monkey
     argv = _base_argv(
         arm="ibprobit", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
         # batch_size=5 requested, effective=4 achieved (see the CE test above
-        # for why); 1.5 * 8 // 4 = 3 steps either way.
+        # for why); 1.5 * 8 // 4 = 3 steps either way. OOD off -- see the note
+        # in the CE test above.
         epochs=1.5, batch_size=5, micro_batch_size=2, num_update_iters=3,
+        ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
 

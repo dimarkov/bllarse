@@ -222,6 +222,45 @@ def stream_micro_batches(train_split, ds_config, micro, img_size, mean, std,
         epoch += 1
 
 
+def load_ood_sets(args, img_size):
+    """Preload every OOD set as uint8 host arrays, once, shared across steps.
+
+    Returns [(name, images_uint8, labels, subset_or_None)]. `subset` is the
+    array of classes present in R/A (derived from that set's FULL label
+    column), used by `evaluate_and_dump` to mask out-of-subset logits before
+    scoring; V2 spans all 1000 classes and gets None. Only called when
+    `plan["ood_steps"]` is non-empty -- a tuning trial with
+    --ood-every-k-dumps 0 must never pay this preload cost (47,500 images).
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "alternatives"))
+    from precompute_ood_features import build_ood_registry, load_wnid_to_idx
+
+    wnid_to_idx = load_wnid_to_idx()
+    registry = build_ood_registry()
+    loaded = []
+    for name in imagenet.OOD_KEYS:
+        split, img_key = registry[name](wnid_to_idx)
+        labels = np.asarray(split["label"])
+        expected = imagenet.OOD_SIZES[name]
+        if len(labels) != expected:
+            # A short (or long) load means the HF split changed shape.
+            # Scoring it anyway would produce a plausible-looking AUROC over
+            # the wrong population, so this must raise rather than warn --
+            # checked before the (expensive) image decode below.
+            raise SystemExit(
+                f"[finetune] {name} has {len(labels)} images, expected "
+                f"{expected}"
+            )
+        subset = np.unique(labels) if name in imagenet.OOD_SUBSET_KEYS else None
+        images = imagenet.load_images_uint8(
+            split, img_key, img_size, np.arange(len(labels)))
+        loaded.append((name, images, labels, subset))
+        print(f"[finetune] preloaded {name}: {len(labels)} images"
+              + (f", {len(subset)}-class subset" if subset is not None else ""))
+    return loaded
+
+
 def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
                       split, step, samples_seen, args, mean, std, key,
                       subset=None):
@@ -349,6 +388,12 @@ def main(args, on_dump=None) -> None:
         )
         print(f"[finetune] preloaded {name}: {len(idx)} images")
 
+    # Guarded on len(...) rather than truthiness of --ood-every-k-dumps
+    # itself: ood_dump_steps is what actually decides whether any step is
+    # scheduled, and a tuning trial (--ood-every-k-dumps 0) must never pay
+    # the 47,500-image preload cost.
+    ood_sets = load_ood_sets(args, args.img_size) if len(plan["ood_steps"]) else []
+
     if args.arm == "ce":
         loss_fn = CrossEntropy(args.label_smooth, num_classes)
         head = eqx.nn.Linear(embed_dim, num_classes, key=init_key)
@@ -376,6 +421,7 @@ def main(args, on_dump=None) -> None:
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
 
     dump_set = set(int(s) for s in plan["dump_steps"])
+    ood_step_set = set(int(s) for s in plan["ood_steps"])
     micro_iter = stream_micro_batches(
         train_split, ds_config, plan["micro"], args.img_size, mean, std,
         plan["steps"] * plan["num_accum"], args.seed,
@@ -430,6 +476,13 @@ def main(args, on_dump=None) -> None:
                     args=args, mean=mean, std=std, key=fwd_key,
                 )
                 scalars.update({f"{name}_{k}": v for k, v in out.items()})
+            if step in ood_step_set:
+                for name, images_uint8, labels, subset in ood_sets:
+                    evaluate_and_dump(
+                        args.arm, backbone, head_or_loss, images_uint8, labels,
+                        split=f"ood_{name}", step=step, samples_seen=samples_seen,
+                        args=args, mean=mean, std=std, key=fwd_key, subset=subset,
+                    )
             print(f"[finetune] step {step}/{plan['steps']} " + " ".join(
                 f"{k}={v:.4f}" for k, v in sorted(scalars.items())))
             if on_dump is not None:
