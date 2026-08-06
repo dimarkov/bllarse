@@ -318,3 +318,62 @@ launch, not here.
 - The FLOP model (results-plan §4.1), which decides whether Fig 7 runs at all
 - Folding `pytest`/`mlflow-skinny` into the image definitions instead of the
   `/ptmp/cheins/pylibs-*` workarounds
+
+## 11. Known limitations after Phase 1
+
+Phase 1 (`src/bllarse/finetune/` + `scripts/finetune/finetune_jax.py`) is
+implemented and reviewed. These are the gaps it did NOT close, recorded here
+because they gate what can actually be launched.
+
+**The CE arm is ready.** Default invocation runs end to end, dumps are scoreable
+by the existing `run_curve`/`fig1_curves` path, and Fig 5 is unblocked.
+
+**The IBProbit arm is not a usable scientific artifact yet**, for two reasons
+that both trace to the q-update work living on an unmerged worktree:
+
+1. **All ten IBProbit head knobs are ignored.** `finetune_jax.main` constructs
+   `IBProbit(embed_dim, num_classes, key=...)` directly, because this branch's
+   `IBProbit.__init__` accepts only `(input_dim, num_classes, *, key, use_bias,
+   use_approx_cdf)`. `--px`, `--q-init`, `--hyper-lr`, `--anchor-weight`,
+   `--fix-q`, `--sigma-z2-init`, `--bmr-gate`, `--bmr-warmup`, `--learn-eps`,
+   `--eps-init` all parse and are then discarded, and ffc's `rho = 1 - B/N` eps
+   forgetting is never set.
+
+   Compounding this: `--num-update-iters` defaults to 128, which is the **PX**
+   operating point. With `px` unreachable the arm runs 128 *plain* CAVI
+   iterations, well short of the ~1000 the plain path needs. Every IBProbit run
+   would therefore train an under-converged head, and every tuned head axis
+   would return identical trials.
+
+   **Blocked on:** merging the `ibprobit-process-noise` constructor, then
+   routing `main` through a shared builder.
+
+2. **IBProbit dumps cannot be scored.** The arm writes
+   `logit_kind="moderated_score"`, which `analysis/curves.py` deliberately
+   rejects (`_METRICISABLE_LOGIT_KINDS = {"softmax_logits"}`) because
+   `classification_metrics` softmaxes unconditionally. So `run_curve` raises,
+   and `tuning/objective.score_dumps` would fail every trial of a campaign whose
+   training all succeeded — surfacing as `summarize_study`'s "every trial failed
+   is a harness fault" guard.
+
+   **Blocked on a decision, not code:** whether softmaxing a moderated score is
+   the right metric path, or whether IBProbit needs its own scoring branch. That
+   is a modelling call (q-update-spec 5.8), not a mechanical fix.
+
+**Smaller items carried forward:**
+
+- `--micro-batch-size` is REQUIRED for `--arm ibprobit`. The CE arm auto-probes
+  via a local `probe_micro_batch_size_ce`; the IBProbit path cannot, because
+  `full_finetune_comparison.build_ibprobit` passes kwargs this branch's
+  constructor rejects.
+- Run uids are `{model}_{dataset}_{arm}_seed{seed}`. `fig1_curves.UID_RE` parses
+  that as `dataset="imagenet1k_ce"` — a Fig 5 script needs its own regex rather
+  than reusing the probing one. `fig2_detection.UID_RE` requires `_vs_` and does
+  not match these uids at all.
+- OOD dumps use `split="ood_{name}"`. `curves.run_detection` and
+  `run_native_detection` take an `ood_split` kwarg (default `"ood"`, so probing
+  callers are unaffected) which must be passed explicitly for these.
+- No native score is dumped (`score=`/`score_kind=`/`eps_hat=` are never passed),
+  so `run_native_detection` is unavailable on fine-tuning runs.
+- `probe_throughput` needs a train img/s; `finetune_jax` now reports one at the
+  end of a run, so the two must be run in that order.
