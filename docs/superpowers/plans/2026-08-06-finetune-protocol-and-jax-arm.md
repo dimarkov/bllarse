@@ -1161,10 +1161,10 @@ def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
         imgs = jnp.asarray(imagenet.normalize_chunk(raw, mean, std))
         labs = jnp.asarray(labels[start:start + args.eval_chunk])
         if arm == "ibprobit":
-            logits = jax_steps_eval_ibprobit(inference_bb, head_or_loss, imgs, labs,
+            logits = eval_logits_ibprobit(inference_bb, head_or_loss, imgs, labs,
                                             key, bf16=args.bf16)
         else:
-            logits = jax_steps_eval_ce(inference_bb, head_or_loss, imgs, key,
+            logits = eval_logits_ce(inference_bb, head_or_loss, imgs, key,
                                        bf16=args.bf16)
         chunks.append(np.asarray(logits))
     logits = np.concatenate(chunks, axis=0)
@@ -1180,13 +1180,13 @@ def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
 
 
 @eqx.filter_jit
-def jax_steps_eval_ce(backbone, head, images, key, bf16=False):
+def eval_logits_ce(backbone, head, images, key, bf16=False):
     features = jax_steps.forward_features(backbone, images, key, bf16=bf16)
     return jax.vmap(head)(features)
 
 
 @eqx.filter_jit
-def jax_steps_eval_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
+def eval_logits_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
     features = jax_steps.forward_features(backbone, images, key, bf16=bf16)
     _, logits = loss_fn(features, labels, with_logits=True, loss_type=2)
     return logits
