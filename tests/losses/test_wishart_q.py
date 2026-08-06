@@ -307,6 +307,28 @@ def test_q_recursion_at_the_prior_is_the_plain_conjugate_update():
     assert jnp.allclose(Psi_n, (1 - gamma) * lf.Psi + gamma * Psi0 + S, rtol=1e-4)
 
 
+def test_q_recursion_convex_combination_off_the_prior():
+    """The t=0 test is degenerate: with self.Psi == Psi0 the convex combination
+    collapses for ANY gamma. Repeat the assertions from a moved state, where a
+    gamma/(1-gamma) swap or a Psi0/self.Psi swap would change the answer."""
+    import equinox as eqx
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9)
+    Psi0, nu0 = lf._q_seed()
+    lf = eqx.tree_at(lambda m: (m.Psi, m.nu), lf, (Psi0 * 0.25, nu0 + 7.0))
+
+    Qhat, Lambda_pred, _, Sigma_new, Delta = _random_state(jr.key(31), d, K)
+    S = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    Psi_n, nu_n, _, _, gamma = lf._q_recursion(Qhat, Lambda_pred, Sigma_new, Delta, K)
+
+    assert not jnp.allclose(lf.Psi, Psi0), "state must be off the prior for this to bite"
+    assert jnp.allclose(nu_n, (1 - gamma) * lf.nu + gamma * nu0 + K, rtol=1e-5)
+    assert jnp.allclose(Psi_n, (1 - gamma) * lf.Psi + gamma * Psi0 + S, rtol=1e-4)
+    # a gamma/(1-gamma) swap must be distinguishable at this state
+    swapped = gamma * lf.nu + (1 - gamma) * nu0 + K
+    assert abs(float(nu_n - swapped)) > 1e-3
+
+
 def test_q_recursion_keeps_psi_pd_and_nu_above_d_plus_one():
     d, K, N = 13, 4, 32
     lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-2, rho=0.9, warmup=0)
@@ -409,3 +431,32 @@ def test_update_runs_under_jit_and_scan():
     out = run(params, fts, ys)
     final = eqx.combine(out, static)
     assert jnp.isfinite(final.mu).all() and jnp.isfinite(final.Psi).all()
+
+
+def test_q_recursion_has_a_fixed_point_at_the_covariance_floor():
+    """When Qhat << Sigma the statistic is dominated by K*Qhat, and S_t = K*Qhat is an
+    EXACT fixed point of the gamma=0 update: Psi(1 + K/(nu-d-1))/(nu-d-1+K) = Psi/(nu-d-1).
+    So the estimator sits at its seed and the only forcing is the O(Qhat^2) drift term.
+    Pinned deliberately: this is a real, measured property of the recursion, not an
+    aspiration, and a future change to the statistic should have to confront it."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3, rho=0.9)
+    Psi0, nu0 = lf._q_seed()
+    Qhat = lf.Qhat
+    S = K * Qhat                                  # the leading-order statistic
+    nu_t = (1 - 0.0) * lf.nu + 0.0 * nu0 + K      # gamma = 0
+    Psi_t = lf.Psi + S
+    Qhat_t = Psi_t / (nu_t - d - 1)
+    assert jnp.allclose(Qhat_t, Qhat, rtol=1e-5), (
+        "S = K*Qhat must reproduce Qhat exactly; if this fails the statistic changed")
+
+
+def test_increment_statistic_drift_term_responds_to_delta():
+    """The drift term is the only part of S_t carrying a change signal. It is swamped by
+    the covariance floor in practice (~1e-5 of the total), but it must at least respond."""
+    d, K = 9, 4
+    lf = IBProbit(d - 1, K, key=jr.key(0), q_init=1e-3)
+    Qhat, Lambda_pred, _, Sigma_new, Delta = _random_state(jr.key(32), d, K)
+    base = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, Delta)
+    moved = lf._increment_statistic(Qhat, Lambda_pred, Sigma_new, 5.0 * Delta)
+    assert float(jnp.trace(moved)) > float(jnp.trace(base))

@@ -98,7 +98,7 @@ class IBProbit(eqx.Module):
         use_bias: bool = True,
         use_approx_cdf: bool = True,
         q_init: Optional[float] = None,
-        alpha: float = 1e-3,
+        alpha: float = 0.1,
         batch_size: Optional[int] = None,
         kappa: Optional[float] = None,
         learn_q: bool = True,
@@ -114,6 +114,16 @@ class IBProbit(eqx.Module):
         # alpha-forgetting with the Kalman steady state, so the paper's tuned
         # forgetting factor survives as the prior on Q. q_init overrides it, which is
         # how the old q = 1/D regime stays reachable for the sec 12.5 comparison.
+        #
+        # alpha defaults to 0.1, NOT the 1e-3 this class first shipped with. At 1e-3
+        # and B = 32, q0 = alpha^2/B = 3.1e-8 and the whole Inverse-Wishart recursion
+        # is provably inert -- learn_q=True and learn_q=False produce bit-identical mu
+        # over 40 steps, because S_t is dominated by its K*Qhat covariance floor (an
+        # exact fixed point of the update) and the O(Qhat^2) drift term that carries
+        # the actual change signal is ~1e-8 of the total. alpha = 0.1 gives
+        # q0 = 3.1e-4, near the pre-Wishart 1/D = 7.8e-4 operating point, and lifts
+        # the drift fraction of S_t three orders to ~1.8e-5. The q0 = alpha^2/B
+        # relation itself is unchanged; only where alpha sits on it.
         if q_init is not None:
             q0 = float(q_init)
         elif batch_size is not None:
