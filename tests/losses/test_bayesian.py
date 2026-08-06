@@ -217,7 +217,7 @@ def test_ibprobit_loss_type_is_instance_field_not_call_arg():
     ignored (enforces a single convergence target)."""
     key = jr.PRNGKey(0)
     D, C, N = 6, 3, 128
-    m = IBProbit(D, C, key=key, q_init=1.0 / D, eps_init=0.0, loss_type=0).update(
+    m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=0).update(
         jr.normal(jr.PRNGKey(1), (N, D)), jr.randint(jr.PRNGKey(2), (N,), 0, C), num_iters=8)
     f = jr.normal(jr.PRNGKey(5), (16, D)); y = jr.randint(jr.PRNGKey(6), (16,), 0, C)
 
@@ -227,19 +227,29 @@ def test_ibprobit_loss_type_is_instance_field_not_call_arg():
 
 
 def test_ibprobit_call_with_logits_unchanged_after_refactor():
-    """__call__ is built from _predictive_logits + _mixture_logp (the mixture is
-    structural now, sec 5.2): its public with_logits output must match calling those two
-    pieces directly, log p_eps = _mixture_logp(_predictive_logits(f))."""
+    """Two separate properties, deliberately not collapsed into one assertion:
+
+    1. the loss_type=2 transform is logcdf(x) - logcdf(-x), reconstructed BY HAND here
+       so a wrong sign, swapped operands or a dropped beta would be caught. Deriving
+       `expected` from _loss_from_logits (or from _mixture_logp, which calls it) would
+       make this f(x) == f(x);
+    2. __call__ wires _predictive_logits into _mixture_logp in that order.
+    """
     key = jr.PRNGKey(0)
     D, C, N = 6, 3, 128
-    m = IBProbit(D, C, key=key, q_init=1.0 / D).update(   # default loss_type=2
+    m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=2).update(   # pin loss_type=2
         jr.normal(jr.PRNGKey(1), (N, D)), jr.randint(jr.PRNGKey(2), (N,), 0, C), num_iters=8)
     f = jr.normal(jr.PRNGKey(5), (16, D)); y = jr.randint(jr.PRNGKey(6), (16,), 0, C)
-
-    _, logits_t = m(f, y, with_logits=True)
     raw = m._predictive_logits(f)
-    expected = m._mixture_logp(raw)
-    assert jnp.allclose(logits_t, expected, rtol=1e-5, atol=1e-5)
+
+    # (1) the transform, hand-derived -- independent of _loss_from_logits
+    hand = m.beta * (m.logcdf(raw) - m.logcdf(-raw))
+    assert jnp.allclose(m._loss_from_logits(raw, jnp.zeros_like(raw))[1], hand, atol=1e-5)
+
+    # (2) the wiring
+    loss, logits = m(f, y, with_logits=True)
+    assert jnp.allclose(logits, m._mixture_logp(raw), atol=1e-6)
+    assert jnp.allclose(loss, -jnp.take_along_axis(logits, y[:, None], axis=1)[:, 0], atol=1e-6)
 
 
 # --- per-data-point assimilation gate ----------------------------------------
