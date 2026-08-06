@@ -1570,6 +1570,27 @@ Expected: no output.
 
 The three flag blocks are near-identical. Delete `--fix-q`, `--hyper-lr`, `--anchor-weight`, `--sigma-z2-init`, `--bmr-gate`, `--learn-eps`; rename `--bmr-warmup` to `--warmup`; add `--alpha` and `--no-learn-q`. Old sweep configs passing a removed flag now fail loudly, which is the intent — a flag that silently does nothing is worse.
 
+- [ ] **Step 0b: Drop the `use_eps` guards**
+
+Task 8 deleted the `use_eps` property — the contamination mixture is structural now, so `__call__` always scores the floored mixture and there is nothing to branch on. Five sites still read it and will raise `AttributeError`:
+
+| file:line | context |
+|---|---|
+| `scripts/alternatives/ood_evaluation.py:201` | docstring/progress guard |
+| `scripts/alternatives/ood_evaluation.py:224` | tqdm postfix: `if loss_fn.use_eps: post["eps"] = ...` |
+| `scripts/alternatives/ood_evaluation.py:374` | params logging |
+| `scripts/alternatives/full_finetune_comparison.py:814` | tqdm/metric logging |
+| `scripts/alternatives/vit_classification.py:716` | tqdm/metric logging |
+
+In each case delete the condition and keep its body unconditionally — `eps` is now always live and always worth reporting. Also replace any `loss_fn.q` read with `loss_fn.Qhat`, which is a `(d,d)` matrix rather than a scalar: log `float(jnp.trace(loss_fn.Qhat) / loss_fn.Qhat.shape[0])` (the mean diagonal) where a scalar is wanted for a progress bar or a metric.
+
+Verify none remain:
+
+```bash
+grep -rn "use_eps\|loss_fn\.q\b\|\.log_q\|sigma_z2" --include=*.py scripts/ src/ tests/ benchmarks/
+```
+Expected: no output.
+
 - [ ] **Step 1: Replace the flag block in all three scripts**
 
 The block is `ood_evaluation.py:451-472`, `full_finetune_comparison.py:1099-1118`, `vit_classification.py:806-825`. In each, replace the flags between `--num-update-iters` and the next section comment with (using `p` or `parser` to match the surrounding file):
