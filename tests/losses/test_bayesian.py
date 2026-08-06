@@ -240,6 +240,11 @@ def test_ibprobit_call_with_logits_unchanged_after_refactor():
     m = IBProbit(D, C, key=key, q_init=1.0 / D, loss_type=2).update(   # pin loss_type=2
         jr.normal(jr.PRNGKey(1), (N, D)), jr.randint(jr.PRNGKey(2), (N,), 0, C), num_iters=8)
     f = jr.normal(jr.PRNGKey(5), (16, D)); y = jr.randint(jr.PRNGKey(6), (16,), 0, C)
+
+    # beta defaults to 1.0, which would make the `m.beta *` below a no-op and leave a
+    # dropped-beta regression in _loss_from_logits undetectable. Set it off 1 so the
+    # scaling is load-bearing in the comparison.
+    m = eqx.tree_at(lambda t: t.beta, m, jnp.float32(1.7))
     raw = m._predictive_logits(f)
 
     # (1) the transform, hand-derived -- independent of _loss_from_logits
