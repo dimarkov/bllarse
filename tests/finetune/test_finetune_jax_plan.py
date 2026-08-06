@@ -39,8 +39,17 @@ def test_default_img_size_is_224():
 def test_check_img_size_refuses_512():
     # DINOV3_DATASET_IMG_SIZES maps imagenet1k -> 512 for FEATURE EXTRACTION.
     # Inheriting it here would be a ~5x cost accident, so it must be loud.
-    with pytest.raises(SystemExit, match="512"):
+    # The pattern pins the interpolated size in its actual context, not just the
+    # boilerplate "imagenet1k -> 512", so if interpolation breaks the test fails.
+    with pytest.raises(SystemExit, match=r"--img-size 512 refused"):
         fj.check_img_size(_args(img_size=512))
+
+
+def test_check_img_size_refuses_384():
+    # A different non-224 size, proving the guard is not hardcoded to 512 and
+    # that the guard actually interpolates the supplied size in the message.
+    with pytest.raises(SystemExit, match=r"--img-size 384 refused"):
+        fj.check_img_size(_args(img_size=384))
 
 
 def test_check_img_size_accepts_224():
