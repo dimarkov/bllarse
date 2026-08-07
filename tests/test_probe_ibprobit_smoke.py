@@ -143,6 +143,57 @@ def test_the_score_matches_the_split_it_was_dumped_with(fake_features, tmp_path)
     assert len(val.labels) != len(test.labels), "the fixture must not split evenly"
 
 
+def test_a_whole_optuna_trial_runs_end_to_end(fake_features, tmp_path, monkeypatch):
+    """The seam the unit tests each see only half of.
+
+    `objective.evaluate` looks the arm up in SCRIPTS, imports that script,
+    re-parses a config through its argparser, calls main(on_dump=...) once per
+    tuning seed, and scores the dumps. Every one of those can break
+    independently, and all of them break AFTER the trial has spent its GPU
+    time -- at which point `study.optimize(catch=(Exception,))` records an
+    ordinary failed trial and the campaign keeps going, so a broken seam looks
+    like a bad search space rather than a harness fault.
+    """
+    from bllarse.tools import adapters
+    from bllarse.tuning import worker
+
+    monkeypatch.setenv("BLLARSE_REPO_ROOT", str(Path(__file__).resolve().parents[1]))
+
+    config = worker.trial_config(
+        "ibprobit", "dtd",
+        params={"batch_size": 64, "q_init": 3e-4, "eps_init": 0.02,
+                "num_update_iters": 32},
+        budgets={"dtd": {"batch_size": 512, "steps": 100, "epochs": 1}},
+        cache_dir=str(fake_features),
+        split_cache_dir=str(tmp_path / "splits"),
+        enable_mlflow=False,
+    )
+    # The study's dataset is dtd (that is what sets the budget); the fixture
+    # stands in for its cached features, so the loaded names have to match it.
+    config.update({"model": "dinov3_small", "dataset": "fake",
+                   "num_classes": 3, "img_size": 224, "epochs": 12,
+                   "n_dumps": 5, "no_hf_cache": True})
+    # `arm` must survive: adapters.config_to_argv turns it into --arm, and
+    # dropping it would silently run the adamw_ce arm under an ibprobit study.
+    assert config["arm"] == "ibprobit"
+
+    seen = []
+    value = objective.evaluate(
+        "ibprobit", config,
+        dump_root=tmp_path / "dumps", group_id="trial", uid="t0",
+        on_dump=lambda i, step, scalars: seen.append((i, step)),
+        keep_dumps=True,
+    )
+    assert np.isfinite(value), "the trial produced no scoreable objective value"
+    assert seen, "on_dump never fired, so pruning would never engage"
+
+    # Both tuning seeds ran and each wrote its own dumps.
+    for seed in objective.TUNING_SEEDS:
+        assert list(evaldump.iter_dumps(tmp_path / "dumps", "trial", f"t0_seed{seed}"))
+
+    del adapters  # imported for the module-resolution side of the seam only
+
+
 def test_learning_rate_is_inert_on_this_arm(fake_features, tmp_path):
     """The arm runs no optimizer, so --learning-rate must not reach anything.
 

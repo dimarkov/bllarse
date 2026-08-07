@@ -36,6 +36,11 @@ dev = [
     "seaborn>=0.13.0",
     "mlflow>=3.9.0",
     "pytest>=8.3.5",
+    # Both container images already pin this; without it locally, the module
+    # level `importorskip` in tests/tuning/test_worker.py silently skipped the
+    # WHOLE file -- so `trial_config`, which builds the config for every trial
+    # of every campaign, had no local coverage at all.
+    "optuna>=4.0",
 ]
 alternatives = [
     "transformers[flax]>=4.35.0",
