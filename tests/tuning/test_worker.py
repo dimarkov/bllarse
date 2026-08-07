@@ -41,9 +41,12 @@ def test_the_ibprobit_trial_config_reaches_probe_pys_cli():
     assert args.q_init == 3e-4
     assert args.num_update_iters == 64
     assert args.px is True
-    # --no-learn-q absent, so the Inverse-Wishart recursion stays on: it is the
-    # method under test, not a search axis.
-    assert args.no_learn_q is False
+    # --no-learn-q PRESENT: Q is pinned at its q0 seed for this campaign, so
+    # the search is over a static process noise. q_init is the seed the
+    # recursion would start from, so leaving it running would have the search
+    # chase a moving target within each trial. This is the assertion that
+    # catches the flag silently flipping back on.
+    assert args.no_learn_q is True
     # kappa unset, so IBProbit's own default of 0.5 applies. Fixed by decision.
     assert args.kappa is None
 

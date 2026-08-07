@@ -42,11 +42,22 @@ VBLL_FIXED = {
 # px on for every IBProbit trial. PX shares the plain CAVI fixed point exactly
 # and only reaches it in fewer iterations, so it is a solver form rather than a
 # model hyperparameter -- searching it would let TPE trade compute against fit
-# and make trials incomparable in cost. `learn_q` needs no entry: the CLI flag
-# is --no-learn-q, so omitting it leaves the recursion on, which is the method
-# under test. `kappa` likewise stays absent, taking the class default of 0.5.
+# and make trials incomparable in cost.
+#
+# learn_q OFF for this campaign, by decision: Q is pinned at its q0 seed and q0
+# is the tuned axis. The two would otherwise confound each other -- q_init is
+# the seed the recursion starts from, so tuning it while the recursion is also
+# running measures a moving target, and `_q_recursion`'s own MEASURED
+# LIMITATION says the node barely moves at the operating points tested anyway
+# (bit-identical mu at q0 = 3.1e-8; "does not make the mechanism responsive" at
+# 3.1e-4). Fixing it makes this campaign a clean search over a STATIC process
+# noise; whether inferring Q beats the tuned static value is a follow-up
+# ablation at that value, not a knob inside the search.
+#
+# `kappa` stays absent, taking the class default of 0.5.
 IBPROBIT_FIXED = {
     "px": True,
+    "no_learn_q": True,
 }
 
 

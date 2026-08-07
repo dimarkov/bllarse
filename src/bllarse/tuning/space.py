@@ -108,9 +108,12 @@ def _suggest_ibprobit(trial: Any, dataset: str) -> dict[str, Any]:
       * `px` on -- PX shares the plain CAVI fixed point exactly (see
         `_cavi_scan_px`) and only reaches it in fewer iterations, so it is a
         solver form rather than a model hyperparameter.
-      * `learn_q` on -- the Inverse-Wishart recursion is the method under test.
-        Turning it off is an ablation, and an ablation belongs in its own runs
-        rather than as an axis TPE can quietly collapse.
+      * `learn_q` OFF -- Q is pinned at its q0 seed for this campaign, so the
+        search is over a STATIC process noise. Leaving the recursion running
+        while tuning `q_init` would have the search chase a moving target: q0
+        is the seed the recursion starts from, so the two are not separable
+        within a trial. Whether inferring Q beats the tuned static value is a
+        follow-up ablation at that value. See worker.IBPROBIT_FIXED.
     """
     return {
         "batch_size": trial.suggest_categorical("batch_size", batch_sizes(dataset)),

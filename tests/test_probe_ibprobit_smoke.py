@@ -194,6 +194,37 @@ def test_a_whole_optuna_trial_runs_end_to_end(fake_features, tmp_path, monkeypat
     del adapters  # imported for the module-resolution side of the seam only
 
 
+@pytest.mark.parametrize("flag,expected_learn_q", [([], True), (["--no-learn-q"], False)])
+def test_the_learn_q_flag_reaches_the_constructor(
+    fake_features, tmp_path, monkeypatch, flag, expected_learn_q
+):
+    """`learn_q=not args.no_learn_q` is one expression, and getting it backwards
+    is invisible downstream: the dumps carry no Qhat, and `_q_recursion`'s own
+    MEASURED LIMITATION says the node barely moves at these operating points --
+    so an inverted flag would produce a run that trains, dumps, scores and looks
+    entirely healthy while pinning Q when it should infer it, or the reverse.
+
+    The tuning campaign pins it OFF (worker.IBPROBIT_FIXED), which makes this
+    the only place the wiring is checked at all.
+    """
+    import probe
+
+    captured = {}
+    real = probe.IBProbit
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(probe, "IBProbit", spy)
+    _run(tmp_path, fake_features, f"ib_lq_{expected_learn_q}", extra=flag)
+
+    assert captured["learn_q"] is expected_learn_q
+    # ...and the neighbouring fixed knobs are not being crossed with it.
+    assert captured["px"] is True
+    assert captured["kappa"] is None
+
+
 def test_learning_rate_is_inert_on_this_arm(fake_features, tmp_path):
     """The arm runs no optimizer, so --learning-rate must not reach anything.
 
