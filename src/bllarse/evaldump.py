@@ -87,9 +87,15 @@ def write_dump(
 ) -> Path:
     """Write one eval point. Returns the path written.
 
-    `logit_kind` records what the array actually is -- "softmax_logits" for CE
-    and VBLL, "moderated_score" for IBProbit (q-update-spec.md 5.8) -- so no
-    downstream consumer has to infer it.
+    `logit_kind` records what the array actually is, so no downstream consumer
+    has to infer it. All three arms currently write "softmax_logits", but they
+    do not write the same THING: AdamW+CE dumps raw pre-softmax logits, while
+    VBLL and IBProbit both dump an already-normalized log-predictive (VBLL's is
+    a Monte Carlo average of softmax samples; IBProbit's is `_mixture_logp`,
+    normalized because (1-eps)*1 + K*(eps/K) == 1). Softmaxing any of the three
+    is correct -- it is a no-op on the latter two -- which is why they share a
+    label; but scores that need an unnormalized level are not, and
+    `metrics._reject_normalized` is what guards those.
 
     `score` is the arm's native epistemic score and is diagnostic only: the
     primary Fig 2 comparison uses MSP and entropy derived from `logits`, which

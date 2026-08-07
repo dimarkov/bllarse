@@ -39,6 +39,16 @@ VBLL_FIXED = {
     "device": "cuda",
 }
 
+# px on for every IBProbit trial. PX shares the plain CAVI fixed point exactly
+# and only reaches it in fewer iterations, so it is a solver form rather than a
+# model hyperparameter -- searching it would let TPE trade compute against fit
+# and make trials incomparable in cost. `learn_q` needs no entry: the CLI flag
+# is --no-learn-q, so omitting it leaves the recursion on, which is the method
+# under test. `kappa` likewise stays absent, taking the class default of 0.5.
+IBPROBIT_FIXED = {
+    "px": True,
+}
+
 
 def study_name(arm: str, dataset: str, campaign: str | None = None) -> str:
     """Study identity, optionally namespaced by campaign.
@@ -158,7 +168,11 @@ def trial_config(
     if arm == "vbll":
         config.update(VBLL_FIXED)
     else:
-        config["arm"] = "adamw_ce"
+        # Both JAX arms run scripts/alternatives/probe.py and select the
+        # training step with --arm, so the study's arm name IS the flag value.
+        config["arm"] = arm
+        if arm == "ibprobit":
+            config.update(IBPROBIT_FIXED)
     return config
 
 

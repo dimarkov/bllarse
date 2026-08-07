@@ -344,7 +344,15 @@ def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
         args.dump_root, args.group_id, args.uid, step,
         logits, labels,
         arm=arm, split=split,
-        logit_kind="moderated_score" if arm == "ibprobit" else "softmax_logits",
+        # "softmax_logits" on BOTH arms, and for IBProbit that is not a
+        # convenience: `IBProbit.__call__(with_logits=True)` returns
+        # `_mixture_logp`, which is normalized by construction --
+        # (1-eps)*1 + K*(eps/K) == 1 -- so softmaxing it is a no-op that
+        # recovers the mixture exactly. That is the same kind of array the VBLL
+        # arm dumps (log of its predictive) under the same label, and
+        # metrics.classification_metrics is correct on it. Labelling it
+        # "moderated_score" instead made run_curve refuse every IBProbit dump.
+        logit_kind="softmax_logits",
         seed=args.seed, samples_seen=samples_seen,
     )
     return metrics.classification_metrics(logits, labels)

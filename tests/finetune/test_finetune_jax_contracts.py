@@ -752,7 +752,15 @@ def test_main_ibprobit_arm_skips_the_optimizer_step_at_step_one(tmp_path, monkey
     by_split = {}
     for r in records:
         by_split.setdefault(r.meta["split"], set()).add(r.meta["step"])
-        assert r.meta["logit_kind"] == "moderated_score"
+        # "softmax_logits", not the "moderated_score" this once asserted.
+        # IBProbit.__call__(with_logits=True) returns _mixture_logp, which is
+        # normalized by construction -- (1-eps)*1 + K*(eps/K) == 1 -- so
+        # softmaxing it is a no-op and metrics.classification_metrics is
+        # correct on it. It is the same kind of array the VBLL arm dumps under
+        # the same label. Under the old label, curves.run_curve refused every
+        # IBProbit dump, so a tuning campaign whose training all succeeded
+        # would still have failed every trial at scoring time.
+        assert r.meta["logit_kind"] == "softmax_logits"
     assert by_split["val"] == by_split["test"] == {1, 2, 3}
 
 

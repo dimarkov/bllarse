@@ -11,10 +11,68 @@ from bllarse.tuning import space, worker
 def test_study_names_are_unique_per_arm_and_dataset():
     names = {
         worker.study_name(arm, ds)
-        for arm in ("adamw_ce", "vbll")
+        for arm in space.ARMS
         for ds in space.DATASETS
     }
-    assert len(names) == 2 * len(space.DATASETS) == 14
+    assert len(names) == 3 * len(space.DATASETS) == 21
+
+
+def test_the_ibprobit_trial_config_reaches_probe_pys_cli():
+    """The end the unit tests cannot see: a config that `trial_config` builds
+    but `probe.build_argparser` rejects fails the trial AFTER its GPU time is
+    spent, and `study.optimize(catch=(Exception,))` records it as an ordinary
+    failure rather than the harness fault it is.
+    """
+    from bllarse.tools import adapters
+
+    budgets = {"dtd": {"batch_size": 512, "steps": 2000, "epochs": 273}}
+    config = worker.trial_config(
+        "ibprobit", "dtd",
+        params={"batch_size": 256, "q_init": 3e-4, "eps_init": 0.02,
+                "num_update_iters": 64},
+        budgets=budgets,
+    )
+    assert config["arm"] == "ibprobit"
+    assert config["px"] is True
+
+    module = adapters.load_script_module("scripts/alternatives/probe.py")
+    args = adapters.parse_config(module, config)
+    assert args.arm == "ibprobit"
+    assert args.q_init == 3e-4
+    assert args.num_update_iters == 64
+    assert args.px is True
+    # --no-learn-q absent, so the Inverse-Wishart recursion stays on: it is the
+    # method under test, not a search axis.
+    assert args.no_learn_q is False
+    # kappa unset, so IBProbit's own default of 0.5 applies. Fixed by decision.
+    assert args.kappa is None
+
+
+def test_the_ibprobit_config_carries_no_optimizer_knobs():
+    """probe.py's argparser still DEFINES --learning-rate (the adamw_ce arm
+    needs it), so passing one would parse cleanly and silently suggest the arm
+    has a tuned learning rate. The config must simply not carry one."""
+    budgets = {"dtd": {"batch_size": 512, "steps": 2000, "epochs": 273}}
+    config = worker.trial_config(
+        "ibprobit", "dtd",
+        params={"batch_size": 256, "q_init": 3e-4, "eps_init": 0.02,
+                "num_update_iters": 64},
+        budgets=budgets,
+    )
+    assert "learning_rate" not in config
+    assert "weight_decay" not in config
+
+
+def test_the_adamw_ce_config_gains_no_ibprobit_knobs():
+    budgets = {"dtd": {"batch_size": 512, "steps": 2000, "epochs": 273}}
+    config = worker.trial_config(
+        "adamw_ce", "dtd",
+        params={"learning_rate": 1e-3, "weight_decay": 1e-4, "batch_size": 256},
+        budgets=budgets,
+    )
+    assert config["arm"] == "adamw_ce"
+    for knob in ("px", "q_init", "eps_init", "num_update_iters"):
+        assert knob not in config
 
 
 def test_workers_sharing_a_storage_dir_share_one_study(tmp_path):

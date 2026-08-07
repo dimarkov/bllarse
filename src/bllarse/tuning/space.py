@@ -43,6 +43,17 @@ TUNING_MODEL = "dinov3_huge"
 MIN_BATCH = 64
 MIN_STEPS_PER_EPOCH = 2
 
+# The tunable arms. Held here rather than inferred from the training scripts so
+# the search space stays inspectable without importing one, and pinned against
+# objective.SCRIPTS by a test: an arm added to one and not the other gives a
+# worker that accepts --arm and then dies inside its first trial.
+ARMS = ("adamw_ce", "vbll", "ibprobit")
+
+# IBProbit's CAVI iteration counts. Categorical, not suggest_int: 192 is 1.5x128
+# rather than a doubling, so the ladder is not geometric and an integer range
+# would spend trials on values nobody asked to compare.
+IBPROBIT_UPDATE_ITERS = (32, 64, 128, 192)
+
 
 def batch_cap(n_train: int) -> int:
     """Largest power of two leaving at least MIN_STEPS_PER_EPOCH steps/epoch.
@@ -82,18 +93,71 @@ def steps_per_epoch(dataset: str, batch_size: int) -> int:
     return N_TRAIN[dataset] // batch_size
 
 
+def _suggest_ibprobit(trial: Any, dataset: str) -> dict[str, Any]:
+    """IBProbit's axes -- disjoint from the other two arms' except for the
+    shared batch ladder.
+
+    NO learning_rate and NO weight_decay. The head is assimilated in closed
+    form by `IBProbit.update` and linear probing freezes the backbone, so this
+    arm runs no optimizer at all: those two axes have nothing to act on, and
+    sampling them would spend a third of the campaign distinguishing
+    configurations that come out bit-identical.
+
+    FIXED, not searched:
+      * `kappa` at the class default 0.5, by decision.
+      * `px` on -- PX shares the plain CAVI fixed point exactly (see
+        `_cavi_scan_px`) and only reaches it in fewer iterations, so it is a
+        solver form rather than a model hyperparameter.
+      * `learn_q` on -- the Inverse-Wishart recursion is the method under test.
+        Turning it off is an ablation, and an ablation belongs in its own runs
+        rather than as an axis TPE can quietly collapse.
+    """
+    return {
+        "batch_size": trial.suggest_categorical("batch_size", batch_sizes(dataset)),
+        # q0 DIRECTLY, not alpha. The class derives q0 = alpha^2 / B by default,
+        # and B is tuned here alongside it -- so a table of tuned alpha is not a
+        # table of process noise: two datasets whose alpha agrees sit at
+        # different q0 whenever their batch sizes differ, and process noise
+        # against (num_classes, num_update_iters) is exactly what this campaign
+        # exists to read. alpha stays recoverable afterwards as sqrt(q0 * B).
+        #
+        # The box brackets 1/D = 7.8e-4 (the pre-Wishart operating point) with
+        # two decades of room above and below. Its floor is a decade and a half
+        # above the measured-inert q0 = 3.1e-8, where learn_q on and off give
+        # bit-identical mu over 40 steps -- trials sampled down there would be
+        # comparing configurations that do not differ.
+        "q_init": trial.suggest_float("q_init", 1e-6, 1e-1, log=True),
+        # Beta(1, 1/eps_init) prior mean on the contamination rate. A genuine
+        # model knob: it sets how readily the head discounts a badly-predicted
+        # point, and the datasets here span very different label-noise levels.
+        "eps_init": trial.suggest_float("eps_init", 1e-3, 1e-1, log=True),
+        # A TPE axis rather than four separate studies: every dataset already
+        # gets its own study, so K is held fixed within one and a tuned
+        # iteration count that VARIES across datasets is itself the
+        # K-dependence signal. Read it with care -- TPE's per-level sampling
+        # noise can move the winner by one rung on its own.
+        "num_update_iters": trial.suggest_categorical(
+            "num_update_iters", list(IBPROBIT_UPDATE_ITERS)
+        ),
+    }
+
+
 def suggest(trial: Any, arm: str, dataset: str) -> dict[str, Any]:
     """One TPE-sampled configuration.
 
-    Shared axes apply to both arms because VBLL's head is also optimised by
-    AdamW. `parameterization` is fixed to diagonal and `cov_rank` is NOT
-    searched: rank buys calibration with memory, and neither AdamW+CE nor
-    IBProbit has an equivalent knob, so letting TPE spend it freely would let
-    VBLL win Fig 1 partly by being larger. Rank is reported separately as an
-    appendix Pareto front.
+    The AdamW axes are shared by adamw_ce and vbll because VBLL's head is also
+    optimised by AdamW; IBProbit's are disjoint (see `_suggest_ibprobit`).
+    `parameterization` is fixed to diagonal and `cov_rank` is NOT searched: rank
+    buys calibration with memory, and neither AdamW+CE nor IBProbit has an
+    equivalent knob, so letting TPE spend it freely would let VBLL win Fig 1
+    partly by being larger. Rank is reported separately as an appendix Pareto
+    front.
     """
-    if arm not in ("adamw_ce", "vbll"):
-        raise ValueError(f"unknown arm {arm!r}")
+    if arm not in ARMS:
+        raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(ARMS)}")
+
+    if arm == "ibprobit":
+        return _suggest_ibprobit(trial, dataset)
 
     # Lower bound raised from 1e-4 to 1e-3 after the pilot: at lr=1e-4, every
     # dataset on both arms still had its val_nll minimum sitting at or within

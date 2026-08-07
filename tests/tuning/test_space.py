@@ -133,6 +133,122 @@ def test_adamw_ce_gains_no_vbll_axes():
         assert axis not in trial.floats
 
 
+def test_ibprobit_has_no_optimizer_axes():
+    """The decisive difference between this arm and the other two.
+
+    IBProbit's head is assimilated in closed form by CAVI, and linear probing
+    freezes the backbone -- so the arm runs no optimizer at all and there is
+    nothing for a learning rate or a weight decay to act on. Sampling them
+    anyway would present two tuned axes that do nothing, and would spend a
+    third of the campaign's trials distinguishing configurations that are
+    bit-identical. This is the test that fails if the adamw_ce block is ever
+    copied into the ibprobit branch.
+    """
+    trial = _FakeTrial()
+    params = space.suggest(trial, "ibprobit", "dtd")
+    for axis in ("learning_rate", "weight_decay"):
+        assert axis not in params
+        assert axis not in trial.floats
+
+
+def test_ibprobit_searches_q_init_directly_rather_than_alpha():
+    """q0 = alpha^2 / B, and B is tuned alongside it.
+
+    The campaign's artifact is a per-dataset table of tuned PROCESS NOISE read
+    against the number of classes and the CAVI iteration count. A table of
+    tuned `alpha` is not that table: two datasets whose tuned alpha agrees sit
+    at different q0 whenever their tuned batch sizes differ, so the quantity
+    the comparison is about would not be the quantity recorded. alpha stays
+    derivable after the fact as sqrt(q0 * B).
+    """
+    trial = _FakeTrial()
+    params = space.suggest(trial, "ibprobit", "dtd")
+    assert "q_init" in params
+    assert "alpha" not in params and "alpha" not in trial.floats
+    assert trial.floats["q_init"] == (1e-6, 1e-1, True)
+
+
+def test_the_q_init_range_brackets_the_pre_wishart_operating_point():
+    """1/D = 7.8e-4 (D = 1280 for dinov3_huge) is where the head ran before the
+    Inverse-Wishart recursion existed, so the box must be able to express it --
+    and must not merely touch it at an endpoint, where TPE cannot refine.
+
+    The floor sits above the MEASURED-inert point: at q0 = 3.1e-8 the whole
+    recursion is provably dead (learn_q on and off give bit-identical mu over
+    40 steps), so trials sampled there would compare configurations that do not
+    differ. A decade of margin keeps the search out of that region without
+    pretending the boundary is sharp.
+    """
+    trial = _FakeTrial()
+    space.suggest(trial, "ibprobit", "dtd")
+    low, high, log = trial.floats["q_init"]
+    assert log, "process noise spans decades; a linear axis would sample only the top one"
+    assert low < 7.8e-4 < high, "1/D must be interior, not an endpoint"
+    assert low >= 10 * 3.1e-8, "the measured-inert regime must be below the floor"
+
+
+def test_ibprobit_does_not_search_kappa():
+    """Fixed at the class default of 0.5 by decision, not searched. It is the
+    Inverse-Wishart prior pseudo-count against the K the likelihood contributes
+    per step; the merge moved its default off `num_classes` precisely because a
+    K-weight prior pins Q at its q0 seed."""
+    trial = _FakeTrial()
+    params = space.suggest(trial, "ibprobit", "dtd")
+    assert "kappa" not in params
+    assert "kappa" not in trial.floats and "kappa" not in trial.categoricals
+
+
+def test_ibprobit_searches_the_four_requested_cavi_iteration_counts():
+    """Categorical, not an integer range: 192 is 1.5x128, so the ladder is not
+    geometric and suggest_int would sample values never asked for.
+
+    Kept as a TPE axis rather than split across four separate studies because
+    each dataset already has its own study: K is held fixed within a study, so
+    a tuned iteration count that VARIES across datasets is itself the
+    K-dependence signal.
+    """
+    trial = _FakeTrial()
+    params = space.suggest(trial, "ibprobit", "dtd")
+    assert trial.categoricals["num_update_iters"] == [32, 64, 128, 192]
+    assert params["num_update_iters"] == 32
+
+
+def test_ibprobit_searches_eps_init():
+    trial = _FakeTrial()
+    space.suggest(trial, "ibprobit", "dtd")
+    assert trial.floats["eps_init"] == (1e-3, 1e-1, True)
+
+
+@pytest.mark.parametrize("dataset", sorted(EXPECTED_CAPS))
+def test_every_arm_shares_one_batch_ladder(dataset):
+    """A per-arm ladder would make the cross-arm comparison partly a comparison
+    of search spaces -- the reason batch_cap's floor is what it is."""
+    ladders = {
+        arm: _FakeTrial() for arm in ("adamw_ce", "vbll", "ibprobit")
+    }
+    for arm, trial in ladders.items():
+        space.suggest(trial, arm, dataset)
+    seen = {tuple(t.categoricals["batch_size"]) for t in ladders.values()}
+    assert len(seen) == 1
+    assert list(seen.pop()) == space.batch_sizes(dataset)
+
+
+def test_an_unknown_arm_still_raises():
+    with pytest.raises(ValueError, match="unknown arm"):
+        space.suggest(_FakeTrial(), "not_an_arm", "dtd")
+
+
+def test_every_tunable_arm_has_a_training_script():
+    """space.ARMS and objective.SCRIPTS are two lists of the same thing, and
+    worker's --arm choices come from the second while its search space comes
+    from the first. An arm in one and not the other is a worker that accepts
+    the flag at submit time and then dies inside its first trial -- on a
+    cluster, several hours after the mistake was made."""
+    from bllarse.tuning import objective
+
+    assert set(space.ARMS) == set(objective.SCRIPTS)
+
+
 def test_flowers102_trains_on_the_official_split():
     """1,020 images, not the 7,169-image val+test pool the upstream repo names
     "train". The whole batch ladder follows from this number, so it is pinned

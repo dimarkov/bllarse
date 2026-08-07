@@ -6,7 +6,10 @@ already extracted, trains a head, and writes a dump at each scheduled step. All
 reported metrics are computed later from those dumps -- nothing here decides
 what the figures show.
 
-Arms: adamw_ce now; ibprobit is wired the same way and enters in Phase 3.
+Arms: adamw_ce and ibprobit. They share everything outside the training step --
+the same cached features, the same pinned val/test split, the same log-spaced
+dump schedule -- so the only thing that differs between their dumps is how the
+head was fitted.
 """
 
 import argparse
@@ -27,7 +30,7 @@ from jax import random as jr, vmap
 
 from bllarse import evaldump, splits
 from bllarse.features import eval_split_name, load_cached_features, train_split_name
-from bllarse.losses import CrossEntropy
+from bllarse.losses import CrossEntropy, IBProbit
 from bllarse.mlflow_utils import child_run
 from bllarse.reporting import report_step
 
@@ -112,13 +115,70 @@ def _ce_epoch(head, opt_state, optimizer, loss_fn, feats, labels, batch_size, ke
         yield head, opt_state
 
 
+@eqx.filter_jit
+def _ibprobit_step(loss_fn, fb, yb, num_iters):
+    """One recursive-Bayesian CAVI update. Jitted for the same reason `_ce_step`
+    is: eager op-by-op dispatch measured 26x slower there, and this step runs
+    just as many times.
+
+    `num_iters` arrives as a Python int, which filter_jit holds static -- it has
+    to, since `_cavi_scan` builds a `lax.scan` over `jnp.arange(num_iters)`.
+    `px` is not passed: it is a static constructor field, so `update` reads it
+    off `self` and a per-call override could only make the two disagree.
+    Shapes are constant across steps (steps_per_epoch drops the remainder), so
+    this compiles once per run.
+    """
+    return loss_fn.update(fb, yb, num_iters=num_iters)
+
+
+def _ibprobit_epoch(loss_fn, feats, labels, batch_size, num_iters, key):
+    """One streaming pass, yielding the head after every CAVI update.
+
+    Structurally parallel to `_ce_epoch` -- same drop-remainder step count, same
+    permutation source, same yield per optimiser-equivalent step -- so a dump
+    scheduled at step N lands on the same `samples_seen` for both arms. Nothing
+    else would make the two trajectories comparable point-for-point.
+
+    There is no optimiser state to thread through: IBProbit's `update` IS the
+    training step, and it returns the whole head.
+    """
+    perm = jr.permutation(key, len(feats))
+    for i in range(steps_per_epoch(len(feats), batch_size)):
+        idx = perm[i * batch_size:(i + 1) * batch_size]
+        fb, yb = jnp.asarray(feats[idx]), jnp.asarray(labels[idx])
+        loss_fn = _ibprobit_step(loss_fn, fb, yb, num_iters)
+        yield loss_fn
+
+
 def _logits_for(head, loss_fn, feats, labels, chunk=4096):
+    """Dumped logits for either arm.
+
+    `head` is None on the ibprobit arm: IBProbit consumes features directly --
+    its posterior mean IS the linear map -- so there is no separate module to
+    push them through first.
+    """
     out = []
     for start in range(0, len(feats), chunk):
         fb = jnp.asarray(feats[start:start + chunk])
         yb = jnp.asarray(labels[start:start + chunk])
-        _, logits = loss_fn(vmap(head)(fb), yb, with_logits=True)
+        inputs = fb if head is None else vmap(head)(fb)
+        _, logits = loss_fn(inputs, yb, with_logits=True)
         out.append(np.asarray(logits))
+    return np.concatenate(out, axis=0)
+
+
+def _scores_for(loss_fn, feats, chunk=4096):
+    """IBProbit's native epistemic score, 1 + f'(Qhat + Sigma)f.
+
+    The direct analogue of the VBLL arm's dumped score (that one sums the logit
+    predictive's covariance diagonal), so `curves.run_native_detection` compares
+    like with like across the two Bayesian arms. AdamW+CE has no such quantity
+    and dumps none.
+    """
+    out = []
+    for start in range(0, len(feats), chunk):
+        fb = jnp.asarray(feats[start:start + chunk])
+        out.append(np.asarray(loss_fn.predictive_variance(fb)))
     return np.concatenate(out, axis=0)
 
 
@@ -159,15 +219,30 @@ def main(args, on_dump=None):
     embed_dim = train_f.shape[-1]
     key, head_key = jr.split(key)
 
-    if args.arm != "adamw_ce":
-        raise NotImplementedError(
-            f"arm '{args.arm}' is not wired yet; adamw_ce only in Phase 1"
+    if args.arm == "ibprobit":
+        # No head module and no optimizer. IBProbit's posterior mean is the
+        # linear map, and `update` assimilates each batch in closed form -- so
+        # --learning-rate and --weight-decay are inert on this arm and the
+        # search space does not sample them.
+        #
+        # rho is the eps forgetting factor, 1 - B/N: one pass' worth of memory,
+        # the convention the class documents and the other three IBProbit
+        # scripts pass. batch_size is handed over as well so that omitting
+        # --q-init falls back to the derived q0 = alpha^2 / B rather than
+        # raising.
+        head, optimizer, opt_state = None, None, None
+        loss_fn = IBProbit(
+            embed_dim, args.num_classes, key=head_key,
+            q_init=args.q_init, alpha=args.alpha, batch_size=args.batch_size,
+            kappa=args.kappa, learn_q=not args.no_learn_q, px=args.px,
+            warmup=args.warmup, eps_init=args.eps_init,
+            rho=max(0.0, 1.0 - args.batch_size / len(train_f)),
         )
-
-    head = eqx.nn.Linear(embed_dim, args.num_classes, key=head_key)
-    loss_fn = CrossEntropy(args.label_smooth, args.num_classes)
-    optimizer = optax.adamw(args.learning_rate, weight_decay=args.weight_decay)
-    opt_state = optimizer.init(eqx.filter(head, eqx.is_array))
+    else:
+        head = eqx.nn.Linear(embed_dim, args.num_classes, key=head_key)
+        loss_fn = CrossEntropy(args.label_smooth, args.num_classes)
+        optimizer = optax.adamw(args.learning_rate, weight_decay=args.weight_decay)
+        opt_state = optimizer.init(eqx.filter(head, eqx.is_array))
 
     # Loaded once, before the loop: the OOD set is dumped at EVERY eval step
     # (see the write below), and re-reading the feature file per dump would cost
@@ -196,17 +271,31 @@ def main(args, on_dump=None):
         run.log_params({
             "steps_per_epoch": per_epoch,
             "total_steps": total_steps,
-            "head_param_count": head_param_count(head),
+            # On the ibprobit arm the head IS the loss_fn, so that is what the
+            # memory-cost axis has to count: mu (d,K) plus the two (d,d) matrices
+            # Sigma and Psi. Counting `head` (None) would report 0.
+            "head_param_count": head_param_count(loss_fn if head is None else head),
         })
 
         step = 0
         dump_index = 0
         for epoch in range(1, args.epochs + 1):
             key, epoch_key = jr.split(key)
-            for head, opt_state in _ce_epoch(
-                head, opt_state, optimizer, loss_fn,
-                train_f, train_l, args.batch_size, epoch_key,
-            ):
+            if args.arm == "ibprobit":
+                stream = _ibprobit_epoch(
+                    loss_fn, train_f, train_l, args.batch_size,
+                    args.num_update_iters, epoch_key,
+                )
+            else:
+                stream = _ce_epoch(
+                    head, opt_state, optimizer, loss_fn,
+                    train_f, train_l, args.batch_size, epoch_key,
+                )
+            for produced in stream:
+                if args.arm == "ibprobit":
+                    loss_fn = produced
+                else:
+                    head, opt_state = produced
                 step += 1
                 if step not in schedule:
                     continue
@@ -214,12 +303,20 @@ def main(args, on_dump=None):
                 # Exact: drop-remainder means every step is exactly batch_size.
                 samples_seen = step * args.batch_size
                 logits = _logits_for(head, loss_fn, eval_f, eval_l)
+                # IBProbit's contamination estimate and its native epistemic
+                # score ride along with the dump. Both are absent on adamw_ce,
+                # which has neither quantity.
+                eps_hat = float(loss_fn.eps) if args.arm == "ibprobit" else None
+                scores = _scores_for(loss_fn, eval_f) if args.arm == "ibprobit" else None
                 for split_name, idx in (("val", val_idx), ("test", test_idx)):
                     evaldump.write_dump(
                         args.dump_root, args.group_id, args.uid, step,
                         logits[idx], eval_l[idx],
                         arm=args.arm, split=split_name, logit_kind="softmax_logits",
                         seed=args.seed, samples_seen=samples_seen,
+                        score=None if scores is None else scores[idx],
+                        score_kind=None if scores is None else "predictive_variance",
+                        eps_hat=eps_hat,
                     )
                 # OOD at every eval step, not only the last. This used to be a
                 # single dump at total_steps, on the grounds that "Fig 2 is a
@@ -236,6 +333,9 @@ def main(args, on_dump=None):
                         _logits_for(head, loss_fn, ood_f, ood_l), ood_l,
                         arm=args.arm, split="ood", logit_kind="softmax_logits",
                         seed=args.seed, samples_seen=samples_seen,
+                        score=None if scores is None else _scores_for(loss_fn, ood_f),
+                        score_kind=None if scores is None else "predictive_variance",
+                        eps_hat=eps_hat,
                     )
                 scalars = report_step(
                     run, step, samples_seen, epoch,
@@ -276,6 +376,36 @@ def build_argparser():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smooth", type=float, default=0.0)
     p.add_argument("--val-fraction", type=float, default=0.1)
+
+    # --- IBProbit head knobs (arm=ibprobit only) ---
+    # Flag names, types and defaults copied VERBATIM from
+    # scripts/alternatives/ood_evaluation.py and scripts/finetune/finetune_jax.py
+    # so all the IBProbit entry points share one operating point. Do not invent
+    # defaults here.
+    p.add_argument("--num-update-iters", type=int, default=128,
+                   help="CAVI iterations per batch (ibprobit arm). Tuned over "
+                        "{32, 64, 128, 192}; see bllarse.tuning.space.")
+    p.add_argument("--px", action="store_true",
+                   help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
+    p.add_argument("--no-learn-q", action="store_true",
+                   help="pin Qhat at its q0 seed (skip the Inverse-Wishart recursion on Q)")
+    p.add_argument("--alpha", type=float, default=0.1,
+                   help="process-noise scale: q0 = alpha^2 / batch_size. Used only when "
+                        "--q-init is omitted; at 1e-3 the recursion is measurably inert")
+    p.add_argument("--q-init", type=float, default=None,
+                   help="override q0 directly (bypasses alpha^2 / B; 1/D is the pre-Wishart "
+                        "value). This, not --alpha, is the tuned axis: q0 is what the "
+                        "campaign compares across datasets, and alpha alone does not pin it "
+                        "once batch size is tuned too.")
+    p.add_argument("--kappa", type=float, default=None,
+                   help="Inverse-Wishart prior pseudo-count (default: 0.5, i.e. half a "
+                        "pseudo-observation against the K the likelihood adds per step). "
+                        "Fixed by decision, not tuned.")
+    p.add_argument("--warmup", type=int, default=1,
+                   help="hold the contamination gate at 1 for the first N update steps")
+    p.add_argument("--eps-init", type=float, default=0.01,
+                   help="Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init). "
+                        "Forgetting rho = 1 - B/N set automatically.")
     p.add_argument("--seed", type=int, default=137)
     p.add_argument("--enable-mlflow", action="store_true")
     p.add_argument("--mlflow-experiment", default=None)
