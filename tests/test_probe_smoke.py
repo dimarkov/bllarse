@@ -106,18 +106,19 @@ def test_probe_dumps_ood_scores_when_an_ood_dataset_is_given(fake_features, tmp_
     ood_steps = sorted(r.meta["step"] for r in dumps if r.meta["split"] == "ood")
     test_steps = sorted(r.meta["step"] for r in dumps if r.meta["split"] == "test")
 
-    # This asserted a single endpoint dump. That forced Fig 2's detection
-    # metrics to be read at the last step -- the only one with an OOD dump --
-    # even though these runs have no early stopping and the arms drift from
-    # their tuned operating point by very different amounts (AdamW+CE on
-    # cifar100 nearly triples its NLL after step 1,786 of 30,000; VBLL moves by
-    # 0.0003). One OOD dump per eval step lets detection be scored at the same
-    # step as every other metric.
+    # This asserted a single ENDPOINT dump, then one per eval step. It is now
+    # one dump at the VAL-OPTIMAL step. The endpoint was wrong because these
+    # runs drift from their tuned operating point by very different amounts
+    # (AdamW+CE on cifar100 nearly triples its NLL after step 1,786 of 30,000;
+    # VBLL moves by 0.0003), so scoring detection there measured overfitting
+    # rather than the method. One-per-eval-step became unaffordable once the
+    # grid went from 40 points to up to 30,000. The argmin is the point every
+    # other metric is read at, so OOD is written there and nowhere else.
     assert ood_steps == test_steps, (
-        "OOD must be dumped at exactly the eval steps the test split is, so the "
-        "two can always be paired without comparing different checkpoints"
+        "OOD must be dumped at exactly the step the test split is, so the two "
+        "can always be paired without comparing different checkpoints"
     )
-    assert len(ood_steps) == 3
+    assert len(ood_steps) == 1
 
 
 def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
@@ -168,18 +169,36 @@ def _run(fake_features, tmp_path, uid, *, epochs, batch_size, n_dumps):
             if r.meta["split"] == "test"]
 
 
-def test_dumps_are_indexed_on_optimiser_steps_not_epochs(fake_features, tmp_path):
-    """The schedule used to run over epochs, so on ImageNet the first dump
-    landed 1.28M samples in -- past the entire early regime the
-    sample-efficiency claim is about. Steps put the first dump at one batch."""
-    # 600 rows / 100 = 6 steps per epoch, 10 epochs = 60 steps.
-    records = _run(fake_features, tmp_path, "steps", epochs=10, batch_size=100, n_dumps=8)
-    steps = sorted(r.meta["step"] for r in records)
+def test_evaluation_is_indexed_on_optimiser_steps_not_epochs(fake_features, tmp_path):
+    """The schedule used to run over epochs, so on ImageNet the first
+    measurement landed 1.28M samples in -- past the entire early regime the
+    sample-efficiency claim is about.
 
-    assert steps[0] == 1, "first dump must be after a single optimiser step"
-    assert steps[-1] == 60, "last dump must be the final step, not the final epoch"
+    Asserted on the evaluation callback rather than on the dumps, because a run
+    now writes exactly one dump (its argmin) and a single step cannot show a
+    grid. The callback IS the grid: it is what patience, the pruner and the
+    argmin all ride on.
+    """
+    import probe
+
+    # 600 rows / 100 = 6 steps per epoch, 10 epochs = 60 steps. batch_cap(600)
+    # is 256, not a whole number of 100-sample steps, so the quantum falls back
+    # to the batch: one evaluation per step.
+    seen = []
+    args = probe.build_argparser().parse_args([
+        "--arm", "adamw_ce", "--model", "dinov3_small", "--dataset", "fake",
+        "--num-classes", "2", "--cache-dir", str(fake_features),
+        "--split-cache-dir", str(tmp_path / "splits"),
+        "--dump-root", str(tmp_path / "dumps"),
+        "--group-id", "sched", "--uid", "steps",
+        "--epochs", "10", "--batch-size", "100", "--seed", "137", "--no-hf-cache",
+    ])
+    probe.main(args, on_dump=lambda i, step, samples, s_: seen.append(step))
+
+    assert seen[0] == 1, "first evaluation must be after a single optimiser step"
+    assert seen[-1] == 60, "last evaluation must be the final step, not the final epoch"
     # If this were still epoch-indexed every step would be a multiple of 6.
-    assert any(step % 6 != 0 for step in steps), f"no mid-epoch dump in {steps}"
+    assert any(step % 6 != 0 for step in seen), f"no mid-epoch evaluation in {seen}"
 
 
 def test_samples_seen_is_exact(fake_features, tmp_path):
@@ -325,12 +344,17 @@ def test_on_dump_is_called_once_per_dump_with_val_nll(fake_features, tmp_path):
         "--epochs", "10", "--n-dumps", "5", "--batch-size", "100",
         "--seed", "137", "--no-hf-cache",
     ])
-    probe.main(args, on_dump=lambda i, step, scalars: seen.append((i, step, scalars)))
+    probe.main(args, on_dump=lambda i, step, samples, scalars: seen.append((i, step, scalars)))
 
-    assert len(seen) == 5, "one callback per dumped step"
-    assert [i for i, _, _ in seen] == [0, 1, 2, 3, 4], (
-        "dump_index must count dumps, not optimiser steps -- it is the pruner's "
-        "step key, and trials vary batch_size so raw steps are not comparable"
+    # 600 rows / 100 = 6 steps per epoch x 10 epochs = 60 steps, and the
+    # quantum falls back to the batch here, so one evaluation per step.
+    # --n-dumps 5 now throttles MLflow and stdout only; it does not gate the
+    # callback, which is what the pruner and patience ride on.
+    assert len(seen) == 60, "one callback per EVALUATION, not per reported dump"
+    assert [i for i, _, _ in seen] == list(range(1, 61)), (
+        "eval_index is the position on the sample grid (samples_seen // "
+        "quantum) -- it is the pruner's step key, and trials vary batch_size "
+        "so raw steps are not comparable across them"
     )
     assert all("val_nll" in scalars for _, _, scalars in seen)
 
@@ -344,7 +368,7 @@ def test_an_exception_from_on_dump_propagates(fake_features, tmp_path):
     class Sentinel(Exception):
         pass
 
-    def boom(i, step, scalars):
+    def boom(i, step, samples, scalars):
         raise Sentinel()
 
     args = probe.build_argparser().parse_args([

@@ -5,19 +5,32 @@ from bllarse import evaldump, metrics
 from bllarse.tuning import objective
 
 
+# The fake training script's batch, so `samples_seen = step * FAKE_BATCH`.
+# Patience thresholds in these tests are written as `n * FAKE_BATCH` to keep
+# them readable as "n evaluations" while still exercising the real sample
+# arithmetic the rule now uses.
+FAKE_BATCH = 100
+
+
 def _make_patience_module(profiles, seed_log=None):
     """A fake training script driven by a per-seed sharpness PROFILE: a list
-    of one sharpness value per dump. Higher sharpness means lower val_nll (a
-    single-class 2-logit setup, same trick as `_write_curve` below), so a
+    of one sharpness value per evaluation. Higher sharpness means lower val_nll
+    (a single-class 2-logit setup, same trick as `_write_curve` below), so a
     plateaued profile (a repeated value) is a plateaued val_nll curve.
 
-    Unlike `_write_curve`, this fires `on_dump` once per dump -- exactly like
+    Unlike `_write_curve`, this fires `on_dump` once per evaluation -- like
     probe.py's real loop -- with a val_nll ACTUALLY COMPUTED (via
     bllarse.metrics.nll) from the logits just written, so what patience sees
     can never drift from what early_stop later reads back off disk. If
     `on_dump` raises (patience's EarlyConvergence, or a caller's own
-    exception), main stops immediately -- mirroring probe.py, which does not
-    catch exceptions from on_dump.
+    exception), main stops immediately.
+
+    It writes one dump PER EVALUATION where the real scripts now buffer and
+    write only their argmin. That divergence is deliberate and local to this
+    double: `_n_val_dumps` is how these tests observe how far a run got before
+    patience cut it, which a single end-of-run dump cannot show. The real
+    single-dump path is covered by
+    `test_the_real_probe_writes_exactly_one_dump_at_its_val_optimum`.
     """
 
     class FakeModule:
@@ -36,18 +49,23 @@ def _make_patience_module(profiles, seed_log=None):
             if seed_log is not None:
                 seed_log.append(args.seed)
             labels = np.zeros(64, dtype=np.int64)
-            for dump_index, sharpness in enumerate(profiles[args.seed]):
-                step = dump_index + 1
+            for i, sharpness in enumerate(profiles[args.seed]):
+                step = i + 1
+                samples_seen = step * FAKE_BATCH
+                # 1-based, and equal to samples_seen // quantum with a
+                # quantum of FAKE_BATCH -- the real scripts' definition.
+                eval_index = step
                 logits = np.zeros((64, 2), dtype=np.float32)
                 logits[:, 0] = sharpness
                 for split in ("val", "test"):
                     evaldump.write_dump(
                         args.dump_root, args.group_id, args.uid, step, logits, labels,
                         arm="adamw_ce", split=split, logit_kind="softmax_logits",
-                        seed=args.seed, samples_seen=step * 128,
+                        seed=args.seed, samples_seen=samples_seen,
                     )
                 if on_dump is not None:
-                    on_dump(dump_index, step, {"val_nll": metrics.nll(logits, labels)})
+                    on_dump(eval_index, step, samples_seen,
+                            {"val_nll": metrics.nll(logits, labels)})
 
     return FakeModule
 
@@ -119,7 +137,7 @@ def test_evaluate_runs_both_seeds_and_removes_its_dumps(tmp_path, monkeypatch):
             seeds_seen.append(args.seed)
             _write_curve(args.dump_root, args.group_id, args.uid, best_nll_at=2)
             if on_dump is not None:
-                on_dump(0, 1, {"val_nll": 0.5})
+                on_dump(0, 1, 100, {"val_nll": 0.5})
 
     monkeypatch.setattr(
         objective.adapters, "load_script_module", lambda path: FakeModule
@@ -162,7 +180,7 @@ def test_on_dump_fires_for_the_first_seed_only(tmp_path, monkeypatch):
     )
     objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="t0",
-        on_dump=lambda i, step, scalars: None,
+        on_dump=lambda i, step, samples, scalars: None,
     )
     assert calls == [(200, True), (201, False)]
 
@@ -188,14 +206,20 @@ def test_a_real_trial_runs_end_to_end_on_the_jax_arm(tmp_path):
             "arm": "adamw_ce", "model": "dinov3_small", "dataset": "fake",
             "num_classes": 2, "cache_dir": str(cache),
             "split_cache_dir": str(tmp_path / "splits"),
+            # 600 train / batch 100 = 6 steps per epoch, 5 epochs = 30 steps.
+            # batch_cap(600) is 256, not a whole number of 100-sample steps, so
+            # _derive_quantum falls back to the batch itself: one evaluation per
+            # step, 30 of them, indexed 1..30 on the sample grid.
             "epochs": 5, "n_dumps": 4, "batch_size": 100, "no_hf_cache": True,
         },
         dump_root=tmp_path / "dumps", group_id="e2e", uid="trial0",
-        on_dump=lambda i, step, s: reported.append(i),
+        on_dump=lambda i, step, samples, s: reported.append((i, samples)),
     )
 
     assert value > 0.0
-    assert reported == [0, 1, 2, 3], "intermediates come from the first seed only"
+    assert reported == [(i, i * 100) for i in range(1, 31)], (
+        "intermediates come from the first seed only, indexed on the sample grid"
+    )
     assert not (tmp_path / "dumps" / "e2e" / "trial0_seed200").exists()
 
 
@@ -216,7 +240,7 @@ def test_a_plateaued_run_stops_early_and_scores_what_was_dumped(tmp_path, monkey
 
     value = objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-        patience=3, warmup_dumps=2, keep_dumps=True,
+        patience_samples=3 * FAKE_BATCH, warmup_samples=2 * FAKE_BATCH, keep_dumps=True,
     )
 
     uids = [f"trial0_seed{seed}" for seed in objective.TUNING_SEEDS]
@@ -242,7 +266,7 @@ def test_patience_does_not_fire_before_the_warmup_threshold(tmp_path, monkeypatc
 
     objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-        patience=2, warmup_dumps=10, keep_dumps=True,
+        patience_samples=2 * FAKE_BATCH, warmup_samples=10 * FAKE_BATCH, keep_dumps=True,
     )
 
     uids = [f"trial0_seed{seed}" for seed in objective.TUNING_SEEDS]
@@ -271,9 +295,9 @@ def test_patience_applies_to_the_second_seed_too(tmp_path, monkeypatch):
     converged = []
     objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-        on_dump=lambda i, step, scalars: None,
-        patience=3, warmup_dumps=2, keep_dumps=True,
-        on_converged=lambda seed, dump_index, step: converged.append(seed),
+        on_dump=lambda i, step, samples, scalars: None,
+        patience_samples=3 * FAKE_BATCH, warmup_samples=2 * FAKE_BATCH, keep_dumps=True,
+        on_converged=lambda seed, eval_index, step: converged.append(seed),
     )
 
     assert converged == [201], "only the plateaued seed should have converged early"
@@ -296,12 +320,12 @@ def test_patience_none_leaves_evaluate_byte_for_byte_unchanged(tmp_path, monkeyp
     calls = []
     objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-        on_dump=lambda i, step, scalars: calls.append((i, step)),
-        patience=None, keep_dumps=True,
+        on_dump=lambda i, step, samples, scalars: calls.append((i, step)),
+        patience_samples=None, keep_dumps=True,
     )
 
-    assert calls == [(i, i + 1) for i in range(len(profile))], (
-        "on_dump must still fire once per dump, for the full profile"
+    assert calls == [(i, i) for i in range(1, len(profile) + 1)], (
+        "on_dump must still fire once per evaluation, for the full profile"
     )
     for seed in objective.TUNING_SEEDS:
         assert _n_val_dumps(root, "t", f"trial0_seed{seed}") == len(profile)
@@ -323,15 +347,160 @@ def test_an_on_dump_exception_still_propagates_through_patience(tmp_path, monkey
         lambda path: _make_patience_module({200: profile, 201: profile}),
     )
 
-    def pruning_on_dump(dump_index, step, scalars):
-        if dump_index == 1:
+    def pruning_on_dump(eval_index, step, samples_seen, scalars):
+        if eval_index == 2:
             raise FakePrune("pruned")
 
     with pytest.raises(FakePrune):
         objective.evaluate(
             "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-            on_dump=pruning_on_dump, patience=2, warmup_dumps=1,
+            on_dump=pruning_on_dump, patience_samples=2 * FAKE_BATCH,
+            warmup_samples=1 * FAKE_BATCH,
         )
 
     # The try/finally cleanup must still have run despite the exception.
     assert not (root / "t" / "trial0_seed200").exists()
+
+
+def _fake_feature_cache(tmp_path, n_train=600, n_test=200, dim=16):
+    """Cached features for a 2-class synthetic dataset, laid out the way
+    load_cached_features expects."""
+    rng = np.random.default_rng(0)
+    cache = tmp_path / "features"
+    cache.mkdir()
+    for split, n in (("train", n_train), ("test", n_test)):
+        labels = rng.integers(0, 2, size=n)
+        feats = rng.normal(size=(n, dim)).astype(np.float32)
+        feats[labels == 1, 0] += 6.0
+        np.savez(cache / f"dinov3_small_fake_res224_{split}.npz",
+                 features=feats, labels=labels)
+    return cache
+
+
+def test_the_real_probe_writes_exactly_one_dump_at_its_val_optimum(tmp_path):
+    """The run's whole disk output is the argmin evaluation, written once at the
+    end -- not one dump per evaluation.
+
+    This is what makes a sample-spaced grid affordable at all: the grid now has
+    up to 30,000 points where the old geometric one had 40, and streaming an
+    array pair to GPFS at each would be ~750x the I/O for data nothing reads.
+    Everything downstream selects the argmin anyway (analysis.thresholds.
+    early_stop), so the rest was written and then deleted unread.
+    """
+    from bllarse.analysis.curves import run_curve
+    from bllarse.analysis.thresholds import early_stop
+    from bllarse.tools import adapters
+
+    cache = _fake_feature_cache(tmp_path)
+    module = adapters.load_script_module(objective.SCRIPTS["adamw_ce"])
+    args = adapters.parse_config(module, {
+        "arm": "adamw_ce", "model": "dinov3_small", "dataset": "fake",
+        "num_classes": 2, "cache_dir": str(cache),
+        "split_cache_dir": str(tmp_path / "splits"),
+        "epochs": 5, "batch_size": 100, "no_hf_cache": True,
+        "seed": 200, "uid": "run0", "group_id": "g",
+        "dump_root": str(tmp_path / "dumps"),
+    })
+
+    seen = []
+    module.main(args, on_dump=lambda i, step, samples, s: seen.append(s["val_nll"]))
+
+    run_dir = tmp_path / "dumps" / "g" / "run0"
+    assert len(list(run_dir.glob("step_*_val.npz"))) == 1
+    assert len(list(run_dir.glob("step_*_test.npz"))) == 1
+    assert len(seen) == 30, "one evaluation per step at a batch-sized quantum"
+
+    # The dump that landed is the argmin of what on_dump reported -- the two
+    # must agree or the objective scores a different point than patience and
+    # the pruner were watching.
+    #
+    # Not bit-equal, and cannot be: on_dump sees the fp32 val_nll computed in
+    # the loop, while this reads it back off a dump whose logits were cast to
+    # float16 (evaldump.py:130). The gap is ~3e-5 relative, which is fp16
+    # round-trip and nothing else -- it predates this protocol and is why the
+    # tolerance is loose rather than exact.
+    stop = early_stop(run_curve(tmp_path / "dumps", "g", "run0"), "val_nll")
+    assert stop.value == pytest.approx(min(seen), rel=1e-3)
+
+
+def test_the_best_dump_is_written_even_when_patience_stops_the_run(tmp_path):
+    """The buffered dump is written from a `finally`.
+
+    With streaming writes an EarlyConvergence escaping `main` still left every
+    dump so far on disk. Buffered, the same escape would leave the directory
+    EMPTY and score a converged trial as a missing run -- so the write has to
+    survive the exception, and this is the test that says so.
+    """
+    from bllarse.tools import adapters
+
+    cache = _fake_feature_cache(tmp_path)
+    module = adapters.load_script_module(objective.SCRIPTS["adamw_ce"])
+    args = adapters.parse_config(module, {
+        "arm": "adamw_ce", "model": "dinov3_small", "dataset": "fake",
+        "num_classes": 2, "cache_dir": str(cache),
+        "split_cache_dir": str(tmp_path / "splits"),
+        "epochs": 5, "batch_size": 100, "no_hf_cache": True,
+        "seed": 200, "uid": "run0", "group_id": "g",
+        "dump_root": str(tmp_path / "dumps"),
+    })
+
+    def stop_at_eval_3(eval_index, step, samples_seen, scalars):
+        if eval_index == 3:
+            raise objective.EarlyConvergence(eval_index, step)
+
+    with pytest.raises(objective.EarlyConvergence):
+        module.main(args, on_dump=stop_at_eval_3)
+
+    run_dir = tmp_path / "dumps" / "g" / "run0"
+    assert len(list(run_dir.glob("step_*_val.npz"))) == 1, (
+        "the argmin dump must survive the exception that stopped the run"
+    )
+
+
+def test_a_multiplicative_patience_fires_where_an_absolute_one_cannot(tmp_path, monkeypatch):
+    """The reason `patience_factor` exists alongside `patience_samples`.
+
+    The seven datasets put their val_nll optimum between 43k samples (cifar10)
+    and 9.0M (stanford_cars) -- a 209x spread -- so the smallest absolute
+    threshold that never cuts a curve short is 15M samples, which on cifar10 is
+    350x past the optimum and therefore no rule at all. A multiplicative
+    threshold is scale-free and fires at the same *relative* point on both.
+
+    Simulated here with two runs whose plateaus sit two decades apart in
+    samples: one absolute threshold cannot serve both, one factor does.
+    """
+    early = [1.0, 2.0, 3.0] + [3.0] * 20      # plateaus at eval 3
+    late = [1.0] * 20 + [2.0, 3.0] + [3.0] * 20  # improves late, then plateaus
+
+    for name, profile, scale in (("early", early, 1), ("late", late, 100)):
+        root = tmp_path / name
+        monkeypatch.setattr(
+            objective.adapters, "load_script_module",
+            lambda path, p=profile: _make_patience_module({200: p, 201: p}),
+        )
+        objective.evaluate(
+            "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
+            patience_factor=2.0, warmup_samples=2 * FAKE_BATCH, keep_dumps=True,
+        )
+        n = _n_val_dumps(root, "t", "trial0_seed200")
+        assert 0 < n < len(profile), (
+            f"{name}: a factor of 2 must cut a plateau at any scale, "
+            f"but wrote {n} of {len(profile)}"
+        )
+
+
+def test_patience_is_disabled_unless_a_threshold_is_given(tmp_path, monkeypatch):
+    """Both forms default to None. With neither set the callback must be the
+    caller's own hook untouched, so a run trains to its full budget -- the
+    behaviour any figure run depends on."""
+    root = tmp_path / "dumps"
+    profile = [3.0] * 8
+    monkeypatch.setattr(
+        objective.adapters, "load_script_module",
+        lambda path: _make_patience_module({200: profile, 201: profile}),
+    )
+    objective.evaluate(
+        "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0", keep_dumps=True,
+    )
+    for seed in objective.TUNING_SEEDS:
+        assert _n_val_dumps(root, "t", f"trial0_seed{seed}") == len(profile)

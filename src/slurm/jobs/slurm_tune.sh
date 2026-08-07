@@ -105,19 +105,39 @@ env_args=(
 [[ -n "${MLFLOW_TRACKING_PASSWORD:-}" ]] && env_args+=(--env "MLFLOW_TRACKING_PASSWORD=$MLFLOW_TRACKING_PASSWORD")
 [[ -n "${MLFLOW_PARENT_RUN_ID:-}" ]] && env_args+=(--env "MLFLOW_PARENT_RUN_ID=$MLFLOW_PARENT_RUN_ID")
 
-# --patience 20, not the worker's own default of "disabled": this value was
-# measured by replaying all 28 real pilot curves through the exact patience
-# bookkeeping. It is the SMALLEST value at which zero runs stop before their
-# own val_nll argmin (at 15 one run stops early, at 8 two do). A trial that
-# stops before its argmin is scored at the wrong point, which changes which
-# hyperparameters the campaign selects -- do NOT lower this "to save time"
-# without re-running that replay against fresh pilot curves.
+# --patience-factor 5.0, replacing `--patience 20`.
+#
+# The old value was calibrated by replaying 28 pilot curves for the smallest
+# count of consecutive no-improvement DUMPS at which none stopped before its
+# argmin. That calibration was sound and the rule it produced was still inert:
+# a run has exactly 40 dumps, so a patience of 20 can only fire when the curve
+# turns in the first half of the grid. Measured over the first campaign's 133
+# completed trials it fired on 46, every one of them cifar10 or dtd, and could
+# not fire at all on the other five datasets -- whose argmins land at dumps
+# 26-37. Counting points on a bounded grid was the defect, not the threshold.
+#
+# The replacement is multiplicative in SAMPLES: stop once samples_seen reaches
+# 5x the samples at which the best val_nll was set. Absolute thresholds were
+# measured and rejected first -- the argmin sits at 43k samples on cifar10 and
+# 9.0M on stanford_cars, so the smallest globally safe absolute value is 15M,
+# which is 350x past cifar10's optimum. The multiplicative form is scale-free:
+# the largest per-curve ratio between consecutive improvements is 1.30-4.88
+# across all seven datasets, and 5.0 cuts none of the 170 measured curves short
+# of its argmin.
+#
+# Same warning as before, for the same reason: a trial stopped before its
+# argmin is scored at the wrong point and changes what the campaign selects. Do
+# not lower this to save time without re-running the replay. Re-derive it from
+# the sample-spaced curves this protocol now produces, NOT from the numbers
+# above -- those were measured on the geometric grid, where every observed
+# ratio is an exact power of its 1.3026 spacing and therefore a quantised lower
+# bound. Calibrating against a grid artifact is how `--patience 20` happened.
 worker_args=(
   --arm "$BLLARSE_TUNE_ARM"
   --dataset "$BLLARSE_TUNE_DATASET"
   --n-trials "$BLLARSE_TUNE_TRIALS"
   --storage-dir "$storage_dir"
-  --patience "${BLLARSE_TUNE_PATIENCE:-20}"
+  --patience-factor "${BLLARSE_TUNE_PATIENCE_FACTOR:-5.0}"
   --cache-dir "$cache_dir"
 )
 # Optional, and unset reproduces the first campaign's unsuffixed study names.

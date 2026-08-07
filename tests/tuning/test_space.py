@@ -13,7 +13,11 @@ EXPECTED_CAPS = {
     # bllarse.features._TRAIN_SPLIT.
     "flowers102": 256,
     "stanford_cars": 2048,
-    "food101": 32768,
+    # 16384, not the 32768 its 75,750 training images would otherwise allow:
+    # MAX_BATCH caps the ladder globally. The cap is also the eval quantum, and
+    # a quantum of 32768 would make food101's val_nll curve twice as coarse as
+    # every other dataset's.
+    "food101": 16384,
     "cifar10": 16384,
     "cifar100": 16384,
 }
@@ -255,3 +259,52 @@ def test_flowers102_trains_on_the_official_split():
     here as well as in bllarse.features."""
     assert space.N_TRAIN["flowers102"] == 1_020
     assert space.batch_sizes("flowers102") == [64, 128, 256]
+
+
+@pytest.mark.parametrize("dataset", sorted(EXPECTED_CAPS))
+def test_eval_quantum_is_a_whole_number_of_steps_at_every_rung(dataset):
+    """The property that makes the quantum schedulable at all.
+
+    Evaluation happens BETWEEN optimiser steps, so a quantum that is not an
+    integer number of steps for some rung cannot be realised for that rung --
+    and silently rounding it would give each trial a slightly different sample
+    grid, which is precisely the defect the quantum exists to remove, but now
+    invisible. It holds because the ladder is powers of two and the quantum is
+    its cap.
+    """
+    quantum = space.eval_quantum(dataset)
+    for batch_size in space.batch_sizes(dataset):
+        assert quantum % batch_size == 0
+        assert space.eval_every_steps(dataset, batch_size) == quantum // batch_size
+
+
+@pytest.mark.parametrize("dataset", sorted(EXPECTED_CAPS))
+def test_eval_quantum_is_sub_epoch(dataset):
+    """The point of a step-based protocol is catching the minimum INSIDE an
+    epoch. The quantum is at most half an epoch by construction -- it is
+    batch_cap, which leaves MIN_STEPS_PER_EPOCH steps per pass -- so this
+    cannot regress without MIN_STEPS_PER_EPOCH changing.
+
+    A quantum fixed globally at MAX_BATCH would fail this on four of the seven:
+    16,384 samples is 16.1 epochs of flowers102's 1,020 training images.
+    """
+    quantum = space.eval_quantum(dataset)
+    epochs_per_eval = quantum / space.N_TRAIN[dataset]
+    assert epochs_per_eval <= 1.0 / space.MIN_STEPS_PER_EPOCH
+
+
+def test_no_ladder_exceeds_the_global_batch_ceiling():
+    """MAX_BATCH caps every dataset, not just the ones small enough to hit
+    MIN_STEPS_PER_EPOCH first. Without it food101 reaches 32768, which is both
+    the most expensive rung and -- since the cap IS the eval quantum -- twice
+    as coarse a val_nll curve as every other dataset gets."""
+    for dataset in EXPECTED_CAPS:
+        assert max(space.batch_sizes(dataset)) <= space.MAX_BATCH
+
+
+def test_eval_every_steps_rejects_an_off_ladder_batch():
+    """Raises rather than rounding. A rounded interval would hand back a grid
+    whose samples_seen differ per trial, and the pruner would go on comparing
+    trials at indices that no longer mean the same thing."""
+    with pytest.raises(ValueError, match="whole number"):
+        space.eval_every_steps("cifar10", 100)

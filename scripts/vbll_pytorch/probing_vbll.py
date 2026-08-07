@@ -16,10 +16,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from bllarse import evaldump, splits
+from bllarse import evaldump, metrics, splits
 from bllarse.features import eval_split_name, load_cached_features, train_split_name
 from bllarse.mlflow_utils import child_run
 from bllarse.reporting import report_step
+from bllarse.tuning import space
 from vbll_experiments.models import build_vbll_head
 
 
@@ -83,14 +84,53 @@ def head_param_count(head) -> int:
     return int(sum(p.numel() for p in head.parameters()))
 
 
-def main(args, on_dump=None):
-    """Train one head. `on_dump(dump_index, step, scalars)` fires after every
-    scheduled dump, if given.
+def _derive_quantum(n_train: int, batch_size: int) -> int:
+    """The eval quantum when --eval-quantum is not given. The vbll twin of the
+    helper in scripts/dinov3/probe.py; see the note there."""
+    try:
+        cap = space.batch_cap(n_train)
+    except ValueError:
+        return batch_size
+    return cap if cap >= batch_size and cap % batch_size == 0 else batch_size
 
-    The index counts dumps rather than optimiser steps because it is Optuna's
-    pruning key: MedianPruner compares trials at the SAME key, and trials vary
-    batch_size, so two configs would share almost no raw step values. n_dumps is
-    40 for every run, so the dump index is a common grid by construction.
+
+def _write_best(args, best):
+    """Write the buffered argmin-val_nll evaluation. The run's ONLY disk write.
+
+    The vbll twin of `_write_best` in scripts/dinov3/probe.py; see the note
+    there. Called from a `finally` so an EarlyConvergence raised out of
+    `on_dump` still leaves the run scoreable.
+    """
+    if best is None:
+        raise ValueError(
+            f"{args.uid}: no evaluation ran, so there is no dump to write. "
+            f"The step budget is shorter than one eval interval."
+        )
+    for split_name, logits, labels, score in best["splits"]:
+        evaldump.write_dump(
+            args.dump_root, args.group_id, args.uid, best["step"],
+            logits, labels,
+            arm="vbll", split=split_name, logit_kind="softmax_logits",
+            seed=args.seed, samples_seen=best["samples_seen"],
+            score=score, score_kind="predictive_variance",
+        )
+    print(
+        f"[vbll] {args.uid}: best val_nll={best['val_nll']:.4f} at step "
+        f"{best['step']} (eval {best['eval_index']}, epoch {best['epoch']}, "
+        f"{best['samples_seen']} samples); wrote {len(best['splits'])} dumps",
+        flush=True,
+    )
+
+
+def main(args, on_dump=None):
+    """Train one head. `on_dump(eval_index, step, samples_seen, scalars)` fires
+    after every scheduled evaluation, if given.
+
+    `eval_index` counts evaluations rather than optimiser steps because it is
+    Optuna's pruning key: MedianPruner compares trials at the SAME key, and
+    trials vary batch_size. Evaluations are `eval_quantum` SAMPLES apart (see
+    tuning.space.eval_quantum), so index i is the same samples_seen for every
+    trial in a study.
     """
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -158,11 +198,25 @@ def main(args, on_dump=None):
         print(f"[vbll] OOD set {args.ood_dataset}: {len(ood_f)} samples")
 
     total_steps = args.epochs * n_batches
-    schedule = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
+
+    # Evaluation is scheduled on SAMPLES, matching scripts/dinov3/probe.py
+    # exactly -- see the long note there. The two arms must share the grid or
+    # Fig 1 compares them at different points of their own training.
+    quantum = args.eval_quantum or _derive_quantum(len(train_f), args.batch_size)
+    if quantum % args.batch_size:
+        raise ValueError(
+            f"--eval-quantum {quantum} is not a whole number of "
+            f"batch_size={args.batch_size} steps. Evaluation happens between "
+            f"optimiser steps, so a fractional interval is unschedulable."
+        )
+    eval_every = quantum // args.batch_size
+    report_grid = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
     print(
         f"[vbll] {args.uid}: {args.epochs} epochs x {n_batches} steps "
         f"= {total_steps} steps ({total_steps * args.batch_size} samples), "
-        f"{len(schedule)} dumps"
+        f"eval every {eval_every} steps ({quantum} samples, "
+        f"{quantum / len(train_f):.2f} epochs) = {total_steps // eval_every} evals, "
+        f"{len(report_grid)} reported"
     )
 
     with child_run(vars(args), run_name=args.uid, tags={
@@ -185,68 +239,95 @@ def main(args, on_dump=None):
         })
 
         step = 0
-        dump_index = 0
-        for epoch in range(1, args.epochs + 1):
-            head.train()
-            perm = torch.randperm(len(x_train))
-            for i in range(n_batches):
-                idx = perm[i * args.batch_size:(i + 1) * args.batch_size]
-                xb, yb = x_train[idx].to(device), y_train[idx].to(device)
-                optimizer.zero_grad()
-                head(xb).train_loss_fn(yb).backward()
-                optimizer.step()
+        # See scripts/dinov3/probe.py: the argmin evaluation is buffered and
+        # written once, from a `finally` so an EarlyConvergence raised out of
+        # `on_dump` cannot leave the run with nothing on disk.
+        best = None
+        val_f, val_l = eval_f[val_idx], eval_l[val_idx]
+        test_f, test_l = eval_f[test_idx], eval_l[test_idx]
 
-                step += 1
-                if step not in schedule:
-                    continue
-
-                # Exact: drop-remainder means every step is exactly batch_size.
-                samples_seen = step * args.batch_size
-                logits, score = _forward(head, eval_f, device, args.predictive_samples)
-                # _forward leaves the head in eval mode. Evaluating mid-epoch
-                # rather than at the epoch boundary means the remaining steps
-                # of this epoch would otherwise train in eval mode.
+        try:
+            for epoch in range(1, args.epochs + 1):
                 head.train()
-                for split_name, sp_idx in (("val", val_idx), ("test", test_idx)):
-                    evaldump.write_dump(
-                        args.dump_root, args.group_id, args.uid, step,
-                        logits[sp_idx], eval_l[sp_idx],
-                        arm="vbll", split=split_name, logit_kind="softmax_logits",
-                        seed=args.seed, samples_seen=samples_seen,
-                        score=score[sp_idx], score_kind="predictive_variance",
-                    )
-                # OOD at every eval step, not only the last -- see the matching
-                # note in scripts/dinov3/probe.py. A single endpoint dump
-                # forced Fig 2's detection metrics to be read at a step no arm
-                # was tuned at, and the arms drift from that step by very
-                # different amounts.
-                if ood_f is not None:
-                    ood_logits, ood_score = _forward(
-                        head, ood_f, device, args.predictive_samples
-                    )
-                    head.train()
-                    evaldump.write_dump(
-                        args.dump_root, args.group_id, args.uid, step,
-                        ood_logits, ood_l,
-                        arm="vbll", split="ood", logit_kind="softmax_logits",
-                        seed=args.seed, samples_seen=samples_seen,
-                        score=ood_score, score_kind="predictive_variance",
-                    )
-                scalars = report_step(
-                    run, step, samples_seen, epoch,
-                    logits[test_idx], eval_l[test_idx],
-                    logits[val_idx], eval_l[val_idx],
-                )
-                print(
-                    f"[vbll] step {step} (epoch {epoch}, {samples_seen} samples): "
-                    + " ".join(f"{k}={v:.4f}" for k, v in scalars.items())
-                )
-                if on_dump is not None:
-                    on_dump(dump_index, step, scalars)
-                dump_index += 1
+                perm = torch.randperm(len(x_train))
+                for i in range(n_batches):
+                    idx = perm[i * args.batch_size:(i + 1) * args.batch_size]
+                    xb, yb = x_train[idx].to(device), y_train[idx].to(device)
+                    optimizer.zero_grad()
+                    head(xb).train_loss_fn(yb).backward()
+                    optimizer.step()
 
-        if ood_f is not None:
-            print(f"[vbll] wrote {len(schedule)} OOD dumps for {args.ood_dataset}")
+                    step += 1
+                    if step % eval_every:
+                        continue
+
+                    # Exact: drop-remainder means every step is exactly batch_size.
+                    samples_seen = step * args.batch_size
+                    # Position on the SAMPLE grid -- see probe.py.
+                    eval_index = samples_seen // quantum
+
+                    # Val only. `_forward` draws `predictive_samples` MC samples
+                    # per call, so at this cadence the test and OOD blocks stay
+                    # out of it until an evaluation actually improves.
+                    val_logits, val_score = _forward(
+                        head, val_f, device, args.predictive_samples
+                    )
+                    # _forward leaves the head in eval mode. Evaluating mid-epoch
+                    # rather than at the epoch boundary means the remaining steps
+                    # of this epoch would otherwise train in eval mode.
+                    head.train()
+                    val_nll = metrics.nll(val_logits, val_l)
+
+                    if best is None or val_nll < best["val_nll"]:
+                        test_logits, test_score = _forward(
+                            head, test_f, device, args.predictive_samples
+                        )
+                        head.train()
+                        best = {
+                            "val_nll": float(val_nll),
+                            "step": step,
+                            "samples_seen": samples_seen,
+                            "epoch": epoch,
+                            "eval_index": eval_index,
+                            "splits": [
+                                ("val", val_logits, val_l, val_score),
+                                ("test", test_logits, test_l, test_score),
+                            ],
+                        }
+                        # OOD at the val-optimal point, not the last step -- see
+                        # the matching note in scripts/dinov3/probe.py. A single
+                        # endpoint dump forced Fig 2's detection metrics to be
+                        # read at a step no arm was tuned at, and the arms drift
+                        # from that step by very different amounts.
+                        if ood_f is not None:
+                            ood_logits, ood_score = _forward(
+                                head, ood_f, device, args.predictive_samples
+                            )
+                            head.train()
+                            best["splits"].append(
+                                ("ood", ood_logits, ood_l, ood_score)
+                            )
+
+                    scalars = {"val_nll": float(val_nll)}
+                    if step in report_grid:
+                        test_logits, _ = _forward(
+                            head, test_f, device, args.predictive_samples
+                        )
+                        head.train()
+                        scalars = report_step(
+                            run, step, samples_seen, epoch,
+                            test_logits, test_l, val_logits, val_l,
+                        )
+                        print(
+                            f"[vbll] step {step} (epoch {epoch}, "
+                            f"{samples_seen} samples): "
+                            + " ".join(f"{k}={v:.4f}" for k, v in scalars.items()),
+                            flush=True,
+                        )
+                    if on_dump is not None:
+                        on_dump(eval_index, step, samples_seen, scalars)
+        finally:
+            _write_best(args, best)
 
 
 def build_argparser():
@@ -264,7 +345,12 @@ def build_argparser():
     p.add_argument("--group-id", default="probe_vbll")
     p.add_argument("--uid", default="vbll_0")
     p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--n-dumps", type=int, default=40)
+    p.add_argument("--eval-quantum", type=int, default=0,
+                   help="Samples between evaluations. 0 derives it from the "
+                        "dataset's batch ladder (tuning.space.eval_quantum).")
+    p.add_argument("--n-dumps", type=int, default=40,
+                   help="Points on the geometric grid that throttles MLflow "
+                        "and stdout. NOT the evaluation grid.")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)

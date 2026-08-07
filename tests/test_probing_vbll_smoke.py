@@ -292,10 +292,17 @@ def test_on_dump_is_called_once_per_dump_with_val_nll(fake_features, tmp_path):
         "--epochs", "10", "--n-dumps", "5", "--batch-size", "100",
         "--seed", "137", "--device", "cpu",
     ])
-    probing_vbll.main(args, on_dump=lambda i, step, s: seen.append((i, step, s)))
+    probing_vbll.main(args, on_dump=lambda i, step, samples, s: seen.append((i, step, s)))
 
-    assert len(seen) == 5
-    assert [i for i, _, _ in seen] == [0, 1, 2, 3, 4]
+    # 600 rows / 100 = 6 steps per epoch x 10 epochs = 60 steps, one
+    # evaluation each (the quantum falls back to the batch here). --n-dumps 5
+    # throttles MLflow and stdout only; it no longer gates the callback.
+    assert len(seen) == 60, "one callback per EVALUATION, not per reported dump"
+    assert [i for i, _, _ in seen] == list(range(1, 61)), (
+        "eval_index is samples_seen // quantum, matching probe.py exactly -- "
+        "the two arms must share the pruner's key or Fig 1 compares them at "
+        "different points of their own training"
+    )
     assert all("val_nll" in scalars for _, _, scalars in seen)
 
 
@@ -316,5 +323,5 @@ def test_an_exception_from_on_dump_propagates(fake_features, tmp_path):
     ])
     with pytest.raises(Sentinel):
         probing_vbll.main(
-            args, on_dump=lambda i, step, s: (_ for _ in ()).throw(Sentinel())
+            args, on_dump=lambda i, step, samples, s: (_ for _ in ()).throw(Sentinel())
         )

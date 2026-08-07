@@ -26,12 +26,18 @@ from bllarse.tuning import objective as objective_mod
 from bllarse.tuning import space
 
 DIRECTION = "minimize"
+
+# Points on the geometric grid that throttles MLflow and stdout in the training
+# scripts. NOT the evaluation grid: evaluation is spaced in samples (see
+# space.eval_quantum), and the pruner's key is that sample-spaced index.
 N_DUMPS = 40
 
-# Fires no earlier than 25% of the dump grid, and only once 20 trials have
-# completed, so early noise cannot kill a config that starts slowly.
+# Fires only once 20 trials have completed, and never in a trial's first
+# PRUNER_WARMUP_EVALS evaluations, so early noise cannot kill a config that
+# starts slowly. In samples the warmup is 10 * eval_quantum -- at most five
+# epochs, since the quantum is at most half an epoch.
 PRUNER_STARTUP_TRIALS = 20
-PRUNER_WARMUP_DUMPS = N_DUMPS // 4
+PRUNER_WARMUP_EVALS = 10
 
 VBLL_FIXED = {
     "parameterization": "diagonal",
@@ -97,7 +103,7 @@ def open_study(
         sampler=TPESampler(),
         pruner=MedianPruner(
             n_startup_trials=PRUNER_STARTUP_TRIALS,
-            n_warmup_steps=PRUNER_WARMUP_DUMPS,
+            n_warmup_steps=PRUNER_WARMUP_EVALS,
         ),
         load_if_exists=True,
     )
@@ -170,6 +176,10 @@ def trial_config(
         "cache_dir": cache_dir,
         "split_cache_dir": split_cache_dir,
         "epochs": budgets_mod.epochs_for_steps(dataset, target_steps, batch_size),
+        # Passed explicitly rather than left to the script's default so the
+        # campaign's evaluation grid is recorded in the trial config and cannot
+        # drift if the ladder is ever re-capped mid-campaign.
+        "eval_quantum": space.eval_quantum(dataset),
         "n_dumps": N_DUMPS,
         "val_fraction": 0.1,
         "enable_mlflow": enable_mlflow,
@@ -194,17 +204,18 @@ def make_objective(
     budgets: Mapping[str, Mapping[str, int]],
     dump_root: Any,
     group_id: str,
-    patience: int | None = None,
-    warmup_dumps: int = objective_mod.DEFAULT_WARMUP_DUMPS,
+    patience_samples: int | None = None,
+    patience_factor: float | None = None,
+    warmup_samples: int = objective_mod.DEFAULT_WARMUP_SAMPLES,
     min_relative_improvement: float = objective_mod.DEFAULT_MIN_RELATIVE_IMPROVEMENT,
     **config_kw: Any,
 ) -> Callable[[optuna.Trial], float]:
     """The optuna objective closure for one study.
 
-    `patience` is the search-only counterpart to MedianPruner: the pruner
-    kills trials that are LOSING, `patience` stops trials that have FINISHED
-    CONVERGING, so the 30k-step cap becomes a true maximum rather than a fixed
-    price every trial pays. It applies to both tuning seeds -- unlike
+    `patience_samples` is the search-only counterpart to MedianPruner: the
+    pruner kills trials that are LOSING, patience stops trials that have
+    FINISHED CONVERGING, so the step cap becomes a true maximum rather than a
+    fixed price every trial pays. It applies to both tuning seeds -- unlike
     `on_dump`/pruning below, which is deliberately first-seed-only.
     """
 
@@ -215,20 +226,28 @@ def make_objective(
         )
         trial.set_user_attr("epochs", config["epochs"])
         trial.set_user_attr("steps", budgets[dataset]["steps"])
+        trial.set_user_attr("eval_quantum", config["eval_quantum"])
 
-        def on_dump(dump_index: int, step: int, scalars: Mapping[str, float]) -> None:
-            # Reported on the DUMP INDEX, never the optimiser step. MedianPruner
+        def on_dump(
+            eval_index: int, step: int, samples_seen: int,
+            scalars: Mapping[str, float],
+        ) -> None:
+            # Reported on the EVAL INDEX, never the optimiser step. MedianPruner
             # compares trials at matching keys and trials vary batch_size, so
             # raw steps would rarely even collide -- the pruner would silently
-            # never have a cohort to compare against.
-            trial.report(float(scalars["val_nll"]), dump_index)
+            # never have a cohort to compare against. The eval index is a
+            # sample-spaced grid (space.eval_quantum), so matching keys now also
+            # means matching samples_seen, which the old geometric step grid did
+            # not: at index i a batch-16384 trial had seen 256x the data of a
+            # batch-64 one, and the pruner compared them anyway.
+            trial.report(float(scalars["val_nll"]), eval_index)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
         stopped_at: dict[int, int] = {}
 
-        def on_converged(seed: int, dump_index: int, step: int) -> None:
-            stopped_at[seed] = dump_index
+        def on_converged(seed: int, eval_index: int, step: int) -> None:
+            stopped_at[seed] = eval_index
 
         value = objective_mod.evaluate(
             arm, config,
@@ -236,8 +255,9 @@ def make_objective(
             group_id=group_id,
             uid=f"trial{trial.number:05d}",
             on_dump=on_dump,
-            patience=patience,
-            warmup_dumps=warmup_dumps,
+            patience_samples=patience_samples,
+            patience_factor=patience_factor,
+            warmup_samples=warmup_samples,
             min_relative_improvement=min_relative_improvement,
             on_converged=on_converged,
         )
@@ -246,8 +266,8 @@ def make_objective(
         # patience actually saved, and to notice if it is misfiring.
         trial.set_user_attr("patience_stopped", bool(stopped_at))
         trial.set_user_attr(
-            "patience_stopped_at_dump",
-            {str(seed): dump_index for seed, dump_index in stopped_at.items()},
+            "patience_stopped_at_eval",
+            {str(seed): eval_index for seed, eval_index in stopped_at.items()},
         )
         return value
 
@@ -279,14 +299,26 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mlflow-experiment", default="bllarse-probing-tuning")
     p.add_argument("--no-mlflow", action="store_true")
     p.add_argument(
-        "--patience", type=int, default=None,
-        help="Consecutive no-improvement dumps that stop a trial's run early. "
-             "Default: disabled, i.e. every trial trains to the full step cap "
-             "(today's behaviour).",
+        "--patience-samples", type=int, default=None,
+        help="Samples without a relative val_nll improvement that stop a "
+             "trial's run early. In SAMPLES, not evaluations: a count of "
+             "evaluations is bounded by the grid, which is how the previous "
+             "--patience 20 came to be unfireable on five of seven datasets. "
+             "Default: disabled, i.e. every trial trains to the full step cap.",
     )
     p.add_argument(
-        "--warmup-dumps", type=int, default=objective_mod.DEFAULT_WARMUP_DUMPS,
-        help="Minimum dumps seen before --patience is allowed to fire.",
+        "--patience-factor", type=float, default=None,
+        help="Stop once samples_seen reaches this multiple of the samples "
+             "at which the best val_nll was set. Scale-free, and the form "
+             "that transfers across these datasets: the optimum sits at "
+             "43k samples on cifar10 and 9.0M on stanford_cars, so no "
+             "single absolute threshold serves both. Fires alongside "
+             "--patience-samples; whichever comes first wins.",
+    )
+    p.add_argument(
+        "--warmup-samples", type=int,
+        default=objective_mod.DEFAULT_WARMUP_SAMPLES,
+        help="Minimum samples seen before --patience-samples may fire.",
     )
     p.add_argument(
         "--min-relative-improvement", type=float,
@@ -318,8 +350,9 @@ def main() -> None:
             budgets=budgets,
             dump_root=args.dump_root,
             group_id=group_id,
-            patience=args.patience,
-            warmup_dumps=args.warmup_dumps,
+            patience_samples=args.patience_samples,
+            patience_factor=args.patience_factor,
+            warmup_samples=args.warmup_samples,
             min_relative_improvement=args.min_relative_improvement,
             cache_dir=args.cache_dir,
             split_cache_dir=args.split_cache_dir,

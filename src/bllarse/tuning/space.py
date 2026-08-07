@@ -43,6 +43,21 @@ TUNING_MODEL = "dinov3_huge"
 MIN_BATCH = 64
 MIN_STEPS_PER_EPOCH = 2
 
+# Ceiling on the ladder, independent of dataset size. Only food101 (75,750) is
+# large enough to reach past it -- its MIN_STEPS_PER_EPOCH bound alone would
+# allow 32,768, twice any other dataset's ceiling and twice the largest batch
+# any trial completed in the first campaign. Two reasons to cut it:
+#
+#   * It is the eval quantum (see `eval_quantum`), and the quantum sets how
+#     much data passes between two consecutive val_nll measurements. Letting
+#     one dataset's quantum run to 32,768 makes its curve twice as coarse as
+#     everyone else's for no gain.
+#   * At a fixed step budget samples_seen = steps * batch_size, so the top of
+#     the ladder is also the most expensive rung AND the one that consumes the
+#     most data. In the first campaign food101's 16,384 trials scored 0.1861
+#     against 0.1588 at batch 2,048 -- 17% worse on 8x the data.
+MAX_BATCH = 16_384
+
 # The tunable arms. Held here rather than inferred from the training scripts so
 # the search space stays inspectable without importing one, and pinned against
 # objective.SCRIPTS by a test: an arm added to one and not the other gives a
@@ -56,7 +71,8 @@ IBPROBIT_UPDATE_ITERS = (32, 64, 128, 192)
 
 
 def batch_cap(n_train: int) -> int:
-    """Largest power of two leaving at least MIN_STEPS_PER_EPOCH steps/epoch.
+    """Largest power of two leaving at least MIN_STEPS_PER_EPOCH steps/epoch,
+    never above MAX_BATCH.
 
     A batch near n_train makes an epoch degenerate under drop-remainder, and
     probing_vbll.py raises outright at len(x_train) // batch_size == 0. The
@@ -75,7 +91,51 @@ def batch_cap(n_train: int) -> int:
     cap = MIN_BATCH
     while cap * 2 <= limit:
         cap *= 2
-    return cap
+    return min(cap, MAX_BATCH)
+
+
+def eval_quantum(dataset: str) -> int:
+    """Samples between consecutive val_nll evaluations, for every trial.
+
+    THE reason evaluation is scheduled on samples rather than steps: at a fixed
+    step budget a step means `batch_size` samples, so a step grid measures
+    trials at wildly different points of their own training -- across one
+    study's ladder that is a 256x spread in data seen at the same "step". A
+    trial at the ladder's top evaluates every step; one at batch = cap/k
+    evaluates every k steps; both land on exactly the same samples_seen values.
+
+    The quantum is the ladder's own cap, which makes it the only choice that
+    works: `cap / batch` is an integer for every rung because the ladder is
+    powers of two, and evaluation can only happen BETWEEN optimiser steps, so a
+    quantum that is not a whole number of steps for some rung is unschedulable
+    for that rung.
+
+    It is also sub-epoch by construction, which is the whole point of a
+    step-based protocol. `batch_cap` leaves at least MIN_STEPS_PER_EPOCH steps
+    per epoch, so the quantum is at most half an epoch -- in practice 0.22 to
+    0.33 epochs across these seven datasets. A quantum fixed globally at
+    MAX_BATCH instead would be 16.1 epochs on flowers102 (1,020 training
+    images), coarser than the epoch-boundary evaluation this protocol replaced.
+    """
+    return batch_cap(N_TRAIN[dataset])
+
+
+def eval_every_steps(dataset: str, batch_size: int) -> int:
+    """Optimiser steps between evaluations for `batch_size` on `dataset`.
+
+    Raises rather than rounding: a non-integer ratio means the requested
+    schedule cannot be realised, and silently rounding it would hand back a
+    grid whose samples_seen values differ per trial -- exactly the defect
+    `eval_quantum` exists to remove, but now invisible.
+    """
+    quantum = eval_quantum(dataset)
+    if quantum % batch_size:
+        raise ValueError(
+            f"eval quantum {quantum} for {dataset} is not a whole number of "
+            f"batch_size={batch_size} steps. The ladder is powers of two, so "
+            f"this means batch_size is off-ladder; see batch_sizes()."
+        )
+    return quantum // batch_size
 
 
 def batch_sizes(dataset: str) -> list[int]:

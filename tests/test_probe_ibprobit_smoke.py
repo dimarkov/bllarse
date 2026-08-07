@@ -181,7 +181,7 @@ def test_a_whole_optuna_trial_runs_end_to_end(fake_features, tmp_path, monkeypat
     value = objective.evaluate(
         "ibprobit", config,
         dump_root=tmp_path / "dumps", group_id="trial", uid="t0",
-        on_dump=lambda i, step, scalars: seen.append((i, step)),
+        on_dump=lambda i, step, samples, scalars: seen.append((i, step)),
         keep_dumps=True,
     )
     assert np.isfinite(value), "the trial produced no scoreable objective value"

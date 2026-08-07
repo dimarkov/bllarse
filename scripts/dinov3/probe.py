@@ -2,13 +2,19 @@
 """Linear probing on cached DINOv3 features, with logit dumps.
 
 One head, one dataset, one seed. Loads features that precompute_features.py has
-already extracted, trains a head, and writes a dump at each scheduled step. All
-reported metrics are computed later from those dumps -- nothing here decides
-what the figures show.
+already extracted, trains a head, evaluates val_nll every `eval_quantum`
+SAMPLES, and writes one dump: the evaluation that minimised it. All reported
+metrics are computed later from that dump -- nothing here decides what the
+figures show.
+
+Evaluation is spaced in samples rather than steps so that index i is the same
+samples_seen for every trial in a study regardless of batch size, and the
+spacing is sub-epoch by construction (0.22-0.33 epochs across these datasets),
+which is the point of a step-based protocol. See tuning.space.eval_quantum.
 
 Arms: adamw_ce and ibprobit. They share everything outside the training step --
-the same cached features, the same pinned val/test split, the same log-spaced
-dump schedule -- so the only thing that differs between their dumps is how the
+the same cached features, the same pinned val/test split, the same sample-spaced
+evaluation grid -- so the only thing that differs between their dumps is how the
 head was fitted.
 """
 
@@ -16,6 +22,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -28,11 +35,12 @@ import numpy as np
 import optax
 from jax import random as jr, vmap
 
-from bllarse import evaldump, splits
+from bllarse import evaldump, metrics, splits
 from bllarse.features import eval_split_name, load_cached_features, train_split_name
 from bllarse.losses import CrossEntropy, IBProbit
 from bllarse.mlflow_utils import child_run
 from bllarse.reporting import report_step
+from bllarse.tuning import space
 
 
 def steps_per_epoch(n_train: int, batch_size: int) -> int:
@@ -182,14 +190,70 @@ def _scores_for(loss_fn, feats, chunk=4096):
     return np.concatenate(out, axis=0)
 
 
-def main(args, on_dump=None):
-    """Train one head. `on_dump(dump_index, step, scalars)` fires after every
-    scheduled dump, if given.
+def _derive_quantum(n_train: int, batch_size: int) -> int:
+    """The eval quantum when --eval-quantum is not given.
 
-    The index counts dumps rather than optimiser steps because it is Optuna's
-    pruning key: MedianPruner compares trials at the SAME key, and trials vary
-    batch_size, so two configs would share almost no raw step values. n_dumps is
-    40 for every run, so the dump index is a common grid by construction.
+    Derived from the training set actually loaded rather than from
+    `space.eval_quantum(dataset)`, so this works for any dataset -- the search
+    space's N_TRAIN table only knows the campaign's seven, and probe.py is also
+    run standalone and under test on synthetic ones.
+
+    Falls back to `batch_size` (evaluate every step, the finest grid there is)
+    whenever the ladder cap is not a whole number of steps -- an off-ladder
+    batch_size, or a training set too small to have a ladder at all. The
+    campaign never takes that path: worker.trial_config passes eval_quantum
+    explicitly.
+    """
+    try:
+        cap = space.batch_cap(n_train)
+    except ValueError:
+        return batch_size
+    return cap if cap >= batch_size and cap % batch_size == 0 else batch_size
+
+
+def _write_best(args, best):
+    """Write the buffered argmin-val_nll evaluation. The run's ONLY disk write.
+
+    Called from a `finally`, so it runs whether the loop finished its budget or
+    was stopped by an EarlyConvergence raised out of `on_dump`. `best` is None
+    only if not a single evaluation happened -- a budget shorter than one eval
+    interval -- which is a misconfiguration rather than a result, so it raises
+    instead of leaving an empty dump directory that scores as a missing run.
+    """
+    if best is None:
+        raise ValueError(
+            f"{args.uid}: no evaluation ran, so there is no dump to write. "
+            f"The step budget is shorter than one eval interval."
+        )
+    for split_name, logits, labels, score in best["splits"]:
+        evaldump.write_dump(
+            args.dump_root, args.group_id, args.uid, best["step"],
+            logits, labels,
+            arm=args.arm, split=split_name, logit_kind="softmax_logits",
+            seed=args.seed, samples_seen=best["samples_seen"],
+            score=score,
+            score_kind=None if score is None else "predictive_variance",
+            eps_hat=best["eps_hat"],
+        )
+    print(
+        f"[probe] {args.uid}: best val_nll={best['val_nll']:.4f} at step "
+        f"{best['step']} (eval {best['eval_index']}, epoch {best['epoch']}, "
+        f"{best['samples_seen']} samples); wrote {len(best['splits'])} dumps",
+        flush=True,
+    )
+
+
+def main(args, on_dump=None):
+    """Train one head. `on_dump(eval_index, step, samples_seen, scalars)` fires
+    after every scheduled evaluation, if given.
+
+    `eval_index` counts evaluations rather than optimiser steps because it is
+    Optuna's pruning key: MedianPruner compares trials at the SAME key, and
+    trials vary batch_size. Evaluations are spaced `eval_quantum` SAMPLES apart
+    (see tuning.space.eval_quantum), so index i is the same samples_seen for
+    every trial in a study -- which the old dump index was not: it was a
+    geometric grid over STEPS, so index i meant 256x more data for a batch-16384
+    trial than a batch-64 one, and the pruner compared them there anyway.
     """
     key = jr.PRNGKey(args.seed)
     hf_repo = None if args.no_hf_cache else args.hf_repo
@@ -257,11 +321,39 @@ def main(args, on_dump=None):
 
     per_epoch = steps_per_epoch(len(train_f), args.batch_size)
     total_steps = args.epochs * per_epoch
-    schedule = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
+
+    # Evaluation is scheduled on SAMPLES, not steps. `quantum` samples pass
+    # between consecutive evaluations for every trial in a study, so the trial
+    # at the ladder's top evaluates every step and one at batch = cap/k
+    # evaluates every k steps -- and both land on identical samples_seen. A
+    # step grid does not: at a fixed step budget a step is `batch_size`
+    # samples, so "step 5,000" was 256x more data for one trial than another
+    # within a single study, and Optuna's pruner was comparing them there.
+    quantum = args.eval_quantum or _derive_quantum(len(train_f), args.batch_size)
+    if quantum % args.batch_size:
+        raise ValueError(
+            f"--eval-quantum {quantum} is not a whole number of "
+            f"batch_size={args.batch_size} steps. Evaluation happens between "
+            f"optimiser steps, so a fractional interval is unschedulable. The "
+            f"ladder is powers of two (see tuning.space.batch_sizes), so this "
+            f"means batch_size is off-ladder for {args.dataset}."
+        )
+    eval_every = quantum // args.batch_size
+
+    # The geometric grid survives, demoted to throttling MLflow and stdout. It
+    # is NOT the evaluation grid any more: it was sized as a figure artifact
+    # for 500-step runs (~400 MB of arrays per run), and at 30,000 steps its
+    # final interval spans ~7,000 steps -- 145 to 1,394 epochs depending on the
+    # dataset, hundreds of times coarser than the epoch-boundary evaluation
+    # this protocol was introduced to improve on.
+    report_grid = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
+    n_evals = total_steps // eval_every
     print(
         f"[probe] {args.uid}: {args.epochs} epochs x {per_epoch} steps "
         f"= {total_steps} steps ({total_steps * args.batch_size} samples), "
-        f"{len(schedule)} dumps"
+        f"eval every {eval_every} steps ({quantum} samples, "
+        f"{quantum / len(train_f):.2f} epochs) = {n_evals} evals, "
+        f"{len(report_grid)} reported"
     )
 
     with child_run(vars(args), run_name=args.uid, tags={
@@ -278,80 +370,125 @@ def main(args, on_dump=None):
         })
 
         step = 0
-        dump_index = 0
-        for epoch in range(1, args.epochs + 1):
-            key, epoch_key = jr.split(key)
-            if args.arm == "ibprobit":
-                stream = _ibprobit_epoch(
-                    loss_fn, train_f, train_l, args.batch_size,
-                    args.num_update_iters, epoch_key,
-                )
-            else:
-                stream = _ce_epoch(
-                    head, opt_state, optimizer, loss_fn,
-                    train_f, train_l, args.batch_size, epoch_key,
-                )
-            for produced in stream:
+        # The single best-val_nll evaluation, held in memory until the run ends.
+        # Nothing is written during training: the old loop wrote 2-3 arrays to
+        # GPFS at every one of its 40 points, and this grid has up to 30,000.
+        # Only the argmin is ever read downstream -- `analysis.thresholds.
+        # early_stop` selects it and `tuning.objective.score_dumps` scores it --
+        # so the rest was written and then deleted unread.
+        best: dict[str, Any] | None = None
+
+        # Hoisted: fancy indexing copies, and at up to 30,000 evaluations a
+        # per-eval copy of the val block would cost more than the forward pass
+        # it feeds.
+        val_f, val_l = eval_f[val_idx], eval_l[val_idx]
+        test_f, test_l = eval_f[test_idx], eval_l[test_idx]
+
+        # try/finally, not a trailing call: `on_dump` raises EarlyConvergence to
+        # stop a converged run (see tuning.objective), and with the dump now
+        # buffered rather than streamed, an escaping exception would leave the
+        # run with NOTHING on disk -- scoring would then fail on a trial that
+        # had in fact finished successfully.
+        try:
+            for epoch in range(1, args.epochs + 1):
+                key, epoch_key = jr.split(key)
                 if args.arm == "ibprobit":
-                    loss_fn = produced
+                    stream = _ibprobit_epoch(
+                        loss_fn, train_f, train_l, args.batch_size,
+                        args.num_update_iters, epoch_key,
+                    )
                 else:
-                    head, opt_state = produced
-                step += 1
-                if step not in schedule:
-                    continue
-
-                # Exact: drop-remainder means every step is exactly batch_size.
-                samples_seen = step * args.batch_size
-                logits = _logits_for(head, loss_fn, eval_f, eval_l)
-                # IBProbit's contamination estimate and its native epistemic
-                # score ride along with the dump. Both are absent on adamw_ce,
-                # which has neither quantity.
-                eps_hat = float(loss_fn.eps) if args.arm == "ibprobit" else None
-                scores = _scores_for(loss_fn, eval_f) if args.arm == "ibprobit" else None
-                for split_name, idx in (("val", val_idx), ("test", test_idx)):
-                    evaldump.write_dump(
-                        args.dump_root, args.group_id, args.uid, step,
-                        logits[idx], eval_l[idx],
-                        arm=args.arm, split=split_name, logit_kind="softmax_logits",
-                        seed=args.seed, samples_seen=samples_seen,
-                        score=None if scores is None else scores[idx],
-                        score_kind=None if scores is None else "predictive_variance",
-                        eps_hat=eps_hat,
+                    stream = _ce_epoch(
+                        head, opt_state, optimizer, loss_fn,
+                        train_f, train_l, args.batch_size, epoch_key,
                     )
-                # OOD at every eval step, not only the last. This used to be a
-                # single dump at total_steps, on the grounds that "Fig 2 is a
-                # converged-endpoint figure" -- but these runs carry no early
-                # stopping, and the endpoint is not where the configuration was
-                # tuned. AdamW+CE on cifar100 peaks at step 1,786 of 30,000 and
-                # then nearly triples its NLL, so scoring detection at the last
-                # step measured that overfitting rather than the method. With a
-                # dump per step, detection can be read at the same step as any
-                # other metric, including the val-optimal one.
-                if ood_f is not None:
-                    evaldump.write_dump(
-                        args.dump_root, args.group_id, args.uid, step,
-                        _logits_for(head, loss_fn, ood_f, ood_l), ood_l,
-                        arm=args.arm, split="ood", logit_kind="softmax_logits",
-                        seed=args.seed, samples_seen=samples_seen,
-                        score=None if scores is None else _scores_for(loss_fn, ood_f),
-                        score_kind=None if scores is None else "predictive_variance",
-                        eps_hat=eps_hat,
-                    )
-                scalars = report_step(
-                    run, step, samples_seen, epoch,
-                    logits[test_idx], eval_l[test_idx],
-                    logits[val_idx], eval_l[val_idx],
-                )
-                print(
-                    f"[probe] step {step} (epoch {epoch}, {samples_seen} samples): "
-                    + " ".join(f"{k}={v:.4f}" for k, v in scalars.items())
-                )
-                if on_dump is not None:
-                    on_dump(dump_index, step, scalars)
-                dump_index += 1
+                for produced in stream:
+                    if args.arm == "ibprobit":
+                        loss_fn = produced
+                    else:
+                        head, opt_state = produced
+                    step += 1
+                    if step % eval_every:
+                        continue
 
-        if ood_f is not None:
-            print(f"[probe] wrote {len(schedule)} OOD dumps for {args.ood_dataset}")
+                    # Exact: drop-remainder means every step is exactly batch_size.
+                    samples_seen = step * args.batch_size
+                    # Defined as the position on the SAMPLE grid, not a running
+                    # counter: index i means i * quantum samples for every trial
+                    # in the study, which is what makes it a sound pruning key.
+                    eval_index = samples_seen // quantum
+
+                    # Val only, and only the logits. This runs up to 30,000
+                    # times, so everything the selection rule does not need
+                    # stays out of it -- `_scores_for` alone is O(N d^2) and
+                    # would dominate the run at this cadence.
+                    val_logits = _logits_for(head, loss_fn, val_f, val_l)
+                    val_nll = metrics.nll(val_logits, val_l)
+
+                    if best is None or val_nll < best["val_nll"]:
+                        # A new argmin: build the full payload NOW, because it
+                        # is a function of head state the next step overwrites.
+                        # Logits rather than the head itself -- for IBProbit the
+                        # head carries two (d,d) matrices, 134 MB at d=4096, an
+                        # order of magnitude more than the arrays they produce.
+                        eps_hat = float(loss_fn.eps) if args.arm == "ibprobit" else None
+                        test_logits = _logits_for(head, loss_fn, test_f, test_l)
+                        val_scores = test_scores = ood_scores = None
+                        if args.arm == "ibprobit":
+                            # IBProbit's contamination estimate and its native
+                            # epistemic score ride along with the dump. Both are
+                            # absent on adamw_ce, which has neither quantity.
+                            val_scores = _scores_for(loss_fn, val_f)
+                            test_scores = _scores_for(loss_fn, test_f)
+                        best = {
+                            "val_nll": float(val_nll),
+                            "step": step,
+                            "samples_seen": samples_seen,
+                            "epoch": epoch,
+                            "eval_index": eval_index,
+                            "eps_hat": eps_hat,
+                            "splits": [
+                                ("val", np.asarray(val_logits), np.asarray(val_l), val_scores),
+                                ("test", np.asarray(test_logits), np.asarray(test_l), test_scores),
+                            ],
+                        }
+                        # OOD at the val-optimal point rather than at the last
+                        # step. It used to be dumped at total_steps on the
+                        # grounds that "Fig 2 is a converged-endpoint figure" --
+                        # but AdamW+CE on cifar100 peaks at step 1,786 of 30,000
+                        # and then nearly triples its NLL, so the endpoint
+                        # measured that overfitting rather than the method.
+                        if ood_f is not None:
+                            if args.arm == "ibprobit":
+                                ood_scores = _scores_for(loss_fn, ood_f)
+                            best["splits"].append((
+                                "ood",
+                                np.asarray(_logits_for(head, loss_fn, ood_f, ood_l)),
+                                np.asarray(ood_l),
+                                ood_scores,
+                            ))
+
+                    scalars = {"val_nll": float(val_nll)}
+                    if step in report_grid:
+                        # MLflow and stdout stay on the geometric grid: the full
+                        # metric set needs test logits and a temperature fit,
+                        # and 30,000 MLflow points per run would be its own
+                        # outage.
+                        scalars = report_step(
+                            run, step, samples_seen, epoch,
+                            _logits_for(head, loss_fn, test_f, test_l), test_l,
+                            val_logits, val_l,
+                        )
+                        print(
+                            f"[probe] step {step} (epoch {epoch}, "
+                            f"{samples_seen} samples): "
+                            + " ".join(f"{k}={v:.4f}" for k, v in scalars.items()),
+                            flush=True,
+                        )
+                    if on_dump is not None:
+                        on_dump(eval_index, step, samples_seen, scalars)
+        finally:
+            _write_best(args, best)
 
 
 def build_argparser():
@@ -370,7 +507,16 @@ def build_argparser():
     p.add_argument("--group-id", default="probe")
     p.add_argument("--uid", default="probe_0")
     p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--n-dumps", type=int, default=40)
+    p.add_argument("--eval-quantum", type=int, default=0,
+                   help="Samples between evaluations. 0 derives it from the "
+                        "dataset's batch ladder (tuning.space.eval_quantum), "
+                        "which is the only value that is a whole number of "
+                        "steps at every rung. Set explicitly only for a "
+                        "batch_size that is off-ladder.")
+    p.add_argument("--n-dumps", type=int, default=40,
+                   help="Points on the geometric grid that throttles MLflow "
+                        "and stdout. NOT the evaluation grid -- see "
+                        "--eval-quantum.")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
