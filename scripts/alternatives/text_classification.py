@@ -124,7 +124,12 @@ def extract_features(model, input_ids, attention_mask):
 
 
 def evaluate_model(model, loss_fn, input_ids, attention_mask, labels, loss_type):
-    """Evaluate model and return accuracy, ECE, NLL."""
+    """Evaluate model and return accuracy, ECE, NLL.
+
+    loss_fn is either IBProbit or CrossEntropy (--loss-fn), so loss_type keeps being
+    forwarded for the generic call signature; IBProbit ignores it (self.loss_type
+    fixes its branch).
+    """
     features = extract_features(model, input_ids, attention_mask)
     features = jnp.array(features)  # Convert to JAX array
     
@@ -143,7 +148,12 @@ def train_epoch(
     loss_type,
     key,
 ):
-    """Train for one epoch using CAVI updates."""
+    """Train for one epoch using CAVI updates.
+
+    loss_type keeps being forwarded to current_loss_fn -- the generic call signature
+    serves both IBProbit and CrossEntropy -- even though IBProbit ignores it
+    (self.loss_type fixes its branch).
+    """
     n_samples = labels.shape[0]
     n_batches = n_samples // batch_size
     
@@ -242,7 +252,9 @@ def main(args):
     num_classes = ds_config["num_classes"]
     
     if args.loss_fn == "IBProbit":
-        loss_fn = IBProbit(embed_dim, num_classes, key=loss_key)
+        # pre-Wishart default; this script is not part of the q study
+        loss_fn = IBProbit(embed_dim, num_classes, key=loss_key,
+                            q_init=1.0 / embed_dim)
     elif args.loss_fn == "CrossEntropy":
         loss_fn = CrossEntropy(args.label_smooth, num_classes)
     else:

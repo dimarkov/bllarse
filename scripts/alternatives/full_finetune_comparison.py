@@ -16,8 +16,9 @@ gradient is taken against the current head and the backbone features are stored;
 after the accumulated trunk gradient is applied, those stored features are
 assimilated into the head in a SINGLE CAVI update over the whole target batch (so
 the grad forward pass is reused -- no second forward). Trunk gradients are w.r.t.
-the backbone only; the head scalars q and eps are self-tuned solely inside that
-one update() call.
+the backbone only; the head's process-noise matrix Q (Inverse-Wishart posterior)
+and contamination rate eps (Beta posterior) are updated by the conjugate
+recursion -- not a gradient step -- solely inside that one update() call.
 
 Both arms consume the identical shuffled data stream (same seed, same batch
 order) and share AdamW hyperparameters for the backbone.
@@ -90,18 +91,17 @@ from vit_classification import (
 from precompute_ood_features import build_ood_registry, load_wnid_to_idx
 
 
-def build_ibprobit(args, embed_dim, num_classes, key, rho=1.0):
-    """Construct the IBProbit head from the exposed CLI knobs (in-update self-tuning
-    q, fixed sigma_z^2, PX scan, BMR gate, eps-contamination mixture). Mirrors the
-    construction in scripts/alternatives/ood_evaluation.py so all three scripts share
-    the same operating point. ``rho`` is the eps forgetting factor (callers pass
-    1 - B/N; the default 1.0 is fine for the throwaway batch-size probe)."""
+def build_ibprobit(args, embed_dim, num_classes, key, rho=1.0, batch_size=None):
+    """Construct the IBProbit head from the exposed CLI knobs (Inverse-Wishart process
+    noise Q, PX scan, eps-contamination mixture). Mirrors the construction in
+    scripts/alternatives/ood_evaluation.py so all three scripts share the same
+    operating point. ``rho`` is the eps forgetting factor (callers pass 1 - B/N; the
+    default 1.0 is fine for the throwaway batch-size probe)."""
     return IBProbit(
         embed_dim, num_classes, key=key,
-        q_init=args.q_init, sigma_z2_init=args.sigma_z2_init,
-        learn_q=not args.fix_q, hyper_lr=args.hyper_lr, anchor_weight=args.anchor_weight,
-        px=args.px, bmr_gate=args.bmr_gate, bmr_warmup=args.bmr_warmup,
-        learn_eps=args.learn_eps, eps_init=args.eps_init, rho=rho,
+        q_init=args.q_init, alpha=args.alpha, batch_size=batch_size,
+        kappa=args.kappa, learn_q=not args.no_learn_q, px=args.px,
+        warmup=args.warmup, eps_init=args.eps_init, rho=rho,
     )
 
 
@@ -110,7 +110,9 @@ def build_ibprobit(args, embed_dim, num_classes, key, rho=1.0):
 @eqx.filter_jit
 def _eval_logits_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
     features = forward_features(backbone, images, key, bf16=bf16)
-    _, logits = loss_fn(features, labels, with_logits=True, loss_type=2)
+    # loss_fn is always the IBProbit head (this helper is only used for arm ==
+    # "ibprobit"); its branch is fixed by self.loss_type.
+    _, logits = loss_fn(features, labels, with_logits=True)
     return logits
 
 
@@ -262,7 +264,7 @@ def probe_micro_batch_size(backbone, args, embed_dim, num_classes, img_size,
         # UnboundLocalError.
         loss_fn = None
         try:
-            loss_fn = build_ibprobit(args, embed_dim, num_classes, key)
+            loss_fn = build_ibprobit(args, embed_dim, num_classes, key, batch_size=bs)
             images = jnp.zeros((bs, 3, img_size, img_size), dtype=jnp.float32)
             labels = jnp.zeros((bs,), dtype=jnp.int32)
             if args.optimizer in ("ivon", "evon") and args.estimator == "hutchinson":
@@ -336,7 +338,8 @@ def run_arm(arm, args, backbone_init, train_split, ds_config, eval_images, eval_
         # eps forgetting rho = 1 - B/N: the head assimilates the whole effective batch each
         # step, so B = effective_batch, N = train-set size (one-pass contamination memory).
         eps_rho = max(0.0, 1.0 - effective_batch / len(train_split))
-        loss_fn = build_ibprobit(args, embed_dim, num_classes, init_key, rho=eps_rho)
+        loss_fn = build_ibprobit(args, embed_dim, num_classes, init_key, rho=eps_rho,
+                                  batch_size=effective_batch)
         head = None
         model = None
         if bayes_opt:
@@ -417,10 +420,8 @@ def run_arm(arm, args, backbone_init, train_split, ds_config, eval_images, eval_
                 )
         if arm == "ibprobit":
             run_params.update(
-                px=args.px, fix_q=args.fix_q, hyper_lr=args.hyper_lr,
-                anchor_weight=args.anchor_weight, q_init=args.q_init,
-                sigma_z2_init=args.sigma_z2_init, bmr_gate=args.bmr_gate,
-                bmr_warmup=args.bmr_warmup, learn_eps=args.learn_eps,
+                px=args.px, learn_q=not args.no_learn_q, alpha=args.alpha,
+                q_init=args.q_init, kappa=args.kappa, warmup=args.warmup,
                 eps_init=args.eps_init,
                 eps_rho=max(0.0, 1.0 - effective_batch / len(train_split)),
             )
@@ -551,9 +552,8 @@ def run_arm(arm, args, backbone_init, train_split, ds_config, eval_images, eval_
 
         metrics = {"train_loss": loss, "step_time": step_time, "train_time": train_time}
         if arm == "ibprobit":
-            metrics["ibprobit_q"] = float(loss_fn.q)
-            if loss_fn.use_eps:
-                metrics["ibprobit_eps"] = float(loss_fn.eps)
+            metrics["ibprobit_q"] = float(jnp.trace(loss_fn.Qhat) / loss_fn.Qhat.shape[0])
+            metrics["ibprobit_eps"] = float(loss_fn.eps)
         if step % args.eval_every == 0 or step == args.num_steps:
             acc, ece, nll = evaluate(arm, backbone, head_or_loss, eval_images,
                                      eval_labels, args.eval_chunk, fwd_key, bf16=args.bf16)
@@ -839,24 +839,21 @@ def build_argparser():
     # --- IBProbit head knobs (mirror scripts/alternatives/ood_evaluation.py) ---
     parser.add_argument("--px", action="store_true",
                         help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
-    parser.add_argument("--fix-q", action="store_true",
-                        help="fix q at its init (disable the in-update self-tuning q gradient)")
-    parser.add_argument("--hyper-lr", type=float, default=0.1,
-                        help="in-update prequential SGD step size for log_q")
-    parser.add_argument("--anchor-weight", type=float, default=1e-3,
-                        help="Inverse-Gamma anchor strength on q (mode at its init); 0 = off")
+    parser.add_argument("--no-learn-q", action="store_true",
+                        help="hold Q at its isotropic prior q0*I (the ablation arm); default infers it")
+    parser.add_argument("--alpha", type=float, default=0.1,
+                        help="prior scale on the process noise: q0 = alpha^2 / batch_size "
+                             "(q-update-spec 5.5e). At alpha=1e-3 the q recursion is inert "
+                             "(learn_q on/off give identical mu); 0.1 puts q0 near the "
+                             "pre-Wishart 1/D operating point.")
     parser.add_argument("--q-init", type=float, default=None,
-                        help="process-noise q init / fixed value (default 1/D, the LayerNorm-scale floor)")
-    parser.add_argument("--sigma-z2-init", type=float, default=1.0,
-                        help="fixed sigma_z^2 (the moderation floor; not a learnable parameter)")
-    parser.add_argument("--bmr-gate", action="store_true",
-                        help="enable the per-data-point BMR smoothing gate in the CAVI update")
-    parser.add_argument("--bmr-warmup", type=int, default=0,
-                        help="skip the BMR gate for the first N update steps (the mu=0 seed gate is useless)")
-    parser.add_argument("--learn-eps", action="store_true",
-                        help="self-tune the eps-contamination weight in-update via conjugate Beta(1, 1/eps_init) updating")
-    parser.add_argument("--eps-init", type=float, default=0.0,
-                        help="with --learn-eps sets the Beta(1, 1/eps_init) prior (mean ~ eps_init); else the fixed eps (>0 activates the mixture). Forgetting rho = 1 - B/N set automatically.")
+                        help="override q0 directly; pass 1/D to reproduce the pre-Wishart regime")
+    parser.add_argument("--kappa", type=float, default=None,
+                        help="Inverse-Wishart prior pseudo-count (default: 0.5, i.e. half a pseudo-observation against the K the likelihood adds per step)")
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="defer the gate and the q recursion for the first N steps (the mu=0 seed is uninformative)")
+    parser.add_argument("--eps-init", type=float, default=0.01,
+                        help="Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init). Forgetting rho = 1 - B/N set automatically.")
     parser.add_argument("--seed", type=int, default=137)
     parser.add_argument("--device", type=str, default="gpu")
     parser.add_argument("--log-mlflow", action="store_true")

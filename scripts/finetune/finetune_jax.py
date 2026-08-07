@@ -87,24 +87,22 @@ def check_arm_flags(args) -> None:
 
 
 def check_micro_batch_required(args) -> None:
-    """The auto-probe is unavailable for --arm ibprobit until it is merged.
+    """The auto-probe is not wired for --arm ibprobit.
 
-    Omitting --micro-batch-size makes main() auto-probe the largest micro
-    batch that fits. Doing that for the ibprobit arm needs a real IBProbit
-    head, but the IBProbit constructor on THIS branch only accepts
-    (input_dim, num_classes, *, key, use_bias, use_approx_cdf) -- it does not
-    yet have the q_init/px/bmr_gate/... knobs that land on the
-    ibprobit-process-noise worktree. Until that merges, --arm ibprobit must
-    pass --micro-batch-size explicitly; the ce arm still auto-probes fine via
-    probe_micro_batch_size_ce, which never touches IBProbit at all.
+    Omitting --micro-batch-size makes main() auto-probe the largest micro batch
+    that fits. Doing that for the ibprobit arm needs a real IBProbit head, and
+    this script has no ibprobit prober -- only probe_micro_batch_size_ce, which
+    never touches IBProbit at all. (full_finetune_comparison.py does have one,
+    probe_micro_batch_size; wiring an equivalent here is unfinished work, not a
+    blocked dependency: the constructor knobs it needs landed with the
+    process-noise merge.) Until then --arm ibprobit must pass
+    --micro-batch-size explicitly.
     """
     if args.arm == "ibprobit" and args.micro_batch_size is None:
         raise SystemExit(
-            "[finetune] --micro-batch-size is required for --arm ibprobit: "
-            "the auto-probe is unavailable for this arm until the IBProbit "
-            "constructor on the ibprobit-process-noise worktree (with its "
-            "q_init/px/bmr_gate/... knobs) is merged. Pass --micro-batch-size "
-            "explicitly."
+            "[finetune] --micro-batch-size is required for --arm ibprobit: this "
+            "script has no auto-probe for that arm (only the ce one). Pass "
+            "--micro-batch-size explicitly."
         )
 
 
@@ -186,24 +184,20 @@ def build_argparser() -> argparse.ArgumentParser:
     # and full_finetune_comparison.py at one operating point.
     p.add_argument("--px", action="store_true",
                    help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
-    p.add_argument("--fix-q", action="store_true",
-                   help="fix q at its init (disable the in-update self-tuning q gradient)")
-    p.add_argument("--hyper-lr", type=float, default=0.1,
-                   help="in-update prequential SGD step size for log_q")
-    p.add_argument("--anchor-weight", type=float, default=1e-3,
-                   help="Inverse-Gamma anchor strength on q (mode at its init); 0 = off")
+    p.add_argument("--no-learn-q", action="store_true",
+                   help="pin Qhat at its q0 seed (skip the Inverse-Wishart recursion on Q)")
+    p.add_argument("--alpha", type=float, default=0.1,
+                   help="process-noise scale: q0 = alpha^2 / effective_batch. Default 0.1; "
+                        "at 1e-3 the recursion is measurably inert (design spec sec 4.8)")
     p.add_argument("--q-init", type=float, default=None,
-                   help="process-noise q init / fixed value (default 1/D, the LayerNorm-scale floor)")
-    p.add_argument("--sigma-z2-init", type=float, default=1.0,
-                   help="fixed sigma_z^2 (the moderation floor; not a learnable parameter)")
-    p.add_argument("--bmr-gate", action="store_true",
-                   help="enable the per-data-point BMR smoothing gate in the CAVI update")
-    p.add_argument("--bmr-warmup", type=int, default=0,
-                   help="skip the BMR gate for the first N update steps (the mu=0 seed gate is useless)")
-    p.add_argument("--learn-eps", action="store_true",
-                   help="self-tune the eps-contamination weight in-update via conjugate Beta(1, 1/eps_init) updating")
-    p.add_argument("--eps-init", type=float, default=0.0,
-                   help="with --learn-eps sets the Beta(1, 1/eps_init) prior (mean ~ eps_init); else the fixed eps (>0 activates the mixture). Forgetting rho = 1 - B/N set automatically.")
+                   help="override q0 directly (bypasses alpha^2 / B; 1/D is the pre-Wishart value)")
+    p.add_argument("--kappa", type=float, default=None,
+                   help="Inverse-Wishart prior pseudo-count (default: 0.5, i.e. half a pseudo-observation against the K the likelihood adds per step)")
+    p.add_argument("--warmup", type=int, default=1,
+                   help="hold the contamination gate at 1 for the first N update steps")
+    p.add_argument("--eps-init", type=float, default=0.01,
+                   help="Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init). "
+                        "Forgetting rho = 1 - B/N set automatically.")
 
     p.add_argument("--n-dumps", type=int, default=protocol.DEFAULT_N_DUMPS)
     p.add_argument(
@@ -526,7 +520,17 @@ def main(args, on_dump=None) -> None:
         opt_state = optimizer.init(eqx.filter((backbone, head), eqx.is_array))
     else:
         from bllarse.losses import IBProbit
-        loss_fn = IBProbit(embed_dim, num_classes, key=init_key)
+        # B is the EFFECTIVE batch, not the micro batch: the head assimilates the
+        # whole accumulated batch in one CAVI update per step, so that is the B the
+        # q0 = alpha^2 / B steady-state relation is derived against. Matches
+        # run_arm in full_finetune_comparison.py. --q-init overrides q0 when set.
+        eps_rho = max(0.0, 1.0 - plan["effective_batch"] / imagenet.IMAGENET_N_TRAIN)
+        loss_fn = IBProbit(
+            embed_dim, num_classes, key=init_key,
+            q_init=args.q_init, alpha=args.alpha, batch_size=plan["effective_batch"],
+            kappa=args.kappa, learn_q=not args.no_learn_q, px=args.px,
+            warmup=args.warmup, eps_init=args.eps_init, rho=eps_rho,
+        )
         head = None
         optimizer = optax.adamw(args.lr, weight_decay=args.weight_decay)
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))

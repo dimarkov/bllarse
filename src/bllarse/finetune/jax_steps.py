@@ -70,7 +70,9 @@ def ibprobit_micro_forward(backbone, loss_fn, images, labels, key, bf16=False):
     tuned only inside that update()."""
     def loss_value_fn(bb):
         fts = forward_features(bb, images, key, bf16=bf16)
-        loss = loss_fn(fts, labels, loss_type=2).mean()
+        # loss_fn is always the IBProbit head here (this function is only called
+        # for arm == "ibprobit"); its branch is fixed by self.loss_type.
+        loss = loss_fn(fts, labels).mean()
         return loss, fts
 
     (loss, fts), grads = eqx.filter_value_and_grad(loss_value_fn, has_aux=True)(backbone)
@@ -84,7 +86,8 @@ def ibprobit_micro_forward_nograd(backbone, loss_fn, images, labels, key, bf16=F
     With the seed posterior (mu=0) the backbone gradient is zero, so we skip
     gradient computation and only store features/labels for the head update."""
     fts = forward_features(backbone, images, key, bf16=bf16)
-    loss = loss_fn(fts, labels, loss_type=2).mean()
+    # loss_fn is always the IBProbit head here (arm == "ibprobit" only).
+    loss = loss_fn(fts, labels).mean()
     return fts, loss
 
 
@@ -260,7 +263,8 @@ def ibprobit_micro_hvp(backbone, tangent, loss_fn, images, labels, key, bf16=Fal
     def loss_value_fn(p):
         bb = eqx.combine(p, static)
         fts = forward_features(bb, images, key, bf16=bf16)
-        loss = loss_fn(fts, labels, loss_type=2).mean()
+        # loss_fn is always the IBProbit head here (arm == "ibprobit" only).
+        loss = loss_fn(fts, labels).mean()
         return loss, fts
 
     ((loss, fts), grads), (_, hvp) = jax.jvp(

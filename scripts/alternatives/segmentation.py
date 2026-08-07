@@ -323,7 +323,9 @@ def main(args):
     num_classes = ds_config["num_classes"]
     
     if args.loss_fn == "IBProbit":
-        seg_head = IBProbit(embed_dim, num_classes, key=head_key)
+        # pre-Wishart default; this script is not part of the q study
+        seg_head = IBProbit(embed_dim, num_classes, key=head_key,
+                             q_init=1.0 / embed_dim)
     elif args.loss_fn == "IBPolyaGamma":
         seg_head = IBPolyaGamma(embed_dim, num_classes, key=head_key)
     else:

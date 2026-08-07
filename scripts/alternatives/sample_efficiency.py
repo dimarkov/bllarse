@@ -211,7 +211,13 @@ def load_or_compute_features(cache_path, model, dataset_split, ds_config, img_si
 # ── Evaluation helpers ────────────────────────────────────────────────────────
 
 def _eval_batches(loss_fn, features, labels, eval_batch_size, loss_type, head=None):
-    """Return (acc, ece, nll) over the given feature/label arrays."""
+    """Return (acc, ece, nll) over the given feature/label arrays.
+
+    Shared by both arms below (IBProbit with head=None, CrossEntropy with a linear
+    head), so loss_type keeps being forwarded even though IBProbit itself ignores it
+    (self.loss_type fixes its branch) -- CrossEntropy's __call__ also ignores it, but
+    the parameter stays for symmetry with the rest of this generic helper.
+    """
     n = len(features)
     all_logits, all_labels = [], []
     for start in range(0, n, eval_batch_size):
@@ -233,7 +239,7 @@ def _eval_batches(loss_fn, features, labels, eval_batch_size, loss_type, head=No
 # ── IBProbit helpers ─────────────────────────────────────────────────────────
 
 @eqx.filter_jit
-def _ibprobit_update_scan(loss_fn, features, labels, num_update_iters, alpha, update_method="update"):
+def _ibprobit_update_scan(loss_fn, features, labels, num_update_iters, update_method="update"):
     """Run sequential IBProbit updates over stacked sub-batches using lax.scan.
 
     Args:
@@ -248,7 +254,7 @@ def _ibprobit_update_scan(loss_fn, features, labels, num_update_iters, alpha, up
     def step(dynamic, batch):
         f, l = batch
         loss_fn = eqx.combine(dynamic, static)
-        new_loss_fn = getattr(loss_fn, update_method)(f, l, num_iters=num_update_iters, alpha=alpha)
+        new_loss_fn = getattr(loss_fn, update_method)(f, l, num_iters=num_update_iters)
         new_dynamic, _ = eqx.partition(new_loss_fn, eqx.is_array)
         return new_dynamic, None
 
@@ -267,9 +273,6 @@ def run_ibprobit_sequential(
 ):
     """Retrain from scratch at each step on all accumulated data.
 
-    alpha is set automatically to ibprobit_batch_size / n_samples so that
-    each mini-batch contributes proportionally to the posterior update.
-
     Returns list of dicts with keys: n_samples, train_acc/ece/nll, test_acc/ece/nll, beta.
     """
     label = {"update": "IBProbit", "update_cavi": "IBProbit (CAVI-EMA)", "update_bmr": "IBProbit (BMR)"}.get(update_method, update_method)
@@ -285,19 +288,19 @@ def run_ibprobit_sequential(
         step_end  = (step + 1) * step_size
         n_samples = step_end
 
-        alpha = 1e-2 * ibprobit_batch_size / n_samples
-
         # Reset from scratch and train on all accumulated data
         key, step_key = jr.split(key)
-        loss_fn = IBProbit(embed_dim, num_classes, key=step_key)
+        # pre-Wishart default; this script is not part of the q study
+        loss_fn = IBProbit(embed_dim, num_classes, key=step_key,
+                            q_init=1.0 / embed_dim)
         acc_indices = indices[:step_end]
         n_sub = n_samples // ibprobit_batch_size
         used  = n_sub * ibprobit_batch_size
         acc_f = jnp.array(train_features[acc_indices[:used]]).reshape(n_sub, ibprobit_batch_size, -1)
         acc_l = jnp.array(train_labels  [acc_indices[:used]]).reshape(n_sub, ibprobit_batch_size)
 
-        print(f"\nStep {step + 1}/{max_batches} | n_samples={n_samples:,} | alpha={alpha:.4f} | updating...")
-        loss_fn = _ibprobit_update_scan(loss_fn, acc_f, acc_l, num_update_iters, alpha, update_method)
+        print(f"\nStep {step + 1}/{max_batches} | n_samples={n_samples:,} | updating...")
+        loss_fn = _ibprobit_update_scan(loss_fn, acc_f, acc_l, num_update_iters, update_method)
 
         # Temperature scaling on a subsample of training data, sized to match the test set
         val_nll_before = val_nll_after = float("nan")
@@ -308,7 +311,9 @@ def run_ibprobit_sequential(
             cal_f = train_features[indices[:step_end]][perm[:n_cal]]
             cal_l = train_labels  [indices[:step_end]][perm[:n_cal]]
             _, _, val_nll_before = _eval_batches(loss_fn, cal_f, cal_l, eval_batch_size, loss_type)
-            loss_fn = loss_fn.calibrate(jnp.array(cal_f), jnp.array(cal_l), num_iters=num_calibration_iters, loss_type=loss_type)
+            # loss_fn here is always the IBProbit head; calibrate() has no loss_type
+            # parameter (it is IBProbit-only, unlike __call__).
+            loss_fn = loss_fn.calibrate(jnp.array(cal_f), jnp.array(cal_l), num_iters=num_calibration_iters)
             _, _, val_nll_after = _eval_batches(loss_fn, cal_f, cal_l, eval_batch_size, loss_type)
             print(f"  Calibration (n_cal={n_cal:,}): nll {val_nll_before:.4f} → {val_nll_after:.4f}  beta={float(loss_fn.beta):.4f}")
 

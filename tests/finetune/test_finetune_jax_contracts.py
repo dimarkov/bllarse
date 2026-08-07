@@ -252,7 +252,8 @@ def test_probe_micro_batch_size_args_are_all_defined_on_finetune_jax_namespace()
     # Sanity: the regex must actually have found the ten IBProbit knobs (and
     # bf16/optimizer/estimator), or this test would trivially pass on zero
     # attributes and catch nothing.
-    assert {"q_init", "px", "bmr_gate", "learn_eps", "bf16", "optimizer"} <= touched
+    assert {"q_init", "px", "alpha", "kappa", "warmup", "eps_init",
+            "bf16", "optimizer"} <= touched
 
     args = fj.build_argparser().parse_args(["--arm", "ibprobit", "--batch-size", "4"])
     missing = sorted(name for name in touched if not hasattr(args, name))
