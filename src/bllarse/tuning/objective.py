@@ -8,6 +8,7 @@ tuning at all: for Fig 2, studies are keyed on the ID dataset only, since both
 scripts load OOD features after the training loop purely for a final dump.
 """
 
+import math
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -114,7 +115,15 @@ def _patience_on_dump(
         seen += 1
         value = float(scalars["val_nll"])
         # Relative improvement, not absolute: see DEFAULT_MIN_RELATIVE_IMPROVEMENT.
-        if best is None or value < best * (1.0 - min_relative_improvement):
+        # `isfinite` guards the `best is None` arm specifically: without it a
+        # non-finite FIRST evaluation becomes `best`, every later comparison
+        # against nan is False, and the counter stalls for the rest of the run
+        # -- firing at exactly `1 + patience`. A non-finite value carries no
+        # information about improvement, so it counts as a stall and is never
+        # adopted as the best.
+        if math.isfinite(value) and (
+            best is None or value < best * (1.0 - min_relative_improvement)
+        ):
             best = value
             stall = 0
         else:

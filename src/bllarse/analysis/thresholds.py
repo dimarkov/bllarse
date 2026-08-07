@@ -13,6 +13,8 @@ here are large. Four rules, all load-bearing:
 4. Crossings are per seed, not the crossing of the seed-mean curve.
 """
 
+import math
+
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -142,7 +144,22 @@ def early_stop(curve: Curve, criterion: str = "val_nll") -> StoppingPoint:
         )
 
     ordered = sorted(curve, key=lambda row: row["step"])
-    best = min(ordered, key=lambda row: row[criterion])
+    # Non-finite points are dropped before the argmin rather than ranked with
+    # it. `min` keeps its first candidate unless a later one compares strictly
+    # less, and every comparison against nan is False -- so a single nan row,
+    # if it sorts first, WINS the argmin and the run scores nan. That is not a
+    # hypothetical: two ibprobit oxford_pets trials failed exactly this way,
+    # their first evaluation non-finite and every good value afterwards unable
+    # to displace it. A point the model could not evaluate is not a candidate
+    # optimum.
+    finite = [row for row in ordered if math.isfinite(row[criterion])]
+    if not finite:
+        raise ValueError(
+            f"every one of {len(ordered)} rows has a non-finite {criterion!r}; "
+            f"this run produced no usable measurement and must not be scored "
+            f"as though it did."
+        )
+    best = min(finite, key=lambda row: row[criterion])
     return StoppingPoint(
         step=best["step"],
         samples_seen=best["samples_seen"],

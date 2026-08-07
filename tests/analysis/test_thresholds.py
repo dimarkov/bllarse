@@ -206,3 +206,32 @@ def test_truncation_falls_back_to_the_curve_when_unrecorded(tmp_path):
     stop = early_stop(run_curve(tmp_path, "g", "old"), "val_nll")
     assert stop.step == 2
     assert stop.at_last_step is False, "argmin at step 2 of 3 is not truncation"
+
+
+def test_a_nonfinite_row_cannot_win_the_argmin():
+    """`min` keeps its first candidate unless a later one compares strictly
+    less, and every comparison against nan is False -- so a nan row that sorts
+    first WINS the argmin and the run scores nan. Two real ibprobit trials
+    failed this way. A point the model could not evaluate is not a candidate
+    optimum."""
+    curve = [
+        {"step": 1, "samples_seen": 100, "val_nll": float("nan")},
+        {"step": 2, "samples_seen": 200, "val_nll": 0.9},
+        {"step": 3, "samples_seen": 300, "val_nll": 0.4},
+        {"step": 4, "samples_seen": 400, "val_nll": 0.7},
+    ]
+    sp = thresholds.early_stop(curve, "val_nll")
+    assert sp.step == 3
+    assert sp.value == pytest.approx(0.4)
+
+
+def test_an_all_nonfinite_curve_raises_rather_than_scoring():
+    """A run that produced no usable measurement must not be handed back a
+    number -- silently scoring it would put a fabricated value into the
+    campaign's comparison."""
+    curve = [
+        {"step": 1, "samples_seen": 100, "val_nll": float("nan")},
+        {"step": 2, "samples_seen": 200, "val_nll": float("inf")},
+    ]
+    with pytest.raises(ValueError, match="non-finite"):
+        thresholds.early_stop(curve, "val_nll")

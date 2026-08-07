@@ -501,3 +501,57 @@ def test_patience_is_disabled_unless_a_threshold_is_given(tmp_path, monkeypatch)
     )
     for seed in objective.TUNING_SEEDS:
         assert _n_val_dumps(root, "t", f"trial0_seed{seed}") == len(profile)
+
+
+def test_a_nonfinite_first_evaluation_does_not_latch_the_patience_counter(
+    tmp_path, monkeypatch
+):
+    """The bug that failed two real ibprobit trials.
+
+    `best is None or value < best * (...)` adopts a nan as the best when it
+    arrives FIRST, because the `best is None` arm short-circuits. Every later
+    comparison is then `v < nan` -> False, so the counter never resets and
+    patience fires at exactly `1 + patience` evaluations regardless of how well
+    the run went. Both failures showed the signature precisely:
+    patience_stopped_at_eval {'201': 41} against a patience of 40.
+
+    A run that recovers must be scored on the values it recovered to.
+    """
+    root = tmp_path / "dumps"
+    # nan first, then a genuinely improving curve.
+    profile = [float("nan"), 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    monkeypatch.setattr(
+        objective.adapters, "load_script_module",
+        lambda path: _make_patience_module({200: profile, 201: profile}),
+    )
+
+    value = objective.evaluate(
+        "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
+        patience=3, warmup_evals=2, keep_dumps=True,
+    )
+
+    assert np.isfinite(value), (
+        "a run that produced finite values after a nan must score finitely"
+    )
+    for seed in objective.TUNING_SEEDS:
+        assert _n_val_dumps(root, "t", f"trial0_seed{seed}") == len(profile), (
+            "the improving tail must not be cut short by a latched counter"
+        )
+
+
+def test_a_nonfinite_evaluation_still_counts_as_a_stall(tmp_path, monkeypatch):
+    """Not adopted as the best, but not free either. A run producing nothing
+    but nan has converged to nothing and must still stop, rather than paying
+    its full budget."""
+    root = tmp_path / "dumps"
+    profile = [1.0, 2.0] + [float("nan")] * 20
+    monkeypatch.setattr(
+        objective.adapters, "load_script_module",
+        lambda path: _make_patience_module({200: profile, 201: profile}),
+    )
+    objective.evaluate(
+        "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
+        patience=3, warmup_evals=2, keep_dumps=True,
+    )
+    for seed in objective.TUNING_SEEDS:
+        assert _n_val_dumps(root, "t", f"trial0_seed{seed}") < len(profile)

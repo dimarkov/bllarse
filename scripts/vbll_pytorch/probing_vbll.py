@@ -7,6 +7,7 @@ Writes dumps under the shared contract (bllarse.evaldump).
 """
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -283,7 +284,21 @@ def main(args, on_dump=None):
                     head.train()
                     val_nll = metrics.nll(val_logits, val_l)
 
-                    if best is None or val_nll < best["val_nll"]:
+                    # `isfinite` first, and NOT folded into the comparison:
+                    # `best is None or val_nll < best[...]` latches on a
+                    # non-finite FIRST evaluation, because `best is None` is
+                    # True so nan becomes the best, and every later
+                    # `v < nan` is False so nothing can replace it. The run
+                    # then stalls by construction, patience fires exactly
+                    # `1 + patience` evaluations in, and the trial writes a
+                    # nan dump that scores nan. Two ibprobit oxford_pets
+                    # trials died this way at num_update_iters=192, both with
+                    # seed 201 stopping at eval 41 against a patience of 40.
+                    # A non-finite evaluation is not a candidate optimum; it
+                    # is simply no information.
+                    if math.isfinite(val_nll) and (
+                        best is None or val_nll < best["val_nll"]
+                    ):
                         test_logits, test_score = _forward(
                             head, test_f, device, args.predictive_samples
                         )

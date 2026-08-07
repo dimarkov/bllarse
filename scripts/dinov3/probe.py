@@ -19,6 +19,7 @@ head was fitted.
 """
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -433,7 +434,21 @@ def main(args, on_dump=None):
                     val_logits = _logits_for(head, loss_fn, val_f, val_l)
                     val_nll = metrics.nll(val_logits, val_l)
 
-                    if best is None or val_nll < best["val_nll"]:
+                    # `isfinite` first, and NOT folded into the comparison:
+                    # `best is None or val_nll < best[...]` latches on a
+                    # non-finite FIRST evaluation, because `best is None` is
+                    # True so nan becomes the best, and every later
+                    # `v < nan` is False so nothing can replace it. The run
+                    # then stalls by construction, patience fires exactly
+                    # `1 + patience` evaluations in, and the trial writes a
+                    # nan dump that scores nan. Two ibprobit oxford_pets
+                    # trials died this way at num_update_iters=192, both with
+                    # seed 201 stopping at eval 41 against a patience of 40.
+                    # A non-finite evaluation is not a candidate optimum; it
+                    # is simply no information.
+                    if math.isfinite(val_nll) and (
+                        best is None or val_nll < best["val_nll"]
+                    ):
                         # A new argmin: build the full payload NOW, because it
                         # is a function of head state the next step overwrites.
                         # Logits rather than the head itself -- for IBProbit the
