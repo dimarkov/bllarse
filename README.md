@@ -93,7 +93,7 @@ the array is not submitted.
 
 ## 🔄 Updating Git-based dependencies
 
-Some dependencies in `pyproject.toml` are installed directly from GitHub (e.g. `blrax`, `mlpox`).  
+Some dependencies in `pyproject.toml` are installed directly from GitHub (e.g. `blrax`).  
 By default, `uv sync` will use the commit pinned in your `uv.lock` file, so you won’t automatically get the latest changes from `main`.
 
 To update one of these packages to the newest commit on its branch:

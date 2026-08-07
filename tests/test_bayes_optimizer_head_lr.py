@@ -106,7 +106,7 @@ def test_head_lr_requires_labels():
 @pytest.mark.parametrize("name", ["ivon", "evon"])
 def test_run_training_with_fc_labeled_head_lr_chain(name):
     """End-to-end: run_training + flat head-lr chain + the .fc-labeling callable
-    used by scripts/finetuning.py (classical loss, full network)."""
+    used by the full-network finetuning path (classical loss)."""
     import equinox as eqx
     import jax.tree as jtu
     from bllarse.losses import CrossEntropy

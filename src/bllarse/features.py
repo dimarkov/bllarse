@@ -5,7 +5,7 @@ so the backbone is byte-identical across frameworks and Figs 1-4 carry no
 cross-framework parity risk.
 
 Deliberately free of JAX and PyTorch. The PyTorch container must import this
-without the JAX stack, and the JAX arm must not pull equimo/mlpox/datasets in
+without the JAX stack, and the JAX arm must not pull equimo/datasets in
 just to call np.load. `huggingface_hub` is imported lazily for the same reason.
 """
 

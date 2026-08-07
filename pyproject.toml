@@ -19,7 +19,6 @@ dependencies = [
     "optax>=0.2.4",
     "tfp-nightly[jax]>=0.25",
     "dotenv<1.0.0",
-    "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
     "blrax @ git+https://github.com/dimarkov/blrax.git@main"
 ]
 

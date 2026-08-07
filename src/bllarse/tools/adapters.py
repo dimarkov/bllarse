@@ -77,11 +77,6 @@ def parse_config(module: Any, config: Mapping[str, Any]) -> Namespace:
     return module.build_argparser().parse_args(config_to_argv(config))
 
 
-def run_training_from_config(config: Mapping[str, Any]) -> None:
-    """Run the repository's standard finetuning script from a config."""
-    run_script_from_config("scripts/finetuning.py", config)
-
-
 def run_vbll_training_from_config(config: Mapping[str, Any]) -> None:
     """Run the PyTorch VBLL finetuning script from a config."""
     run_script_from_config("scripts/vbll_pytorch/finetuning_vbll.py", config)

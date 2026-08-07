@@ -55,14 +55,17 @@ except ImportError:
     NO_EQUIMO = True
     warnings.warn("equimo not installed. Run: pip install equimo>=1.1.0")
 
-from mlpox.load_models import load_model as mlpox_load_model
-
 from bllarse.losses import IBProbit, CrossEntropy
 
 from calibration import evaluate_classification
 
 
-# Model configurations available in equimo
+# Model configurations available in equimo. DINOv3 only: the deepMLP_big and
+# deepMLP_large entries (mlpox `B_12-Wi_{512,1024}_res_64_in21k`) were removed
+# along with the mlpox dependency, since the deep-MLP experiments are excised
+# from the paper. `channels_first` is True for every entry and stays only
+# because the feature-extraction call sites read it; they are the ones that
+# would need touching to drop it.
 EQUIMO_MODELS = {
     # DINOv3 models (ViT with LayerNorm only) — expect CHW input
     "dinov3_small": {"img_size": 224, "embed_dim": 384, "channels_first": True},
@@ -70,13 +73,9 @@ EQUIMO_MODELS = {
     "dinov3_large": {"img_size": 224, "embed_dim": 1024, "channels_first": True},
     "dinov3_huge": {"img_size": 224, "embed_dim": 1280, "channels_first": True},
     "dinov3_max": {"img_size": 224, "embed_dim": 4096, "channels_first": True},
-    # DeepMLP models — expect HWC input
-    "deepMLP_big": {"img_size": 64, "embed_dim": 512, "channels_first": False},
-    "deepMLP_large": {"img_size": 64, "embed_dim": 1024, "channels_first": False},
 }
 
 # Dataset-specific input sizes for DINOv3 models (patch_size=16, so size must be divisible by 16).
-# Chosen based on native dataset resolution; DeepMLP models ignore this table.
 DINOV3_DATASET_IMG_SIZES = {
     "cifar10":       224,
     "cifar100":      224,
@@ -173,29 +172,22 @@ def get_pretrained_backbone(model_name: str, key):
 
     # Map to equimo model identifiers
     model_id_map = {
-        "dinov3_small": ("vit", "dinov3_vits16plus_pretrain_lvd1689m"),
-        "dinov3_big": ("vit", "dinov3_vitb16_pretrain_lvd1689m"),
-        "dinov3_large": ("vit", "dinov3_vitl16_pretrain_lvd1689m"),
-        "dinov3_huge": ("vit", "dinov3_vith16plus_pretrain_lvd1689m"),
-        "dinov3_max": ("vit", "dinov3_vit7b16_pretrain_lvd1689m"),
-        "deepMLP_big": ("mlp", "B_12-Wi_512_res_64_in21k"),
-        "deepMLP_large": ("mlp", "B_12-Wi_1024_res_64_in21k")
+        "dinov3_small": "dinov3_vits16plus_pretrain_lvd1689m",
+        "dinov3_big": "dinov3_vitb16_pretrain_lvd1689m",
+        "dinov3_large": "dinov3_vitl16_pretrain_lvd1689m",
+        "dinov3_huge": "dinov3_vith16plus_pretrain_lvd1689m",
+        "dinov3_max": "dinov3_vit7b16_pretrain_lvd1689m",
     }
 
     if model_name not in model_id_map:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(model_id_map.keys())}")
 
-    arch_type, model_id = model_id_map[model_name]
-
-    if 'dinov3' in model_name:
-        # equimo >=1.0 loads pretrained weights via registered factory functions
-        model = getattr(equimo_models, model_id)(pretrained=True)
-        return eqx.nn.inference_mode(model, True)
-    else:
-        model = mlpox_load_model(model_id)
-        # Remove the classification head to get embeddings
-        model = eqx.tree_at(lambda m: m.fc, model, eqx.nn.Identity())
-        return eqx.nn.inference_mode(model, True)
+    # equimo >=1.0 loads pretrained weights via registered factory functions.
+    # The mlpox branch that stood here loaded the deep-MLP backbones and stripped
+    # their classification head; both it and the ("vit"/"mlp") arch_type tag it
+    # switched on are gone with the mlpox dependency.
+    model = getattr(equimo_models, model_id_map[model_name])(pretrained=True)
+    return eqx.nn.inference_mode(model, True)
 
 
 NORM_STATS = {

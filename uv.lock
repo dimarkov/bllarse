@@ -260,7 +260,6 @@ dependencies = [
     { name = "equimo" },
     { name = "ipykernel" },
     { name = "jax", extra = ["cuda"] },
-    { name = "mlpox" },
     { name = "optax" },
     { name = "pillow" },
     { name = "tfp-nightly", extra = ["jax"] },
@@ -292,7 +291,6 @@ requires-dist = [
     { name = "equimo", specifier = ">=0.3.3" },
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "jax", extras = ["cuda"], specifier = ">=0.6.2" },
-    { name = "mlpox", git = "https://github.com/dimarkov/mlpox.git?rev=main" },
     { name = "optax", specifier = ">=0.2.4" },
     { name = "pillow", specifier = ">=11.1.0" },
     { name = "tfp-nightly", extras = ["jax"], specifier = ">=0.25" },
@@ -2168,17 +2166,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ec/b0/5912313e895e6ce02f1f67110164d147593d1b5379a4767a30a5b9e730c5/mlflow_tracing-3.13.0.tar.gz", hash = "sha256:42c435b0fdcab00f1865cab4a52f7a85a2a08d68a959f36bcf90a1c9fe65db0a", size = 1393079, upload-time = "2026-06-01T05:54:44.906Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/94/fd/2c53ebc2f7fbb34ed4a3913a71ff53962e6be35fa02f7cee1f52c77388cd/mlflow_tracing-3.13.0-py3-none-any.whl", hash = "sha256:2f8187ce2b1af7419be71d2d8ab5fec53d207d4b8d703cd15e5db64939098d72", size = 1664279, upload-time = "2026-06-01T05:54:42.911Z" },
-]
-
-[[package]]
-name = "mlpox"
-version = "0.1.0"
-source = { git = "https://github.com/dimarkov/mlpox.git?rev=main#930af45ec8b79ddc6087998016cd98c3b62060d8" }
-dependencies = [
-    { name = "einops" },
-    { name = "equinox" },
-    { name = "huggingface-hub" },
-    { name = "jax" },
 ]
 
 [[package]]

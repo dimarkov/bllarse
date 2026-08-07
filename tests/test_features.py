@@ -196,7 +196,7 @@ def test_module_imports_without_jax_or_torch():
     versa. A heavy import chain here would defeat the point of the module."""
     code = (
         "import sys, bllarse.features; "
-        "heavy = [m for m in ('jax', 'torch', 'equimo', 'mlpox', 'datasets') "
+        "heavy = [m for m in ('jax', 'torch', 'equimo', 'datasets') "
         "if m in sys.modules]; "
         "assert not heavy, heavy; print('clean')"
     )
