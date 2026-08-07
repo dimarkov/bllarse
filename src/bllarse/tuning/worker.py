@@ -227,10 +227,28 @@ def make_objective(
         trial.set_user_attr("steps", budgets[dataset]["steps"])
         trial.set_user_attr("eval_quantum", config["eval_quantum"])
 
+        # Where this trial's val_nll bottomed out, and how far it got. Recorded
+        # from the callback rather than from the dumps because tuning dumps are
+        # deleted once the objective is computed -- the journal is all that
+        # outlives a trial, so a diagnostic that lives only on disk is no
+        # diagnostic at all.
+        #
+        # This is what says whether `--patience` is set sensibly. A trial with
+        # argmin_eval == total_evals never converged: it was still improving
+        # when the step budget ran out, and patience had nothing to cut. Many
+        # of those at small batch means the BUDGET is too small, not that
+        # patience is too large -- and the two call for opposite corrections.
+        # First seed only, like the rest of on_dump.
+        seen = {"total": 0, "argmin": 0, "best": float("inf")}
+
         def on_dump(
             eval_index: int, step: int, samples_seen: int,
             scalars: Mapping[str, float],
         ) -> None:
+            seen["total"] = eval_index
+            value = float(scalars["val_nll"])
+            if value < seen["best"]:
+                seen["best"], seen["argmin"] = value, eval_index
             # Reported on the EVAL INDEX, never the optimiser step. MedianPruner
             # compares trials at matching keys and trials vary batch_size, so
             # raw steps would rarely even collide -- the pruner would silently
@@ -266,6 +284,11 @@ def make_objective(
         trial.set_user_attr(
             "patience_stopped_at_eval",
             {str(seed): eval_index for seed, eval_index in stopped_at.items()},
+        )
+        trial.set_user_attr("argmin_eval", seen["argmin"])
+        trial.set_user_attr("total_evals", seen["total"])
+        trial.set_user_attr(
+            "truncated", seen["total"] > 0 and seen["argmin"] == seen["total"]
         )
         return value
 

@@ -84,6 +84,7 @@ def write_dump(
     score=None,
     score_kind: str | None = None,
     eps_hat: float | None = None,
+    at_last_eval: bool | None = None,
 ) -> Path:
     """Write one eval point. Returns the path written.
 
@@ -124,6 +125,22 @@ def write_dump(
         "score_kind": score_kind,
         "seed": int(seed),
         "eps_hat": None if eps_hat is None else float(eps_hat),
+        # Whether this point was the run's LAST evaluation, recorded by the
+        # training script rather than inferred later.
+        #
+        # `thresholds.early_stop` used to infer truncation from the curve --
+        # "is the argmin the last row?" -- which worked when a run dumped its
+        # whole trajectory. A run now writes only its argmin, so that inference
+        # is trivially True for every run and the budget rule built on it
+        # ("raise the budget until at_last_step is false for >=90% of runs",
+        # tuning.budgets) would reject every budget. Only the training loop
+        # knows how many evaluations there were, so it is the only thing that
+        # can answer this.
+        #
+        # None on dumps written without it -- older runs, and any caller that
+        # does not know -- and early_stop falls back to the curve inference
+        # there.
+        "at_last_eval": None if at_last_eval is None else bool(at_last_eval),
     }
 
     payload = {

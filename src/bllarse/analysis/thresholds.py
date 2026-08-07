@@ -119,10 +119,17 @@ def early_stop(curve: Curve, criterion: str = "val_nll") -> StoppingPoint:
     Selection is on val, reporting is on test, and the two are disjoint by
     construction (bllarse.splits), so this does not leak.
 
-    `at_last_step` flags a minimum at the final dumped point: the curve was
-    still improving when the budget ran out, so this is a truncation rather
-    than a converged optimum, and the run is not evidence about where the
-    optimum is.
+    `at_last_step` flags a minimum at the final EVALUATION: the curve was still
+    improving when the budget ran out, so this is a truncation rather than a
+    converged optimum, and the run is not evidence about where the optimum is.
+    `tuning.budgets` reads it to decide a step budget is too small.
+
+    It is taken from the dump's own `at_last_eval` metadata when present, and
+    only inferred from the curve ("is the argmin the last row?") when it is
+    not. The inference is unsound for a run that writes a single dump -- which
+    is what both probing scripts now do, keeping only their argmin -- because
+    the argmin is then trivially also the last row, and every run would report
+    as truncated. Only the training loop knows how many evaluations there were.
     """
     if not curve:
         raise ValueError("curve is empty; nothing to select")
@@ -142,7 +149,11 @@ def early_stop(curve: Curve, criterion: str = "val_nll") -> StoppingPoint:
         criterion=criterion,
         value=best[criterion],
         row=best,
-        at_last_step=best["step"] == ordered[-1]["step"],
+        at_last_step=(
+            best["at_last_eval"]
+            if best.get("at_last_eval") is not None
+            else best["step"] == ordered[-1]["step"]
+        ),
     )
 
 

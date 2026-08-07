@@ -84,6 +84,11 @@ def run_curve(
             "temperature_clipped": (
                 temperature_scaled and metrics.is_clipped_temperature(temperature)
             ),
+            # None on dumps written before this was recorded; `early_stop`
+            # falls back to inferring it from the curve there. See the note in
+            # evaldump.write_dump for why the inference cannot be trusted on a
+            # run that writes only its argmin.
+            "at_last_eval": test_record.meta.get("at_last_eval"),
             **metrics.classification_metrics(logits, labels),
         }
 

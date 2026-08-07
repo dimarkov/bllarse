@@ -94,7 +94,7 @@ def _derive_quantum(n_train: int, batch_size: int) -> int:
     return cap if cap >= batch_size and cap % batch_size == 0 else batch_size
 
 
-def _write_best(args, best):
+def _write_best(args, best, last_eval_index):
     """Write the buffered argmin-val_nll evaluation. The run's ONLY disk write.
 
     The vbll twin of `_write_best` in scripts/dinov3/probe.py; see the note
@@ -113,11 +113,15 @@ def _write_best(args, best):
             arm="vbll", split=split_name, logit_kind="softmax_logits",
             seed=args.seed, samples_seen=best["samples_seen"],
             score=score, score_kind="predictive_variance",
+            # See the matching note in scripts/dinov3/probe.py.
+            at_last_eval=best["eval_index"] == last_eval_index,
         )
     print(
         f"[vbll] {args.uid}: best val_nll={best['val_nll']:.4f} at step "
-        f"{best['step']} (eval {best['eval_index']}, epoch {best['epoch']}, "
-        f"{best['samples_seen']} samples); wrote {len(best['splits'])} dumps",
+        f"{best['step']} (eval {best['eval_index']} of {last_eval_index}, "
+        f"epoch {best['epoch']}, {best['samples_seen']} samples)"
+        f"{' AT LAST EVAL -- truncated, not converged' if best['eval_index'] == last_eval_index else ''}"
+        f"; wrote {len(best['splits'])} dumps",
         flush=True,
     )
 
@@ -243,6 +247,7 @@ def main(args, on_dump=None):
         # written once, from a `finally` so an EarlyConvergence raised out of
         # `on_dump` cannot leave the run with nothing on disk.
         best = None
+        eval_index = 0
         val_f, val_l = eval_f[val_idx], eval_l[val_idx]
         test_f, test_l = eval_f[test_idx], eval_l[test_idx]
 
@@ -327,7 +332,7 @@ def main(args, on_dump=None):
                     if on_dump is not None:
                         on_dump(eval_index, step, samples_seen, scalars)
         finally:
-            _write_best(args, best)
+            _write_best(args, best, eval_index)
 
 
 def build_argparser():

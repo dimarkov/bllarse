@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from bllarse.analysis import thresholds
@@ -150,3 +151,58 @@ def test_early_stop_per_seed_is_per_run_not_on_the_mean_curve():
     stops = thresholds.early_stop_per_seed(curves)
     assert stops[137].step == 10
     assert stops[138].step == 100
+
+
+def test_truncation_comes_from_the_dump_not_from_the_curve_length(tmp_path):
+    """A single-dump run must not report as truncated just for being single.
+
+    Both probing scripts now keep only their argmin evaluation, so the old
+    inference -- "is the argmin the last row of the curve?" -- is trivially
+    True for every run. `tuning.budgets` raises the step budget until
+    at_last_step is false for >=90% of runs, so left uncorrected this would
+    reject every budget forever. The training loop records the answer instead,
+    since it is the only thing that knows how many evaluations there were.
+    """
+    from bllarse import evaldump
+    from bllarse.analysis.curves import run_curve
+    from bllarse.analysis.thresholds import early_stop
+
+    labels = np.zeros(64, dtype=np.int64)
+    logits = np.zeros((64, 2), dtype=np.float32)
+    logits[:, 0] = 4.0
+
+    for uid, at_last in (("converged", False), ("truncated", True)):
+        for split in ("val", "test"):
+            evaldump.write_dump(
+                tmp_path, "g", uid, 512, logits, labels,
+                arm="adamw_ce", split=split, logit_kind="softmax_logits",
+                seed=200, samples_seen=65536, at_last_eval=at_last,
+            )
+        stop = early_stop(run_curve(tmp_path, "g", uid), "val_nll")
+        assert stop.at_last_step is at_last, (
+            f"{uid}: at_last_step must come from the dump's at_last_eval, not "
+            f"from the curve having one row"
+        )
+
+
+def test_truncation_falls_back_to_the_curve_when_unrecorded(tmp_path):
+    """Dumps written before at_last_eval existed carry None, and multi-dump
+    curves are still read the old way -- so trajectory runs and archived dumps
+    keep working unchanged."""
+    from bllarse import evaldump
+    from bllarse.analysis.curves import run_curve
+    from bllarse.analysis.thresholds import early_stop
+
+    labels = np.zeros(64, dtype=np.int64)
+    for step, sharpness in ((1, 1.0), (2, 5.0), (3, 2.0)):
+        logits = np.zeros((64, 2), dtype=np.float32)
+        logits[:, 0] = sharpness
+        for split in ("val", "test"):
+            evaldump.write_dump(
+                tmp_path, "g", "old", step, logits, labels,
+                arm="adamw_ce", split=split, logit_kind="softmax_logits",
+                seed=200, samples_seen=step * 128,
+            )
+    stop = early_stop(run_curve(tmp_path, "g", "old"), "val_nll")
+    assert stop.step == 2
+    assert stop.at_last_step is False, "argmin at step 2 of 3 is not truncation"

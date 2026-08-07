@@ -276,3 +276,68 @@ def test_a_partly_failed_study_still_summarises(tmp_path):
     study.optimize(flaky, n_trials=3, catch=(Exception,))
     summary = worker.summarize_study(study)
     assert "2 completed" in summary
+
+
+def test_a_trial_records_where_its_val_nll_bottomed_out(monkeypatch, tmp_path):
+    """argmin_eval / total_evals / truncated, on the trial itself.
+
+    Tuning dumps are deleted once the objective is computed, so the journal is
+    the only thing that outlives a trial. Without these, `patience_stopped=False`
+    is ambiguous: it cannot distinguish a trial that converged and was cut from
+    one that was still improving when the budget ran out. Those two call for
+    opposite corrections -- lower the patience, or raise the budget -- so the
+    campaign has to be able to tell them apart after the fact.
+    """
+    import optuna
+
+    curve = [0.9, 0.5, 0.3, 0.4, 0.35]     # argmin at eval 3 of 5
+
+    def fake_evaluate(arm, config, **kw):
+        on_dump = kw["on_dump"]
+        for i, v in enumerate(curve, start=1):
+            on_dump(i, i * 10, i * 1000, {"val_nll": v})
+        return min(curve)
+
+    monkeypatch.setattr(worker.objective_mod, "evaluate", fake_evaluate)
+    study = optuna.create_study(direction="minimize")
+    study.optimize(
+        worker.make_objective(
+            "ibprobit", "dtd",
+            budgets={"dtd": {"steps": 30_000}},
+            dump_root=tmp_path, group_id="g",
+        ),
+        n_trials=1,
+    )
+    attrs = study.trials[0].user_attrs
+    assert attrs["argmin_eval"] == 3
+    assert attrs["total_evals"] == 5
+    assert attrs["truncated"] is False
+
+
+def test_a_trial_still_improving_at_its_budget_is_flagged_truncated(monkeypatch, tmp_path):
+    """The signal that the STEP BUDGET is too small rather than patience too
+    large. A monotonically improving curve never plateaus, so patience never
+    fires and the run simply hits its cap."""
+    import optuna
+
+    curve = [0.9, 0.7, 0.5, 0.3, 0.1]      # argmin is the last eval
+
+    def fake_evaluate(arm, config, **kw):
+        on_dump = kw["on_dump"]
+        for i, v in enumerate(curve, start=1):
+            on_dump(i, i * 10, i * 1000, {"val_nll": v})
+        return min(curve)
+
+    monkeypatch.setattr(worker.objective_mod, "evaluate", fake_evaluate)
+    study = optuna.create_study(direction="minimize")
+    study.optimize(
+        worker.make_objective(
+            "ibprobit", "dtd",
+            budgets={"dtd": {"steps": 30_000}},
+            dump_root=tmp_path, group_id="g",
+        ),
+        n_trials=1,
+    )
+    attrs = study.trials[0].user_attrs
+    assert attrs["argmin_eval"] == attrs["total_evals"] == 5
+    assert attrs["truncated"] is True

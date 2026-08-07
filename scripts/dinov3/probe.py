@@ -211,7 +211,7 @@ def _derive_quantum(n_train: int, batch_size: int) -> int:
     return cap if cap >= batch_size and cap % batch_size == 0 else batch_size
 
 
-def _write_best(args, best):
+def _write_best(args, best, last_eval_index):
     """Write the buffered argmin-val_nll evaluation. The run's ONLY disk write.
 
     Called from a `finally`, so it runs whether the loop finished its budget or
@@ -234,11 +234,18 @@ def _write_best(args, best):
             score=score,
             score_kind=None if score is None else "predictive_variance",
             eps_hat=best["eps_hat"],
+            # Recorded here because only this loop knows how many evaluations
+            # there were. A run writes one dump, so nothing downstream can tell
+            # a converged optimum from a budget that ran out -- which is the
+            # signal tuning.budgets uses to decide the budget is too small.
+            at_last_eval=best["eval_index"] == last_eval_index,
         )
     print(
         f"[probe] {args.uid}: best val_nll={best['val_nll']:.4f} at step "
-        f"{best['step']} (eval {best['eval_index']}, epoch {best['epoch']}, "
-        f"{best['samples_seen']} samples); wrote {len(best['splits'])} dumps",
+        f"{best['step']} (eval {best['eval_index']} of {last_eval_index}, "
+        f"epoch {best['epoch']}, {best['samples_seen']} samples)"
+        f"{' AT LAST EVAL -- truncated, not converged' if best['eval_index'] == last_eval_index else ''}"
+        f"; wrote {len(best['splits'])} dumps",
         flush=True,
     )
 
@@ -377,6 +384,7 @@ def main(args, on_dump=None):
         # early_stop` selects it and `tuning.objective.score_dumps` scores it --
         # so the rest was written and then deleted unread.
         best: dict[str, Any] | None = None
+        eval_index = 0
 
         # Hoisted: fancy indexing copies, and at up to 30,000 evaluations a
         # per-eval copy of the val block would cost more than the forward pass
@@ -488,7 +496,7 @@ def main(args, on_dump=None):
                     if on_dump is not None:
                         on_dump(eval_index, step, samples_seen, scalars)
         finally:
-            _write_best(args, best)
+            _write_best(args, best, eval_index)
 
 
 def build_argparser():
