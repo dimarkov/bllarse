@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "alternatives"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "dinov3"))
 
 import vit_classification as vc
 

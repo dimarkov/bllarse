@@ -216,7 +216,7 @@ def main(args, on_dump=None):
                         score=score[sp_idx], score_kind="predictive_variance",
                     )
                 # OOD at every eval step, not only the last -- see the matching
-                # note in scripts/alternatives/probe.py. A single endpoint dump
+                # note in scripts/dinov3/probe.py. A single endpoint dump
                 # forced Fig 2's detection metrics to be read at a step no arm
                 # was tuned at, and the arms drift from that step by very
                 # different amounts.

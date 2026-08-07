@@ -8,7 +8,7 @@ Dependencies:
     pip install equimo>=1.1.0
 
 Example usage:
-    python scripts/alternatives/vit_classification.py \
+    python scripts/dinov3/vit_classification.py \
         --model dinov3_small \
         --dataset cifar10 \
         --loss-fn IBProbit \
@@ -807,7 +807,7 @@ def build_argparser():
     parser.add_argument("--batch-size", type=int, nargs="+", default=[64], help="Batch size(s)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num-update-iters", type=int, nargs="+", default=[16], help="CAVI iterations per batch (IBProbit)")
-    # --- IBProbit head knobs (mirror scripts/alternatives/ood_evaluation.py) ---
+    # --- IBProbit head knobs (mirror scripts/dinov3/ood_evaluation.py) ---
     parser.add_argument("--px", action="store_true",
                         help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
     parser.add_argument("--no-learn-q", action="store_true",

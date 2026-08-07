@@ -1,6 +1,6 @@
 """Jitted micro-batch kernels and the gradient-accumulation step.
 
-Lifted out of scripts/alternatives/full_finetune_comparison.py so that script
+Lifted out of scripts/dinov3/full_finetune_comparison.py so that script
 and scripts/finetune/finetune_jax.py share ONE copy. These carry buffer-donation
 contracts tuned against a measured peak (commit cb81798, ~6 GiB off dinov3_huge)
 and the argument order of `_tree_add` is load-bearing -- a second copy that

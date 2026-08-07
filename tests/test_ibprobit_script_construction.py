@@ -1,8 +1,13 @@
-"""Guards the API contract between IBProbit and its three consuming scripts.
+"""Guards the API contract between IBProbit and its consuming scripts.
 
 726bc78 landed ood_evaluation.py, full_finetune_comparison.py and
 vit_classification.py on this branch without the IBProbit they call, and the
 suite did not notice. These assertions are cheap and would have.
+
+ood_evaluation.py has since been removed -- its OOD helpers were ported into
+full_finetune_comparison.py (see tests/test_full_finetune_ood.py) and its
+detection metrics are now produced from evaldump dumps by
+bllarse.analysis.curves -- so the contract now covers the two survivors.
 """
 import jax.numpy as jnp
 import jax.random as jr
@@ -12,10 +17,9 @@ from bllarse.losses.bayesian import IBProbit
 
 
 def _kwargs():
-    """The union of constructor kwargs the three scripts pass.
+    """The union of constructor kwargs the consuming scripts pass.
 
-    ood_evaluation supplies `px` at update() time rather than at construction;
-    everything else here is passed at construction by at least one of the three.
+    Every kwarg here is passed at construction by at least one of them.
     `alpha` must track the scripts' argparse default (currently 0.1) -- not the
     IBProbit constructor default -- because the scripts pass alpha=args.alpha
     explicitly and so bypass the constructor's own default entirely.
@@ -31,7 +35,7 @@ def test_scripts_kwargs_construct_a_head():
 
 
 def test_scripts_kwargs_survive_a_streaming_pass():
-    lf = IBProbit(16, 4, key=jr.key(0), **_kwargs()).reset_posterior()
+    lf = IBProbit(16, 4, key=jr.key(0), **_kwargs()).reset(jr.key(9))
     keys = jr.split(jr.key(1), 2)
     fts = jr.normal(keys[0], (24, 16))
     y = jr.randint(keys[1], (24,), 0, 4)
@@ -51,10 +55,13 @@ def test_predictive_variance_is_positive_and_per_input():
 
 
 def test_px_can_be_passed_at_update_time():
-    """ood_evaluation.py constructs without px and passes it per-update via
-    stream_train_ibprobit -> loss_fn.update(..., px=px). Guard that path too."""
+    """px is settable per-update, not only at construction: `update(..., px=px)`
+    overrides the constructor value. The now-removed ood_evaluation.py was the
+    caller that used this, but the override is public API and `_cavi_scan_px`
+    shares the plain fixed point exactly, so a solver chosen per-call stays a
+    solver choice. Guard the path so it does not rot unnoticed."""
     ctor = {k: v for k, v in _kwargs().items() if k != "px"}
-    lf = IBProbit(16, 4, key=jr.key(0), **ctor).reset_posterior()
+    lf = IBProbit(16, 4, key=jr.key(0), **ctor).reset(jr.key(9))
     keys = jr.split(jr.key(3), 2)
     fts = jr.normal(keys[0], (24, 16))
     y = jr.randint(keys[1], (24,), 0, 4)
@@ -74,10 +81,10 @@ def test_kwargs_alpha_matches_the_scripts_argparse_default():
     import importlib
     import sys
     from pathlib import Path
-    alt_dir = str(Path(__file__).resolve().parents[1] / "scripts" / "alternatives")
+    alt_dir = str(Path(__file__).resolve().parents[1] / "scripts" / "dinov3")
     sys.path.insert(0, alt_dir)
     try:
-        for mod in ("ood_evaluation", "full_finetune_comparison", "vit_classification"):
+        for mod in ("full_finetune_comparison", "vit_classification"):
             M = importlib.import_module(mod)
             p = M.build_argparser() if hasattr(M, "build_argparser") else M.get_parser()
             default = next(a.default for a in p._actions if a.dest == "alpha")

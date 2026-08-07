@@ -4,7 +4,7 @@ One arm per invocation (`--arm ce|ibprobit`), writing eval dumps on a log-spaced
 schedule so temperature scaling, Brier and OOD detection are all computed post
 hoc by the same code that scores the probing figures.
 
-This is NOT scripts/alternatives/full_finetune_comparison.py, which stays as the
+This is NOT scripts/dinov3/full_finetune_comparison.py, which stays as the
 IVON/EVON benchmarking harness with inline metrics. The two share their jitted
 kernels via bllarse.finetune.jax_steps.
 """
@@ -175,7 +175,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="CAVI iterations per macro batch (IBProbit arm).")
     p.add_argument("--bf16", action="store_true")
 
-    # --- IBProbit head knobs (mirror scripts/alternatives/ood_evaluation.py) ---
+    # --- IBProbit head knobs (mirror scripts/dinov3/ood_evaluation.py) ---
     # Copied VERBATIM (flag names, types, defaults, help text) from
     # full_finetune_comparison.build_argparser: probe_micro_batch_size ->
     # build_ibprobit reads all ten of these regardless of --arm, since the
@@ -278,7 +278,7 @@ def load_ood_sets(args, img_size):
     --ood-every-k-dumps 0 must never pay this preload cost (47,500 images).
     """
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "alternatives"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dinov3"))
     from precompute_ood_features import build_ood_registry, load_wnid_to_idx
 
     wnid_to_idx = load_wnid_to_idx()
@@ -449,7 +449,7 @@ def main(args, on_dump=None) -> None:
     # by the CPU-only test suite (and by --help), and equimo/datasets pull in
     # a lot of machinery neither needs.
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "alternatives"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dinov3"))
     from vit_classification import (
         DATASET_CONFIGS, EQUIMO_MODELS, IMAGENET_MEAN, IMAGENET_STD,
         get_pretrained_backbone,

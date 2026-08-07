@@ -12,7 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "alternatives"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "dinov3"))
 
 import full_finetune_comparison as ffc  # noqa: E402
 

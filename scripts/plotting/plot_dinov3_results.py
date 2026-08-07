@@ -3,10 +3,10 @@
 
 Usage:
     # Fetch from MLflow, save CSV, plot, and generate table:
-    python scripts/alternatives/plot_sweep2a_results.py
+    python scripts/dinov3/plot_sweep2a_results.py
 
     # Re-plot from cached CSV:
-    python scripts/alternatives/plot_sweep2a_results.py --plot-only --input sweep2a_results.csv
+    python scripts/dinov3/plot_sweep2a_results.py --plot-only --input sweep2a_results.csv
 """
 
 import argparse

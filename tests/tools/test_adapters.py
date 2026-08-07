@@ -65,7 +65,7 @@ def test_run_script_from_config_supports_build_configs(tmp_path, monkeypatch):
 def test_load_script_module_resolves_a_repo_relative_script():
     from bllarse.tools import adapters
 
-    module = adapters.load_script_module("scripts/alternatives/probe.py")
+    module = adapters.load_script_module("scripts/dinov3/probe.py")
     assert callable(module.main)
     assert callable(module.build_argparser)
 
@@ -73,7 +73,7 @@ def test_load_script_module_resolves_a_repo_relative_script():
 def test_parse_config_produces_the_same_namespace_as_the_cli():
     from bllarse.tools import adapters
 
-    module = adapters.load_script_module("scripts/alternatives/probe.py")
+    module = adapters.load_script_module("scripts/dinov3/probe.py")
     args = adapters.parse_config(module, {
         "model": "dinov3_huge", "dataset": "food101", "num_classes": 101,
         "learning_rate": 5e-3,

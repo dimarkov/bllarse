@@ -24,7 +24,7 @@ Both arms consume the identical shuffled data stream (same seed, same batch
 order) and share AdamW hyperparameters for the backbone.
 
 Example usage:
-    python scripts/alternatives/full_finetune_comparison.py \
+    python scripts/dinov3/full_finetune_comparison.py \
         --model dinov3_small --dataset imagenet1k \
         --batch-size 4096 --num-steps 500 --log-mlflow
 """
@@ -94,7 +94,7 @@ from precompute_ood_features import build_ood_registry, load_wnid_to_idx
 def build_ibprobit(args, embed_dim, num_classes, key, rho=1.0, batch_size=None):
     """Construct the IBProbit head from the exposed CLI knobs (Inverse-Wishart process
     noise Q, PX scan, eps-contamination mixture). Mirrors the construction in
-    scripts/alternatives/ood_evaluation.py so all three scripts share the same
+    scripts/dinov3/ood_evaluation.py so all three scripts share the same
     operating point. ``rho`` is the eps forgetting factor (callers pass 1 - B/N; the
     default 1.0 is fine for the throwaway batch-size probe)."""
     return IBProbit(
@@ -836,7 +836,7 @@ def build_argparser():
                         help="Run the backbone forward in bfloat16 (mixed precision: master "
                              "weights and optimizer stay float32, only saved activations "
                              "are bf16). Halves activation memory and speeds up matmuls.")
-    # --- IBProbit head knobs (mirror scripts/alternatives/ood_evaluation.py) ---
+    # --- IBProbit head knobs (mirror scripts/dinov3/ood_evaluation.py) ---
     parser.add_argument("--px", action="store_true",
                         help="parameter-expanded CAVI scan (collapses the slow scale mode; far fewer iters)")
     parser.add_argument("--no-learn-q", action="store_true",

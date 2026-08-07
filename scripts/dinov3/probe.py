@@ -379,7 +379,7 @@ def build_argparser():
 
     # --- IBProbit head knobs (arm=ibprobit only) ---
     # Flag names, types and defaults copied VERBATIM from
-    # scripts/alternatives/ood_evaluation.py and scripts/finetune/finetune_jax.py
+    # scripts/dinov3/ood_evaluation.py and scripts/finetune/finetune_jax.py
     # so all the IBProbit entry points share one operating point. Do not invent
     # defaults here.
     p.add_argument("--num-update-iters", type=int, default=128,

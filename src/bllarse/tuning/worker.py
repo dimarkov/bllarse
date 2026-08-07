@@ -179,7 +179,7 @@ def trial_config(
     if arm == "vbll":
         config.update(VBLL_FIXED)
     else:
-        # Both JAX arms run scripts/alternatives/probe.py and select the
+        # Both JAX arms run scripts/dinov3/probe.py and select the
         # training step with --arm, so the study's arm name IS the flag value.
         config["arm"] = arm
         if arm == "ibprobit":

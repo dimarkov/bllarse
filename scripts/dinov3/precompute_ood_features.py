@@ -15,10 +15,10 @@ frozen backbone and resolution as the in-distribution ImageNet-1k features
 uploaded to HF Hub.
 
 Usage:
-    python scripts/alternatives/precompute_ood_features.py
-    python scripts/alternatives/precompute_ood_features.py --model dinov3_huge
-    python scripts/alternatives/precompute_ood_features.py --ood-keys imagenet_r imagenet_a
-    python scripts/alternatives/precompute_ood_features.py --no-hf-cache  # local-only
+    python scripts/dinov3/precompute_ood_features.py
+    python scripts/dinov3/precompute_ood_features.py --model dinov3_huge
+    python scripts/dinov3/precompute_ood_features.py --ood-keys imagenet_r imagenet_a
+    python scripts/dinov3/precompute_ood_features.py --no-hf-cache  # local-only
 """
 
 import gc

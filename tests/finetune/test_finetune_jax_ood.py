@@ -27,7 +27,7 @@ import pytest
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "finetune"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "alternatives"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "dinov3"))
 
 import finetune_jax as fj  # noqa: E402
 
@@ -114,7 +114,7 @@ def _fake_prefetch_iterator(iterator, n_prefetch=2):
 
 
 def _install_fake_ood_registry(monkeypatch, sizes, subset_labels):
-    """Stand in for scripts/alternatives/precompute_ood_features.
+    """Stand in for scripts/dinov3/precompute_ood_features.
 
     `sizes`: {name: n_images} -- also monkeypatched onto imagenet.OOD_SIZES so
     a correctly-sized fake does not spuriously look "short".

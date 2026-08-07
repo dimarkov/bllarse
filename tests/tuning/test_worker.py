@@ -35,7 +35,7 @@ def test_the_ibprobit_trial_config_reaches_probe_pys_cli():
     assert config["arm"] == "ibprobit"
     assert config["px"] is True
 
-    module = adapters.load_script_module("scripts/alternatives/probe.py")
+    module = adapters.load_script_module("scripts/dinov3/probe.py")
     args = adapters.parse_config(module, config)
     assert args.arm == "ibprobit"
     assert args.q_init == 3e-4

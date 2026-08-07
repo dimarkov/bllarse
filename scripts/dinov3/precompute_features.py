@@ -1,11 +1,11 @@
 """Precompute and cache ViT features for all model/dataset combinations.
 
 Usage:
-    python scripts/alternatives/precompute_features.py
-    python scripts/alternatives/precompute_features.py --models dinov3_small dinov3_big
-    python scripts/alternatives/precompute_features.py --datasets cifar10 oxford_pets
-    python scripts/alternatives/precompute_features.py --no-cache  # force recompute + re-upload
-    python scripts/alternatives/precompute_features.py --no-hf-cache  # local-only
+    python scripts/dinov3/precompute_features.py
+    python scripts/dinov3/precompute_features.py --models dinov3_small dinov3_big
+    python scripts/dinov3/precompute_features.py --datasets cifar10 oxford_pets
+    python scripts/dinov3/precompute_features.py --no-cache  # force recompute + re-upload
+    python scripts/dinov3/precompute_features.py --no-hf-cache  # local-only
 """
 
 import gc

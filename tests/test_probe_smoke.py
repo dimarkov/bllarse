@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-ALT = Path(__file__).resolve().parents[1] / "scripts" / "alternatives"
+ALT = Path(__file__).resolve().parents[1] / "scripts" / "dinov3"
 sys.path.insert(0, str(ALT))
 
 from bllarse import evaldump

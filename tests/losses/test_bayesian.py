@@ -202,7 +202,7 @@ def test_ibprobit_process_noise_prevents_collapse():
     assert float(epi.mean()) > 0.0
 
 
-def test_ibprobit_reset_posterior_restores_seed():
+def test_ibprobit_reset_restores_seed():
     key = jr.PRNGKey(0)
     D, C, N = 8, 4, 64
     d = D + 1
@@ -211,10 +211,33 @@ def test_ibprobit_reset_posterior_restores_seed():
     updated = m.update(x, y, num_iters=8)
     assert updated.posterior_ready is True
 
-    cleared = updated.reset_posterior()
+    cleared = updated.reset(jr.PRNGKey(3))
     assert cleared.posterior_ready is False
     assert jnp.allclose(cleared.mu, jnp.zeros((d, C)))     # seed mu = 0
     assert jnp.allclose(cleared.Sigma, jnp.eye(d))         # seed Sigma = I
+
+
+def test_ibprobit_reset_clears_every_recursive_field():
+    """The reason `reset_posterior` was folded into `reset`: two near-identical resets
+    let a state field be added to one and forgotten in the other, and a head carrying
+    stale state into a fresh pass still trains and still scores -- it just silently
+    starts from the previous pass's posterior. Enumerate the recursive state so a new
+    field has to be handled here rather than discovered in a run."""
+    D, C, N = 8, 4, 64
+    m = IBProbit(D, C, key=jr.PRNGKey(0), q_init=1.0 / D, eps_init=0.02)
+    x = jr.normal(jr.PRNGKey(1), (N, D)); y = jr.randint(jr.PRNGKey(2), (N,), 0, C)
+
+    updated = m.update(x, y, num_iters=8)
+    updated = updated.calibrate(x, y, num_iters=4)     # moves beta off its seed
+    fresh = updated.reset(jr.PRNGKey(3))
+    seed = IBProbit(D, C, key=jr.PRNGKey(0), q_init=1.0 / D, eps_init=0.02)
+
+    for field in ("mu", "Sigma", "step", "eps_alpha", "eps_beta",
+                  "Psi", "nu", "p_a", "p_b", "beta"):
+        assert jnp.allclose(getattr(fresh, field), getattr(seed, field)), (
+            f"{field} survived reset(): it is recursive state the reset does not clear"
+        )
+    assert fresh.posterior_ready is False
 
 
 def test_ibprobit_loss_type_is_instance_field_not_call_arg():
@@ -459,14 +482,14 @@ def test_ibprobit_eps_forgetting_bounds_effective_sample_size():
 
 
 def test_ibprobit_eps_reset_restores_prior():
-    """reset_posterior restores the Beta counts to the prior seed (the contamination estimate
+    """reset restores the Beta counts to the prior seed (the contamination estimate
     restarts alongside the wiped posterior)."""
     D, C, N = 6, 4, 200
     x, y = _near_separable(D, C, N)
     m = IBProbit(D, C, key=jr.PRNGKey(0), q_init=1.0 / D, eps_init=0.01)
     m1 = m.update(x, y, num_iters=8)
     assert not jnp.allclose(m1.eps_beta, m.eps_beta)          # counts moved
-    m2 = m1.reset_posterior()
+    m2 = m1.reset(jr.PRNGKey(9))
     assert float(m2.eps_alpha) == 1.0 and float(m2.eps_beta) == 100.0
     assert jnp.allclose(m2.mu, 0.0)                           # posterior wiped too
 

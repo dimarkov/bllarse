@@ -72,4 +72,4 @@ def create_configs():
 
 
 def run(config):
-    run_script_from_config("scripts/alternatives/probe.py", config)
+    run_script_from_config("scripts/dinov3/probe.py", config)

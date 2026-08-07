@@ -226,30 +226,21 @@ class IBProbit(eqx.Module):
         """Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init)."""
         return 1.0, (1.0 / self.eps_init if self.eps_init > 0.0 else 100.0)
 
-    def reset_posterior(self) -> "IBProbit":
-        """Reset the recursive posterior to the seed state (mu = 0, Sigma = I, Beta counts
-        back to the prior), used before a fresh online pass over data."""
-        d, nc = self.mu.shape
-        a0, b0 = self._eps_seed()
-        Psi0, nu0 = self._q_seed()
-        pa0, pb0 = self._pc_seed()
-        return eqx.tree_at(
-            lambda m: (m.mu, m.Sigma, m.step, m.posterior_ready, m.eps_alpha, m.eps_beta,
-                       m.Psi, m.nu, m.p_a, m.p_b),
-            self,
-            (jnp.zeros((d, nc), dtype=jnp.float32),
-             jnp.eye(d, dtype=jnp.float32),
-             jnp.zeros((), dtype=jnp.int32),
-             False,
-             jnp.asarray(a0, dtype=jnp.float32),
-             jnp.asarray(b0, dtype=jnp.float32),
-             Psi0, nu0, pa0, pb0)
-        )
-
     def reset(self, key: PRNGKey) -> "IBProbit":
         """Re-initialize to defaults (mu = 0, Sigma = I seed, the Inverse-Wishart prior on
         Q, and both Beta count pairs back to their priors) and clear the posterior.
-        Signature kept for `bllarse.utils` / tests; ``key`` unused."""
+
+        This is the ONLY reset. It previously had a twin, `reset_posterior()`, whose body
+        was identical but for leaving `beta` -- the `calibrate()` temperature -- in place.
+        Nothing needed that distinction once its single caller (the old
+        `scripts/dinov3/ood_evaluation.py`) was removed, and two near-identical
+        resets is exactly the shape a state field gets forgotten in: adding a field to one
+        and not the other leaks state across passes silently, since a stale posterior still
+        trains and still scores.
+
+        ``key`` is unused and kept only for the signature: `bllarse.utils` calls
+        `.reset(key)` polymorphically across the loss heads, and the PolyaGamma siblings
+        genuinely resample from it."""
         d, num_classes = self.mu.shape
         a0, b0 = self._eps_seed()
         Psi0, nu0 = self._q_seed()

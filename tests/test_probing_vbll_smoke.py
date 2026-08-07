@@ -104,7 +104,7 @@ def test_hf_repo_flag_threads_through_every_load_cached_features_call(
 ):
     """Cross-cutting fix: probing_vbll.py must expose --hf-repo/--no-hf-cache
     and thread hf_repo through the train, eval, and OOD load_cached_features
-    call sites -- matching scripts/alternatives/probe.py. Before this fix, the
+    call sites -- matching scripts/dinov3/probe.py. Before this fix, the
     VBLL arm had no way to fetch features from the Hub at all, so any cluster
     node without a pre-staged .cache/features would fail with
     FileNotFoundError on every VBLL task while the JAX arm succeeded."""

@@ -18,7 +18,7 @@ import jax.random as jr
 import optax
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "alternatives"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "dinov3"))
 
 import full_finetune_comparison as ffc  # noqa: E402
 from blrax.utils import noisy_value_and_grad  # noqa: E402

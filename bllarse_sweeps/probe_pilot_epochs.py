@@ -38,7 +38,7 @@ PILOT_SEED = 200  # a tuning seed, never a reported one
 LEARNING_RATES = [1e-3, 3e-2]  # the extremes of the tuning range
 
 SCRIPTS = {
-    "adamw_ce": "scripts/alternatives/probe.py",
+    "adamw_ce": "scripts/dinov3/probe.py",
     "vbll": "scripts/vbll_pytorch/probing_vbll.py",
 }
 

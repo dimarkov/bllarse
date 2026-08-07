@@ -42,7 +42,7 @@ import equinox as eqx
 import optax
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "finetune"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "alternatives"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "dinov3"))
 
 import finetune_jax as fj  # noqa: E402
 
@@ -152,7 +152,7 @@ def _install_fake_heavy_modules(monkeypatch, *, embed_dim, num_classes, img_size
     fake_vit.get_pretrained_backbone = get_pretrained_backbone
     # stream_micro_batches (I5) imports prefetch_iterator from
     # vit_classification -- duplicated here (same queue/thread technique as
-    # the real one in scripts/alternatives/vit_classification.py) so the fake
+    # the real one in scripts/dinov3/vit_classification.py) so the fake
     # module doesn't need the real, heavier one.
     fake_vit.prefetch_iterator = _fake_prefetch_iterator
 

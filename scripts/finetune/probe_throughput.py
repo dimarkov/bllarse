@@ -70,7 +70,7 @@ def main():
     args = build_argparser().parse_args()
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "alternatives"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dinov3"))
     from vit_classification import DATASET_CONFIGS
     from datasets import load_dataset
 

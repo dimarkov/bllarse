@@ -22,11 +22,11 @@ from bllarse.tools import adapters
 TUNING_SEEDS = (200, 201)
 
 SCRIPTS = {
-    "adamw_ce": "scripts/alternatives/probe.py",
+    "adamw_ce": "scripts/dinov3/probe.py",
     # Same script as adamw_ce: the two JAX arms share the feature loading, the
     # pinned split and the dump schedule, and differ only in the training step.
     # `--arm` selects between them.
-    "ibprobit": "scripts/alternatives/probe.py",
+    "ibprobit": "scripts/dinov3/probe.py",
     "vbll": "scripts/vbll_pytorch/probing_vbll.py",
 }
 

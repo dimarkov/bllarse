@@ -247,7 +247,7 @@ def test_eval_split_name_matches_dataset_configs():
     """The mapping above is a copy of vit_classification's DATASET_CONFIGS.
     Parse that file's test_split entries and assert the copy is still faithful,
     without importing it (it pulls in equimo/jax)."""
-    src = Path(__file__).resolve().parents[1] / "scripts/alternatives/vit_classification.py"
+    src = Path(__file__).resolve().parents[1] / "scripts/dinov3/vit_classification.py"
     text = src.read_text()
     body = text[text.index("DATASET_CONFIGS"):]
     entries = re.findall(r'^\s{4}"(\w+)":\s*\{', body, flags=re.M)

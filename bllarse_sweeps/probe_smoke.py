@@ -37,5 +37,5 @@ def create_configs():
 
 def run(config):
     script = ("scripts/vbll_pytorch/probing_vbll.py"
-              if "arm" not in config else "scripts/alternatives/probe.py")
+              if "arm" not in config else "scripts/dinov3/probe.py")
     run_script_from_config(script, config)
