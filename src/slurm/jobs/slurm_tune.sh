@@ -105,39 +105,44 @@ env_args=(
 [[ -n "${MLFLOW_TRACKING_PASSWORD:-}" ]] && env_args+=(--env "MLFLOW_TRACKING_PASSWORD=$MLFLOW_TRACKING_PASSWORD")
 [[ -n "${MLFLOW_PARENT_RUN_ID:-}" ]] && env_args+=(--env "MLFLOW_PARENT_RUN_ID=$MLFLOW_PARENT_RUN_ID")
 
-# --patience-factor 5.0, replacing `--patience 20`.
+# --patience 40 consecutive evaluations with no relative val_nll improvement.
 #
-# The old value was calibrated by replaying 28 pilot curves for the smallest
-# count of consecutive no-improvement DUMPS at which none stopped before its
-# argmin. That calibration was sound and the rule it produced was still inert:
-# a run has exactly 40 dumps, so a patience of 20 can only fire when the curve
-# turns in the first half of the grid. Measured over the first campaign's 133
-# completed trials it fired on 46, every one of them cifar10 or dtd, and could
-# not fire at all on the other five datasets -- whose argmins land at dumps
-# 26-37. Counting points on a bounded grid was the defect, not the threshold.
+# The count is meaningful now in a way it was not before. Evaluations are
+# uniformly spaced in SAMPLES (space.eval_quantum), so 40 of them is 40 x the
+# quantum, the same amount of training wherever in the run it lands. The old
+# `--patience 20` counted points on a GEOMETRIC grid bounded at 40, so it could
+# only fire when a curve turned in its first half: measured over the first
+# campaign's 133 completed trials it fired on 46, every one cifar10 or dtd, and
+# structurally never on the other five datasets.
 #
-# The replacement is multiplicative in SAMPLES: stop once samples_seen reaches
-# 5x the samples at which the best val_nll was set. Absolute thresholds were
-# measured and rejected first -- the argmin sits at 43k samples on cifar10 and
-# 9.0M on stanford_cars, so the smallest globally safe absolute value is 15M,
-# which is 350x past cifar10's optimum. The multiplicative form is scale-free:
-# the largest per-curve ratio between consecutive improvements is 1.30-4.88
-# across all seven datasets, and 5.0 cuts none of the 170 measured curves short
-# of its argmin.
+# 40 is a starting value, NOT a derived one, and deliberately so. Two attempts
+# to derive a threshold from the previous campaign's curves both failed, and
+# both failed by generalising from too little: an absolute sample threshold
+# cannot serve datasets whose optima span 43k (cifar10) to 9.0M (stanford_cars)
+# samples, and a multiplicative factor calibrated on ibprobit alone -- where it
+# cut 0 of 113 curves short -- cut 125 of 1,214 once adamw_ce and vbll were
+# measured too. The quantity cannot be known before the results exist.
 #
-# Same warning as before, for the same reason: a trial stopped before its
-# argmin is scored at the wrong point and changes what the campaign selects. Do
-# not lower this to save time without re-running the replay. Re-derive it from
-# the sample-spaced curves this protocol now produces, NOT from the numbers
-# above -- those were measured on the geometric grid, where every observed
-# ratio is an exact power of its 1.3026 spacing and therefore a quantised lower
-# bound. Calibrating against a grid artifact is how `--patience 20` happened.
+# 40 also clears the arithmetic ceiling that a larger count would hit. The
+# evaluation count per run is `steps * batch / quantum`, so it scales with
+# batch: at batch 64 a cifar10/cifar100/food101 run has only ~118 evaluations
+# (against 30,000 at the top of the ladder). A patience of 100 could fire
+# there only if the argmin landed by eval 18 -- the same bounded-grid defect
+# as --patience 20 on 40 dumps. At 40 it fires whenever the argmin is at eval
+# 78 or earlier. The count is only fully batch-invariant once the budget is
+# denominated in samples rather than steps; that is not done here.
+#
+# So: run it, then read what actually happened off the trials' own
+# `patience_stopped` and `patience_stopped_at_eval` attributes, and adjust. The
+# risk to watch for is unchanged -- a trial stopped before its own val_nll
+# argmin is scored at the wrong point, which changes which hyperparameters the
+# campaign selects.
 worker_args=(
   --arm "$BLLARSE_TUNE_ARM"
   --dataset "$BLLARSE_TUNE_DATASET"
   --n-trials "$BLLARSE_TUNE_TRIALS"
   --storage-dir "$storage_dir"
-  --patience-factor "${BLLARSE_TUNE_PATIENCE_FACTOR:-5.0}"
+  --patience "${BLLARSE_TUNE_PATIENCE:-40}"
   --cache-dir "$cache_dir"
 )
 # Optional, and unset reproduces the first campaign's unsuffixed study names.

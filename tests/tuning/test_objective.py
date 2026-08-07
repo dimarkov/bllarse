@@ -240,7 +240,7 @@ def test_a_plateaued_run_stops_early_and_scores_what_was_dumped(tmp_path, monkey
 
     value = objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-        patience_samples=3 * FAKE_BATCH, warmup_samples=2 * FAKE_BATCH, keep_dumps=True,
+        patience=3, warmup_evals=2, keep_dumps=True,
     )
 
     uids = [f"trial0_seed{seed}" for seed in objective.TUNING_SEEDS]
@@ -266,7 +266,7 @@ def test_patience_does_not_fire_before_the_warmup_threshold(tmp_path, monkeypatc
 
     objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-        patience_samples=2 * FAKE_BATCH, warmup_samples=10 * FAKE_BATCH, keep_dumps=True,
+        patience=2, warmup_evals=10, keep_dumps=True,
     )
 
     uids = [f"trial0_seed{seed}" for seed in objective.TUNING_SEEDS]
@@ -296,7 +296,7 @@ def test_patience_applies_to_the_second_seed_too(tmp_path, monkeypatch):
     objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
         on_dump=lambda i, step, samples, scalars: None,
-        patience_samples=3 * FAKE_BATCH, warmup_samples=2 * FAKE_BATCH, keep_dumps=True,
+        patience=3, warmup_evals=2, keep_dumps=True,
         on_converged=lambda seed, eval_index, step: converged.append(seed),
     )
 
@@ -321,7 +321,7 @@ def test_patience_none_leaves_evaluate_byte_for_byte_unchanged(tmp_path, monkeyp
     objective.evaluate(
         "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
         on_dump=lambda i, step, samples, scalars: calls.append((i, step)),
-        patience_samples=None, keep_dumps=True,
+        patience=None, keep_dumps=True,
     )
 
     assert calls == [(i, i) for i in range(1, len(profile) + 1)], (
@@ -354,8 +354,7 @@ def test_an_on_dump_exception_still_propagates_through_patience(tmp_path, monkey
     with pytest.raises(FakePrune):
         objective.evaluate(
             "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-            on_dump=pruning_on_dump, patience_samples=2 * FAKE_BATCH,
-            warmup_samples=1 * FAKE_BATCH,
+            on_dump=pruning_on_dump, patience=2, warmup_evals=1,
         )
 
     # The try/finally cleanup must still have run despite the exception.
@@ -457,22 +456,20 @@ def test_the_best_dump_is_written_even_when_patience_stops_the_run(tmp_path):
     )
 
 
-def test_a_multiplicative_patience_fires_where_an_absolute_one_cannot(tmp_path, monkeypatch):
-    """The reason `patience_factor` exists alongside `patience_samples`.
+def test_patience_counts_evaluations_at_any_scale(tmp_path, monkeypatch):
+    """A count is meaningful because the evaluation grid is UNIFORM in samples.
 
-    The seven datasets put their val_nll optimum between 43k samples (cifar10)
-    and 9.0M (stanford_cars) -- a 209x spread -- so the smallest absolute
-    threshold that never cuts a curve short is 15M samples, which on cifar10 is
-    350x past the optimum and therefore no rule at all. A multiplicative
-    threshold is scale-free and fires at the same *relative* point on both.
+    N evaluations is always N x eval_quantum samples, so the same count cuts a
+    plateau wherever it sits in the run -- which a count on the old geometric
+    grid did not, and which is why `--patience 20` could only fire when a curve
+    turned in its first half.
 
-    Simulated here with two runs whose plateaus sit two decades apart in
-    samples: one absolute threshold cannot serve both, one factor does.
+    Two runs whose plateau begins at very different points, one threshold.
     """
-    early = [1.0, 2.0, 3.0] + [3.0] * 20      # plateaus at eval 3
+    early = [1.0, 2.0, 3.0] + [3.0] * 20        # plateaus at eval 3
     late = [1.0] * 20 + [2.0, 3.0] + [3.0] * 20  # improves late, then plateaus
 
-    for name, profile, scale in (("early", early, 1), ("late", late, 100)):
+    for name, profile in (("early", early), ("late", late)):
         root = tmp_path / name
         monkeypatch.setattr(
             objective.adapters, "load_script_module",
@@ -480,19 +477,19 @@ def test_a_multiplicative_patience_fires_where_an_absolute_one_cannot(tmp_path, 
         )
         objective.evaluate(
             "adamw_ce", {}, dump_root=root, group_id="t", uid="trial0",
-            patience_factor=2.0, warmup_samples=2 * FAKE_BATCH, keep_dumps=True,
+            patience=5, warmup_evals=2, keep_dumps=True,
         )
         n = _n_val_dumps(root, "t", "trial0_seed200")
         assert 0 < n < len(profile), (
-            f"{name}: a factor of 2 must cut a plateau at any scale, "
+            f"{name}: patience 5 must cut a plateau at either position, "
             f"but wrote {n} of {len(profile)}"
         )
 
 
 def test_patience_is_disabled_unless_a_threshold_is_given(tmp_path, monkeypatch):
-    """Both forms default to None. With neither set the callback must be the
-    caller's own hook untouched, so a run trains to its full budget -- the
-    behaviour any figure run depends on."""
+    """Defaults to None. Unset, the callback must be the caller's own hook
+    untouched, so a run trains to its full budget -- the behaviour any figure
+    run depends on."""
     root = tmp_path / "dumps"
     profile = [3.0] * 8
     monkeypatch.setattr(

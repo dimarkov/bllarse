@@ -204,17 +204,16 @@ def make_objective(
     budgets: Mapping[str, Mapping[str, int]],
     dump_root: Any,
     group_id: str,
-    patience_samples: int | None = None,
-    patience_factor: float | None = None,
-    warmup_samples: int = objective_mod.DEFAULT_WARMUP_SAMPLES,
+    patience: int | None = None,
+    warmup_evals: int = objective_mod.DEFAULT_WARMUP_EVALS,
     min_relative_improvement: float = objective_mod.DEFAULT_MIN_RELATIVE_IMPROVEMENT,
     **config_kw: Any,
 ) -> Callable[[optuna.Trial], float]:
     """The optuna objective closure for one study.
 
-    `patience_samples` is the search-only counterpart to MedianPruner: the
-    pruner kills trials that are LOSING, patience stops trials that have
-    FINISHED CONVERGING, so the step cap becomes a true maximum rather than a
+    `patience` is the search-only counterpart to MedianPruner: the pruner
+    kills trials that are LOSING, patience stops trials that have FINISHED
+    CONVERGING, so the step cap becomes a true maximum rather than a
     fixed price every trial pays. It applies to both tuning seeds -- unlike
     `on_dump`/pruning below, which is deliberately first-seed-only.
     """
@@ -255,9 +254,8 @@ def make_objective(
             group_id=group_id,
             uid=f"trial{trial.number:05d}",
             on_dump=on_dump,
-            patience_samples=patience_samples,
-            patience_factor=patience_factor,
-            warmup_samples=warmup_samples,
+            patience=patience,
+            warmup_evals=warmup_evals,
             min_relative_improvement=min_relative_improvement,
             on_converged=on_converged,
         )
@@ -299,26 +297,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mlflow-experiment", default="bllarse-probing-tuning")
     p.add_argument("--no-mlflow", action="store_true")
     p.add_argument(
-        "--patience-samples", type=int, default=None,
-        help="Samples without a relative val_nll improvement that stop a "
-             "trial's run early. In SAMPLES, not evaluations: a count of "
-             "evaluations is bounded by the grid, which is how the previous "
-             "--patience 20 came to be unfireable on five of seven datasets. "
-             "Default: disabled, i.e. every trial trains to the full step cap.",
+        "--patience", type=int, default=None,
+        help="Consecutive evaluations with no relative val_nll improvement "
+             "that stop a trial's run early. Evaluations are uniformly spaced "
+             "in samples (space.eval_quantum), so N of them is always the same "
+             "amount of training -- unlike the geometric dump grid this count "
+             "used to run on. Default: disabled.",
     )
     p.add_argument(
-        "--patience-factor", type=float, default=None,
-        help="Stop once samples_seen reaches this multiple of the samples "
-             "at which the best val_nll was set. Scale-free, and the form "
-             "that transfers across these datasets: the optimum sits at "
-             "43k samples on cifar10 and 9.0M on stanford_cars, so no "
-             "single absolute threshold serves both. Fires alongside "
-             "--patience-samples; whichever comes first wins.",
-    )
-    p.add_argument(
-        "--warmup-samples", type=int,
-        default=objective_mod.DEFAULT_WARMUP_SAMPLES,
-        help="Minimum samples seen before --patience-samples may fire.",
+        "--warmup-evals", type=int,
+        default=objective_mod.DEFAULT_WARMUP_EVALS,
+        help="Minimum evaluations seen before --patience may fire.",
     )
     p.add_argument(
         "--min-relative-improvement", type=float,
@@ -350,9 +339,8 @@ def main() -> None:
             budgets=budgets,
             dump_root=args.dump_root,
             group_id=group_id,
-            patience_samples=args.patience_samples,
-            patience_factor=args.patience_factor,
-            warmup_samples=args.warmup_samples,
+            patience=args.patience,
+            warmup_evals=args.warmup_evals,
             min_relative_improvement=args.min_relative_improvement,
             cache_dir=args.cache_dir,
             split_cache_dir=args.split_cache_dir,

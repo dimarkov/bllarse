@@ -72,33 +72,43 @@ def test_it_forwards_an_optional_campaign_suffix():
     assert "BLLARSE_TUNE_CAMPAIGN" not in required
 
 
-def test_it_passes_a_multiplicative_patience_by_default():
-    """5.0 is the smallest FACTOR at which none of the first campaign's 170
-    measured curves stops before its own val_nll argmin. A trial stopped before
-    its argmin is scored at the wrong point, which would change which
-    hyperparameters the campaign selects.
+def test_it_passes_a_patience_of_40_evaluations_by_default():
+    """40 consecutive evaluations with no relative val_nll improvement.
 
-    Multiplicative, not a count and not an absolute sample threshold. The count
-    form (`--patience 20`) was bounded by the 40-point grid and so could only
-    fire when a curve turned in its first half -- it fired on 46 of 133 trials,
-    all cifar10 or dtd, and structurally never on the other five datasets. The
-    absolute form cannot serve seven datasets whose argmins span 43k to 9.0M
-    samples with one number.
+    A COUNT, and it means something now only because the evaluation grid is
+    uniform in samples: 40 evaluations is 40 x eval_quantum, the same amount of
+    training wherever it lands. The identical flag on the old geometric,
+    40-point dump grid could only fire when a curve turned in its first half --
+    it fired on 46 of 133 trials, every one cifar10 or dtd, and structurally
+    never on the other five datasets.
+
+    40 rather than something larger because the evaluation count per run is
+    `steps * batch / quantum` and so scales with batch: at batch 64 a
+    cifar10/cifar100/food101 run has ~118 evaluations, where a patience of 100
+    could only fire if the argmin landed by eval 18 -- the same ceiling again.
+
+    It is a starting value, not a derived one. Deriving it from the previous
+    campaign failed twice, most recently a factor fitted on ibprobit (0 of 113
+    curves cut short) that cut 125 of 1,214 once the other two arms were
+    measured.
     """
     text = SCRIPT.read_text()
-    assert "--patience-factor" in text
-    assert "BLLARSE_TUNE_PATIENCE_FACTOR:-5.0" in text
-    # Scoped to the argument array, not the whole file: the comment above it
-    # quotes the retired `--patience 20` to explain why it was retired.
+    assert "--patience" in text
+    assert "BLLARSE_TUNE_PATIENCE:-40" in text
+    assert "--patience-factor" not in text, "the multiplicative form was retired"
+    # Scoped to the argument array, not the whole file: the comments quote the
+    # retired spellings to explain why they were retired.
     passed_flags = [
         line.strip().split()[0]
         for line in text.splitlines()
         if line.startswith("  --")
     ]
-    assert "--patience" not in passed_flags, (
-        "the count-denominated patience is gone; a stale flag would be "
-        "rejected by the worker's argparser at job start"
-    )
+    assert "--patience" in passed_flags
+    for retired in ("--patience-factor", "--patience-samples", "--warmup-samples"):
+        assert retired not in passed_flags, (
+            f"{retired} was removed from the worker's argparser; passing it "
+            f"would abort every task at job start"
+        )
 
 
 def test_it_disables_cuda_graph_command_buffers_for_the_jax_arm():
