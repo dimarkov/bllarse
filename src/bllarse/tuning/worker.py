@@ -189,11 +189,19 @@ def trial_config(
     if arm == "vbll":
         config.update(VBLL_FIXED)
     else:
-        # Both JAX arms run scripts/dinov3/probe.py and select the
-        # training step with --arm, so the study's arm name IS the flag value.
-        config["arm"] = arm
-        if arm == "ibprobit":
+        # The JAX arms run scripts/dinov3/probe.py and select the training step
+        # with --arm. The study arm name is NOT always the flag value:
+        # `ibprobit_noeps` is an ablation of the ibprobit head, not a third
+        # training step, and probe.py's argparser accepts only
+        # {adamw_ce, ibprobit} -- passing the study name through would abort
+        # every trial at argparse.
+        config["arm"] = "ibprobit" if arm.startswith("ibprobit") else arm
+        if arm.startswith("ibprobit"):
             config.update(IBPROBIT_FIXED)
+        if arm == "ibprobit_noeps":
+            # Pinned, not searched. `space.suggest` omits the eps axis for this
+            # arm, so nothing in `params` overwrites this.
+            config["eps_init"] = space.IBPROBIT_NOEPS_INIT
     return config
 
 

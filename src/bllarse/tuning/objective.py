@@ -28,6 +28,9 @@ SCRIPTS = {
     # pinned split and the dump schedule, and differ only in the training step.
     # `--arm` selects between them.
     "ibprobit": "scripts/dinov3/probe.py",
+    # The contamination ablation: same head, same script, eps_init pinned at
+    # space.IBPROBIT_NOEPS_INIT instead of searched.
+    "ibprobit_noeps": "scripts/dinov3/probe.py",
     "vbll": "scripts/vbll_pytorch/probing_vbll.py",
 }
 

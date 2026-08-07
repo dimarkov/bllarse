@@ -9,12 +9,26 @@ from bllarse.tuning import space, worker
 
 
 def test_study_names_are_unique_per_arm_and_dataset():
+    """Every (arm, dataset) must get its own journal. `open_study` passes
+    `load_if_exists=True`, so two pairs colliding on a name would silently
+    share one study and TPE would model two different search spaces at once.
+
+    Derived from ARMS rather than hardcoded: the count changed from 21 to 28
+    when `ibprobit_noeps` was added, and a literal here would have had to be
+    edited alongside -- which is exactly the kind of edit that gets made
+    without checking that the names are still actually distinct.
+    """
     names = {
         worker.study_name(arm, ds)
         for arm in space.ARMS
         for ds in space.DATASETS
     }
-    assert len(names) == 3 * len(space.DATASETS) == 21
+    assert len(names) == len(space.ARMS) * len(space.DATASETS)
+    # `ibprobit` is a prefix of `ibprobit_noeps`, so the two arms' names must
+    # still separate once the dataset is appended.
+    assert worker.study_name("ibprobit", "dtd") != worker.study_name(
+        "ibprobit_noeps", "dtd"
+    )
 
 
 def test_the_ibprobit_trial_config_reaches_probe_pys_cli():
@@ -341,3 +355,42 @@ def test_a_trial_still_improving_at_its_budget_is_flagged_truncated(monkeypatch,
     attrs = study.trials[0].user_attrs
     assert attrs["argmin_eval"] == attrs["total_evals"] == 5
     assert attrs["truncated"] is True
+
+
+def test_the_noeps_arm_runs_probe_with_arm_ibprobit_not_its_study_name():
+    """probe.py's argparser accepts only {adamw_ce, ibprobit}. `ibprobit_noeps`
+    is an ablation of the ibprobit head, not a third training step, so passing
+    the study's arm name through as --arm would abort every trial at argparse
+    -- and `study.optimize(catch=(Exception,))` would record each one as an
+    ordinary failed trial rather than a harness fault."""
+    budgets = {"dtd": {"steps": 30_000}}
+    cfg = worker.trial_config(
+        "ibprobit_noeps", "dtd",
+        params={"batch_size": 256, "q_init": 1e-3, "num_update_iters": 64},
+        budgets=budgets,
+    )
+    assert cfg["arm"] == "ibprobit"
+    assert cfg["eps_init"] == worker.space.IBPROBIT_NOEPS_INIT
+    # The rest of the ibprobit operating point must carry over unchanged, or
+    # the ablation is confounded with px/learn_q.
+    for k, v in worker.IBPROBIT_FIXED.items():
+        assert cfg[k] == v
+
+
+def test_the_free_eps_arm_keeps_its_sampled_eps():
+    """The pin must not leak onto the baseline arm."""
+    cfg = worker.trial_config(
+        "ibprobit", "dtd",
+        params={"batch_size": 256, "q_init": 1e-3, "eps_init": 5e-3,
+                "num_update_iters": 64},
+        budgets={"dtd": {"steps": 30_000}},
+    )
+    assert cfg["arm"] == "ibprobit"
+    assert cfg["eps_init"] == 5e-3
+
+
+def test_every_arm_has_a_training_script():
+    """ARMS and objective.SCRIPTS must agree: an arm in one and not the other
+    gives a worker that accepts --arm and then dies inside its first trial."""
+    from bllarse.tuning import objective
+    assert set(worker.space.ARMS) == set(objective.SCRIPTS)

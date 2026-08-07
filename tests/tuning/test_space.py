@@ -308,3 +308,45 @@ def test_eval_every_steps_rejects_an_off_ladder_batch():
     trials at indices that no longer mean the same thing."""
     with pytest.raises(ValueError, match="whole number"):
         space.eval_every_steps("cifar10", 100)
+
+
+def test_the_noeps_arm_drops_eps_from_the_search_rather_than_overriding_it():
+    """`ibprobit_noeps` pins eps_init; it must not also SAMPLE it.
+
+    A sampled axis that never reaches the training script would have TPE model
+    a dimension the runs do not have, and the study's own record of what it
+    searched would be a fiction. Everything else must match `ibprobit` exactly,
+    or the ablation measures the search space instead of the contamination
+    mixture.
+    """
+    free, pinned = _FakeTrial(), _FakeTrial()
+    a = space.suggest(free, "ibprobit", "dtd")
+    b = space.suggest(pinned, "ibprobit_noeps", "dtd")
+
+    assert "eps_init" in a and "eps_init" in free.floats
+    assert "eps_init" not in b and "eps_init" not in pinned.floats
+    assert set(a) - {"eps_init"} == set(b), (
+        "the two arms must differ in the eps axis and nothing else"
+    )
+    assert free.floats["q_init"] == pinned.floats["q_init"]
+    assert free.categoricals == pinned.categoricals
+
+
+def test_the_pinned_eps_is_not_zero_and_clears_the_heads_own_guard():
+    """0.0 does NOT disable the mixture. `IBProbit._eps_seed` reads
+
+        return 1.0, (1.0 / self.eps_init if self.eps_init > 0.0 else 100.0)
+
+    so zero falls through to b0 = 100 -- a Beta(1, 100) with mean 0.0099, the
+    MIDDLE of the searched box, measured to drift to 0.16 within 32 updates.
+    An ablation set to 0.0 would silently re-run the baseline.
+    """
+    assert space.IBPROBIT_NOEPS_INIT > 0.0
+    assert space.IBPROBIT_NOEPS_INIT < 1e-9, (
+        "must be far below the searched box's 1e-3 floor to make the mixture "
+        "floor numerically absent"
+    )
+
+
+def test_both_ibprobit_arms_are_registered():
+    assert "ibprobit" in space.ARMS and "ibprobit_noeps" in space.ARMS

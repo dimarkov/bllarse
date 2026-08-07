@@ -62,7 +62,24 @@ MAX_BATCH = 16_384
 # the search space stays inspectable without importing one, and pinned against
 # objective.SCRIPTS by a test: an arm added to one and not the other gives a
 # worker that accepts --arm and then dies inside its first trial.
-ARMS = ("adamw_ce", "vbll", "ibprobit")
+ARMS = ("adamw_ce", "vbll", "ibprobit", "ibprobit_noeps")
+
+# The contamination ablation. `ibprobit_noeps` is the same head and the same
+# training script; it differs only in that eps_init is PINNED here rather than
+# searched, so the mixture floor is numerically absent and the head is scored
+# on its own predictive alone.
+#
+# 1e-12, not 0.0. `IBProbit._eps_seed` reads
+#     return 1.0, (1.0 / self.eps_init if self.eps_init > 0.0 else 100.0)
+# so eps_init = 0.0 falls through its own guard to b0 = 100 -- a Beta(1, 100)
+# whose mean is 0.0099, i.e. the MIDDLE of the searched box, and measured to
+# drift to 0.16 within 32 updates. Zero is also structurally unreachable: the
+# recursion is `eps_alpha = a0 + rho*(eps_alpha - a0) + sum(1 - r)` with a0
+# pinned at 1.0, so eps > 0 always. 1e-12 gives b0 = 1e12, against which the
+# recursion's `+sum(r)` term (at most one batch) is entirely lost in float32 --
+# measured to hold eps at exactly 1e-12 over 32 updates on 10%-noisy labels,
+# with finite logits and NLL. 1e-16 behaves identically; 1e-12 keeps headroom.
+IBPROBIT_NOEPS_INIT = 1e-12
 
 # IBProbit's CAVI iteration counts. Categorical, not suggest_int: 192 is 1.5x128
 # rather than a doubling, so the ladder is not geometric and an integer range
@@ -153,7 +170,9 @@ def steps_per_epoch(dataset: str, batch_size: int) -> int:
     return N_TRAIN[dataset] // batch_size
 
 
-def _suggest_ibprobit(trial: Any, dataset: str) -> dict[str, Any]:
+def _suggest_ibprobit(
+    trial: Any, dataset: str, *, search_eps: bool = True
+) -> dict[str, Any]:
     """IBProbit's axes -- disjoint from the other two arms' except for the
     shared batch ladder.
 
@@ -193,7 +212,13 @@ def _suggest_ibprobit(trial: Any, dataset: str) -> dict[str, Any]:
         # Beta(1, 1/eps_init) prior mean on the contamination rate. A genuine
         # model knob: it sets how readily the head discounts a badly-predicted
         # point, and the datasets here span very different label-noise levels.
-        "eps_init": trial.suggest_float("eps_init", 1e-3, 1e-1, log=True),
+        # Absent on the ibprobit_noeps arm, where it is pinned to
+        # IBPROBIT_NOEPS_INIT instead. Dropped from the SEARCH rather than
+        # sampled-and-overridden: a sampled axis that does not reach the
+        # training script makes TPE model a dimension the runs do not have, and
+        # the study's own record of what it searched would be wrong.
+        **({"eps_init": trial.suggest_float("eps_init", 1e-3, 1e-1, log=True)}
+           if search_eps else {}),
         # A TPE axis rather than four separate studies: every dataset already
         # gets its own study, so K is held fixed within one and a tuned
         # iteration count that VARIES across datasets is itself the
@@ -219,8 +244,8 @@ def suggest(trial: Any, arm: str, dataset: str) -> dict[str, Any]:
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(ARMS)}")
 
-    if arm == "ibprobit":
-        return _suggest_ibprobit(trial, dataset)
+    if arm in ("ibprobit", "ibprobit_noeps"):
+        return _suggest_ibprobit(trial, dataset, search_eps=(arm == "ibprobit"))
 
     # Lower bound raised from 1e-4 to 1e-3 after the pilot: at lr=1e-4, every
     # dataset on both arms still had its val_nll minimum sitting at or within
