@@ -45,16 +45,16 @@ SEEDS = list(range(137, 147))
 # the first thing to re-tune under a wider box.
 TUNED = {
     "cifar10": dict(
-        batch_size=512, learning_rate=0.00724228445210743,
-        weight_decay=0.006513135447341547, epochs=310,
-        kl_ratio=0.0013508943032436627, prior_scale=881.3727566009832,
-        wishart_scale=0.10287922489622742,
+        batch_size=256, learning_rate=0.00485855327360665,
+        weight_decay=0.010999459744888555, kl_ratio=0.002248606747831535,
+        prior_scale=806.1389096047113, wishart_scale=0.037175448221093595,
+        epochs=154
     ),
     "cifar100": dict(
-        batch_size=8192, learning_rate=0.008168136015387205,
-        weight_decay=0.0014989986935613508, epochs=5000,
-        kl_ratio=0.0025029432051600136, prior_scale=18.409135270999073,
-        wishart_scale=0.10300568219115977,
+        batch_size=512, learning_rate=0.006253432594518148,
+        weight_decay=0.09039853860172353, kl_ratio=6.625111879332074e-07,
+        prior_scale=0.12821306950802192, wishart_scale=0.0028061939766293254,
+        epochs=310
     ),
 }
 

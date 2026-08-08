@@ -33,31 +33,36 @@ SEEDS = list(range(137, 147))
 # dataset-dependent -- kl_ratio spans 2.3e-7 to 1.4e-4 across these five, and the
 # implied eta spans 9.1e-8 to 8.4e-3, all far below the textbook ELBO's eta = 1.
 TUNED = {
-    "oxford_pets": dict(batch_size=1024, learning_rate=0.021259684564184235,
-                        weight_decay=0.008158209386171941, epochs=10000,
-                        kl_ratio=6.4735824277955436e-06,
-                        prior_scale=0.4298669857164471,
-                        wishart_scale=2.737879517972118),
-    "food101": dict(batch_size=4096, learning_rate=0.010595072734930645,
-                    weight_decay=0.07900144106396743, epochs=1667,
-                    kl_ratio=2.2512894655707186e-07,
-                    prior_scale=411.05835707428395,
-                    wishart_scale=0.1590377899575667),
-    "flowers102": dict(batch_size=256, learning_rate=0.018170132266055055,
-                       weight_decay=0.005306021933757882, epochs=10000,
-                       kl_ratio=5.43962896641966e-07,
-                       prior_scale=0.16656790376525496,
-                       wishart_scale=0.08255546902844318),
-    "stanford_cars": dict(batch_size=1024, learning_rate=0.005651911780129438,
-                          weight_decay=0.07777972642213599, epochs=4286,
-                          kl_ratio=3.6319498187756327e-07,
-                          prior_scale=54.24415107235277,
-                          wishart_scale=0.18030325427989444),
-    "dtd": dict(batch_size=128, learning_rate=0.010010089218628395,
-                weight_decay=8.054055700615195e-05, epochs=1035,
-                kl_ratio=0.00013507277261844218,
-                prior_scale=62.32624360321586,
-                wishart_scale=0.03342071539821254),
+    "oxford_pets": dict(
+        batch_size=128, learning_rate=0.014582332608481552,
+        weight_decay=0.0029003502496597238, kl_ratio=1.3067604587856238e-06,
+        prior_scale=351.7862885242714, wishart_scale=0.12465977620739462,
+        epochs=1072
+    ),
+    "food101": dict(
+        batch_size=256, learning_rate=0.0017523056959308691,
+        weight_decay=0.0006983980274893595, kl_ratio=1.9699169406162906e-06,
+        prior_scale=1.9329868444045457, wishart_scale=0.13019640570783467,
+        epochs=102
+    ),
+    "flowers102": dict(
+        batch_size=64, learning_rate=0.027772152286249085,
+        weight_decay=3.569490434699052e-05, kl_ratio=6.581564108994321e-07,
+        prior_scale=0.14469407662365807, wishart_scale=0.09564180809225105,
+        epochs=2000
+    ),
+    "stanford_cars": dict(
+        batch_size=64, learning_rate=0.0015496634275213618,
+        weight_decay=0.0003441784909185116, kl_ratio=2.363217816602551e-07,
+        prior_scale=0.37977399310692955, wishart_scale=0.2037317330205334,
+        epochs=237
+    ),
+    "dtd": dict(
+        batch_size=64, learning_rate=0.011639615162990528,
+        weight_decay=0.0010661667809165759, kl_ratio=7.110021785552001e-05,
+        prior_scale=0.3666703835471811, wishart_scale=0.07576231746200533,
+        epochs=518
+    ),
 }
 
 BASE = dict(

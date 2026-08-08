@@ -24,7 +24,16 @@ import statistics as st
 
 from bllarse import evaldump, metrics
 
-GROUPS = {"adamw_ce": "probe_adamw_ce_fig1", "vbll": "probe_vbll_fig1"}
+# Four arms. `ibprobit_noeps` is the contamination ablation -- the same
+# IBProbit head with eps_init pinned at 1e-12 instead of tuned -- and it is a
+# separate arm here rather than a variant of `ibprobit` because the two were
+# tuned independently and land on different hyperparameters.
+GROUPS = {
+    "adamw_ce": "probe_adamw_ce_fig1",
+    "vbll": "probe_vbll_fig1",
+    "ibprobit": "probe_ibprobit_fig1",
+    "ibprobit_noeps": "probe_ibprobit_noeps_fig1",
+}
 UID_RE = re.compile(r"^(?P<model>dinov3_[a-z0-9]+)_(?P<dataset>.+)_seed(?P<seed>\d+)$")
 METRIC_KEYS = ("acc", "ece", "nll", "brier")
 

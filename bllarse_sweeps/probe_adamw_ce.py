@@ -45,7 +45,7 @@ DATASETS = {
 }
 SEEDS = list(range(137, 147))  # 10 seeds
 
-# tune_adamw_ce_<dataset>, best trial by val_nll. `epochs` expresses the
+# adamw_ce_<dataset>_samples40, best trial by val_nll. `epochs` expresses the
 # campaign's fixed 30,000-step budget at that trial's batch size -- it is a
 # restatement of the budget, not an independent knob, so epochs and batch_size
 # must be changed together or not at all.
@@ -56,16 +56,26 @@ SEEDS = list(range(137, 147))  # 10 seeds
 # that the paper's arguments centre on huge. It has to be stated in the paper
 # rather than buried -- the non-huge rungs are not independently tuned.
 TUNED = {
-    "oxford_pets": dict(batch_size=128, learning_rate=0.0022431794946575047,
-                        weight_decay=0.09213439181199469, epochs=1072),
-    "food101": dict(batch_size=512, learning_rate=0.00185267542687323,
-                    weight_decay=0.028923149962120948, epochs=205),
-    "flowers102": dict(batch_size=256, learning_rate=0.029852910202981524,
-                       weight_decay=0.05834095151443068, epochs=10000),
-    "stanford_cars": dict(batch_size=1024, learning_rate=0.0038738131845282697,
-                          weight_decay=0.09787226845735203, epochs=4286),
-    "dtd": dict(batch_size=64, learning_rate=0.006377989537373754,
-                weight_decay=0.01477022869531366, epochs=518),
+    "oxford_pets": dict(
+        batch_size=64, learning_rate=0.018152101741656677,
+        weight_decay=0.008278246675974297, epochs=527
+    ),
+    "food101": dict(
+        batch_size=512, learning_rate=0.002826281219835646,
+        weight_decay=7.725356544062722e-05, epochs=205
+    ),
+    "flowers102": dict(
+        batch_size=256, learning_rate=0.019652435709019516,
+        weight_decay=1.0092039298773214e-05, epochs=10000
+    ),
+    "stanford_cars": dict(
+        batch_size=64, learning_rate=0.0020402667218283985,
+        weight_decay=1.5563704047949982e-05, epochs=237
+    ),
+    "dtd": dict(
+        batch_size=64, learning_rate=0.0035828430208080723,
+        weight_decay=1.8311539230944342e-05, epochs=518
+    ),
 }
 
 BASE = dict(

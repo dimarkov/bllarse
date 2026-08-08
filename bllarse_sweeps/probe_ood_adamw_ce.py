@@ -5,7 +5,7 @@ Pairs: CIFAR-10 vs SVHN, CIFAR-100 vs SVHN (far-OOD), CIFAR-10 vs CIFAR-100
 and OOD in another. All at res224, so ID and OOD features share a space.
 
 Hyperparameters are per-ID-dataset, taken from the val_nll-optimal trial of the
-kl_ratio tuning campaign rather than shared defaults: batch size alone spans
+samples40 tuning campaign rather than shared defaults: batch size alone spans
 128-1024 between the two ID sets, so one BASE would put at least one of them far
 off its own optimum and the comparison against VBLL would measure the defaults.
 """
@@ -31,16 +31,16 @@ PAIRS = [
 ]
 SEEDS = list(range(137, 147))
 
-# tune_adamw_ce_<dataset>, best trial by val_nll. `epochs` carries the campaign's
+# adamw_ce_<dataset>_samples40, best trial by val_nll. `epochs` carries the campaign's
 # fixed 30,000-step budget at that trial's batch size; it is not a free knob.
 TUNED = {
     "cifar10": dict(
-        batch_size=128, learning_rate=0.002695247738500482,
-        weight_decay=0.056797889590319804, epochs=77,
+        batch_size=128, learning_rate=0.0034581670852852956,
+        weight_decay=0.09462300712138334, epochs=77
     ),
     "cifar100": dict(
-        batch_size=1024, learning_rate=0.001613199560423111,
-        weight_decay=0.00026682977362280785, epochs=625,
+        batch_size=256, learning_rate=0.0019153485721736003,
+        weight_decay=0.0004941138658043405, epochs=154
     ),
 }
 

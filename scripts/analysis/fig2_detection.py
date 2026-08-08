@@ -36,7 +36,16 @@ from bllarse.analysis import curves
 
 SHARED_SCORES = {"msp": metrics.msp_ood_score, "entropy": metrics.entropy_ood_score}
 RAW_SCORES = {"energy": metrics.energy_ood_score, "max_logit": metrics.max_logit_ood_score}
-GROUPS = {"adamw_ce": "probe_adamw_ce_fig2", "vbll": "probe_vbll_fig2"}
+# Four arms. `ibprobit_noeps` is the contamination ablation -- the same
+# IBProbit head with eps_init pinned at 1e-12 instead of tuned -- and it is a
+# separate arm here rather than a variant of `ibprobit` because the two were
+# tuned independently and land on different hyperparameters.
+GROUPS = {
+    "adamw_ce": "probe_adamw_ce_fig2",
+    "vbll": "probe_vbll_fig2",
+    "ibprobit": "probe_ibprobit_fig2",
+    "ibprobit_noeps": "probe_ibprobit_noeps_fig2",
+}
 # The model prefix is matched explicitly rather than with a lazy `.+?`: uids look
 # like dinov3_huge_cifar10_vs_svhn_seed137, and a lazy group takes "dinov3" and
 # leaves id="huge_cifar10", which mislabels every row without failing.
