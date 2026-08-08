@@ -48,12 +48,27 @@ from PIL import Image
 from jax import random as jr, config, vmap
 from datasets import load_dataset
 
+# equimo 1.1.1 moved the model package: `equimo.models` -> `equimo.vision.models`
+# (alongside new `audio`/`language`/`tabular` siblings). The DINOv3 factory
+# functions this file calls are unchanged in name and signature -- only the
+# import path moved -- so both layouts are accepted rather than pinning a
+# version. Newest first: on 1.1.1 the old path is simply absent, and on <=1.1.0
+# the new one is.
+#
+# Found the hard way: Raven's fine-tuning venv had been upgraded to 1.1.1, so
+# get_pretrained_backbone raised "equimo not installed" on a machine where
+# equimo was installed and importable -- the ImportError from the missing
+# SUBMODULE is indistinguishable here from the package being absent.
 try:
-    import equimo.models as equimo_models
+    import equimo.vision.models as equimo_models  # equimo >= 1.1.1
     NO_EQUIMO = False
 except ImportError:
-    NO_EQUIMO = True
-    warnings.warn("equimo not installed. Run: pip install equimo>=1.1.0")
+    try:
+        import equimo.models as equimo_models  # equimo <= 1.1.0
+        NO_EQUIMO = False
+    except ImportError:
+        NO_EQUIMO = True
+        warnings.warn("equimo not installed. Run: pip install equimo>=1.1.0")
 
 from bllarse.losses import IBProbit, CrossEntropy
 
