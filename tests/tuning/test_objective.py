@@ -555,3 +555,79 @@ def test_a_nonfinite_evaluation_still_counts_as_a_stall(tmp_path, monkeypatch):
     )
     for seed in objective.TUNING_SEEDS:
         assert _n_val_dumps(root, "t", f"trial0_seed{seed}") < len(profile)
+
+
+# --- seeds/scripts/score: the fine-tuning campaign shares this run loop ------
+
+
+def test_evaluate_runs_one_run_per_seed(tmp_path, monkeypatch):
+    """`seeds` controls how many runs a trial costs.
+
+    Fine-tuning uses ONE. Two is right for a 40-second probe; at ~6 hours a
+    trial it would double a ~880 A100-hour campaign.
+    """
+    seen = []
+
+    class FakeModule:
+        @staticmethod
+        def main(args, on_dump=None):
+            seen.append(args["seed"])
+
+    monkeypatch.setattr(
+        objective.adapters, "load_script_module", lambda path: FakeModule)
+    monkeypatch.setattr(objective.adapters, "parse_config", lambda mod, cfg: dict(cfg))
+
+    value = objective.evaluate(
+        "ce", {}, dump_root=tmp_path, group_id="g", uid="t",
+        seeds=(200,), scripts={"ce": "fake.py"},
+        score=lambda root, group, uids: float(len(uids)),
+    )
+    assert seen == [200]
+    assert value == 1.0
+
+
+def test_evaluate_defaults_reproduce_the_probing_behaviour(tmp_path, monkeypatch):
+    # Both probing seeds, in order, off the unmodified SCRIPTS table.
+    seen = []
+
+    class FakeModule:
+        @staticmethod
+        def main(args, on_dump=None):
+            seen.append(args["seed"])
+
+    monkeypatch.setattr(
+        objective.adapters, "load_script_module", lambda path: FakeModule)
+    monkeypatch.setattr(objective.adapters, "parse_config", lambda mod, cfg: dict(cfg))
+    monkeypatch.setattr(objective, "score_dumps", lambda *a: 0.0)
+
+    objective.evaluate(
+        "adamw_ce", {}, dump_root=tmp_path, group_id="g", uid="t",
+        score=lambda *a: 0.0,
+    )
+    assert seen == list(objective.TUNING_SEEDS)
+
+
+def test_evaluate_uses_the_supplied_script_table(tmp_path, monkeypatch):
+    # An arm valid in the fine-tuning table but absent from the probing one
+    # must be accepted, and vice versa -- otherwise the two campaigns' arm
+    # names would have to be kept globally unique.
+    loaded = []
+    monkeypatch.setattr(
+        objective.adapters, "load_script_module",
+        lambda path: loaded.append(path) or type("M", (), {
+            "main": staticmethod(lambda args, on_dump=None: None)}))
+    monkeypatch.setattr(objective.adapters, "parse_config", lambda mod, cfg: dict(cfg))
+
+    objective.evaluate(
+        "ce", {}, dump_root=tmp_path, group_id="g", uid="t",
+        seeds=(200,), scripts={"ce": "scripts/finetune/finetune_jax.py"},
+        score=lambda *a: 0.0,
+    )
+    assert loaded == ["scripts/finetune/finetune_jax.py"]
+
+    with pytest.raises(ValueError, match="unknown arm"):
+        objective.evaluate(
+            "adamw_ce", {}, dump_root=tmp_path, group_id="g", uid="t",
+            seeds=(200,), scripts={"ce": "scripts/finetune/finetune_jax.py"},
+            score=lambda *a: 0.0,
+        )

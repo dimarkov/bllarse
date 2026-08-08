@@ -162,14 +162,18 @@ def evaluate(
     warmup_evals: int = DEFAULT_WARMUP_EVALS,
     min_relative_improvement: float = DEFAULT_MIN_RELATIVE_IMPROVEMENT,
     on_converged: OnConverged | None = None,
+    seeds: Sequence[int] = TUNING_SEEDS,
+    scripts: Mapping[str, str] = SCRIPTS,
+    score: Callable[[Any, str, Sequence[str]], float] = score_dumps,
 ) -> float:
-    """Run `config` on both tuning seeds and return its objective value.
+    """Run `config` on every tuning seed and return its objective value.
 
     `on_dump` fires during the FIRST seed only. Pruning a hopeless config before
     its second seed is where most of the saving comes from, and reporting from
     both would push two different trajectories through one trial's step keys --
     MedianPruner compares trials at matching keys, so that would corrupt every
-    comparison it makes.
+    comparison it makes. (With a single seed, as fine-tuning uses, "first seed
+    only" is simply every seed.)
 
     `patience` is a separate concern from `on_dump` and, unlike it, applies to
     BOTH seeds: it stops a run once that many consecutive evaluations pass with
@@ -187,15 +191,34 @@ def evaluate(
 
     Dumps are removed unless `keep_dumps`: Stage 4 re-runs the winning config
     on the reported seeds, so nothing downstream reads a tuning run's dump.
-    """
-    if arm not in SCRIPTS:
-        raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(SCRIPTS)}")
 
-    module = adapters.load_script_module(SCRIPTS[arm])
-    uids = [f"{uid}_seed{seed}" for seed in TUNING_SEEDS]
+    `seeds`, `scripts` and `score` exist for the fine-tuning campaign, which
+    shares this run loop and differs from probing in all three. Every one
+    defaults to the probing value, so the probing call path is bit-identical.
+
+      * `seeds` -- fine-tuning runs ONE seed per trial. Two is right for a
+        40-second probe; at ~6 hours a trial it would double a ~880 A100-hour
+        campaign.
+      * `scripts` -- a different arm -> script table
+        (finetune_worker.SCRIPTS).
+      * `score` -- fine-tuning scores the minimum val_nll observed in the run's
+        own evaluation stream, not `early_stop(run_curve(...))`. That is forced
+        by evaluating val alone: `curves.run_curve` reads `test_record.meta`,
+        so it raises on a run with no test dump, and producing one would mean
+        forwarding 30k images at a step nothing can identify until the run is
+        over. The property this module's docstring cares about survives:
+        `early_stop(curve, "val_nll")` IS the argmin of val_nll over the finite
+        rows of the curve, and the evaluation stream is that curve -- the same
+        quantity, minus one fp16 dump round-trip.
+    """
+    if arm not in scripts:
+        raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(scripts)}")
+
+    module = adapters.load_script_module(scripts[arm])
+    uids = [f"{uid}_seed{seed}" for seed in seeds]
 
     try:
-        for index, (seed, run_uid) in enumerate(zip(TUNING_SEEDS, uids)):
+        for index, (seed, run_uid) in enumerate(zip(seeds, uids)):
             args = adapters.parse_config(module, {
                 **config,
                 "seed": seed,
@@ -218,7 +241,7 @@ def evaluate(
             except EarlyConvergence as converged:
                 if on_converged is not None:
                     on_converged(seed, converged.eval_index, converged.step)
-        return score_dumps(dump_root, group_id, uids)
+        return score(dump_root, group_id, uids)
     finally:
         if not keep_dumps:
             for run_uid in uids:
