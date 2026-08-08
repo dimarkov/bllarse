@@ -16,7 +16,7 @@ import finetune_jax as fj  # noqa: E402
 
 
 def _args(**overrides):
-    argv = ["--arm", "ce", "--batch-size", "1024"]
+    argv = ["--arm", "ce", "--batch-size", "1024", "--micro-batch-size", "256"]
     for key, value in overrides.items():
         flag = f"--{key.replace('_', '-')}"
         # store_true flags take no value; passing one is an argparse error.
@@ -67,38 +67,59 @@ def test_resolve_plan_derives_steps_from_the_effective_batch():
     assert plan["steps"] == 5_004
 
 
-def test_resolve_plan_uses_the_achieved_batch_not_the_request():
-    # accum_plan may not hit the target exactly; steps must follow what the run
-    # will actually do, or samples-seen on Fig 5's x-axis is wrong.
-    plan = fj.resolve_plan(_args(batch_size=4096), micro_batch=100)
-    assert plan["effective_batch"] == 4100
-    assert plan["steps"] == fj.protocol.steps_for_epochs(
-        fj.imagenet.IMAGENET_N_TRAIN, 4.0, 4100
-    )
+def test_resolve_plan_refuses_a_micro_batch_that_does_not_divide_the_target():
+    # This used to round -- 4096 over a micro batch of 100 became an effective
+    # batch of 4100 -- which silently mislabels samples-seen on Fig 5's x-axis.
+    # Design A8 pins the micro batch to a power of two no larger than the
+    # ladder's gcd precisely so this is always satisfiable.
+    with pytest.raises(ValueError, match="does not divide"):
+        fj.resolve_plan(_args(batch_size=4096), micro_batch=100)
 
 
-def test_resolve_plan_dump_schedule_spans_the_run():
-    plan = fj.resolve_plan(_args(batch_size=1024), micro_batch=64)
-    assert plan["dump_steps"][0] == 1
-    assert plan["dump_steps"][-1] == plan["steps"]
-    assert len(plan["dump_steps"]) == 24
+def test_resolve_plan_evaluates_on_a_uniform_sample_grid():
+    plan = fj.resolve_plan(_args(batch_size=1024, max_samples=2_000_000), micro_batch=256)
+    assert plan["eval_quantum"] == 16_384
+    assert plan["eval_every"] == 16
+    assert plan["steps"] == 1953
+    assert plan["n_evals"] == 122
 
 
-def test_resolve_plan_ood_steps_are_a_subset_of_dump_steps():
-    plan = fj.resolve_plan(_args(batch_size=1024), micro_batch=64)
-    assert set(plan["ood_steps"]).issubset(set(plan["dump_steps"].tolist()))
-    assert plan["ood_steps"][-1] == plan["steps"]
+def test_every_ladder_rung_gets_the_same_number_of_evaluations():
+    # The whole point of spacing evaluation in SAMPLES: eval index i is the
+    # same amount of training on every rung, so MedianPruner compares trials
+    # at matching data rather than matching steps. On the log-spaced step grid
+    # this replaces, index i on a batch-4096 trial had seen 16x the data of a
+    # batch-256 one and the pruner compared them anyway.
+    counts = {
+        batch: fj.resolve_plan(
+            _args(batch_size=batch, max_samples=2_000_000), micro_batch=256
+        )["n_evals"]
+        for batch in (256, 512, 1024, 2048, 4096)
+    }
+    assert set(counts.values()) == {122}, counts
 
 
-def test_resolve_plan_ood_disabled_yields_no_ood_steps():
+def test_resolve_plan_refuses_a_budget_shorter_than_one_evaluation():
+    # Without this the run trains to completion and writes nothing, which
+    # surfaces downstream as a missing run rather than a misconfiguration.
+    with pytest.raises(SystemExit, match="shorter than one evaluation"):
+        # 10 steps of 1024, but one evaluation is 16 steps.
+        fj.resolve_plan(
+            _args(batch_size=1024, max_samples=10_240), micro_batch=256
+        )
+
+
+def test_max_samples_overrides_the_epoch_cap():
+    # Tuning is capped in samples so the tuned batch size transfers; the final
+    # campaign is capped at 4 epochs. --max-samples selects the former.
     plan = fj.resolve_plan(
-        _args(batch_size=1024, ood_every_k_dumps=0), micro_batch=64
+        _args(batch_size=1024, epochs=4.0, max_samples=2_000_000), micro_batch=256
     )
-    assert len(plan["ood_steps"]) == 0
+    assert plan["steps"] == 1953  # not steps_for_epochs(...) == 5004
 
 
 def test_resolve_plan_accepts_a_fractional_epoch_for_tuning():
-    plan = fj.resolve_plan(_args(batch_size=1024, epochs=0.5), micro_batch=64)
+    plan = fj.resolve_plan(_args(batch_size=1024, epochs=0.5), micro_batch=256)
     assert plan["steps"] == 625
 
 
@@ -106,7 +127,7 @@ def test_head_lr_is_rejected_for_the_ibprobit_arm():
     # IBProbit runs no optimizer on its head -- optimizer.init sees the backbone
     # alone and the head is assimilated in closed form by loss_fn.update. A
     # head lr silently doing nothing would look like a tuned axis that isn't.
-    argv = ["--arm", "ibprobit", "--batch-size", "1024", "--head-lr", "1e-2"]
+    argv = ["--arm", "ibprobit", "--batch-size", "1024", "--micro-batch-size", "256", "--head-lr", "1e-2"]
     args = fj.build_argparser().parse_args(argv)
     with pytest.raises(SystemExit, match="head"):
         fj.check_arm_flags(args)
@@ -116,25 +137,20 @@ def test_head_lr_is_accepted_for_the_ce_arm():
     fj.check_arm_flags(_args(head_lr=1e-2))  # must not raise
 
 
-def test_micro_batch_size_is_required_for_the_ibprobit_arm():
-    # C1: the auto-probe path for --arm ibprobit builds an IBProbit head via
-    # build_ibprobit, which this branch's IBProbit constructor cannot accept
-    # (see check_micro_batch_required's docstring) -- so it must be required
-    # explicitly rather than silently probed into a TypeError.
-    args = fj.build_argparser().parse_args(["--arm", "ibprobit", "--batch-size", "1024"])
-    with pytest.raises(SystemExit, match="--micro-batch-size"):
-        fj.check_micro_batch_required(args)
+@pytest.mark.parametrize("arm", ["ce", "ibprobit"])
+def test_micro_batch_size_is_required_on_every_arm(arm):
+    # Design A8: the micro batch is measured once per arm and per GPU
+    # (scripts/finetune/probe_micro_batch.py) and pinned, so no arm auto-probes
+    # any more. That also removes the asymmetry where only --arm ibprobit had
+    # to pass it, which existed purely because the CE-only prober could not
+    # build an IBProbit head.
+    with pytest.raises(SystemExit):
+        fj.build_argparser().parse_args(["--arm", arm, "--batch-size", "1024"])
 
 
-def test_micro_batch_size_is_optional_for_the_ce_arm():
-    args = fj.build_argparser().parse_args(["--arm", "ce", "--batch-size", "1024"])
-    fj.check_micro_batch_required(args)  # must not raise
-
-
-def test_micro_batch_size_explicit_is_accepted_for_the_ibprobit_arm():
-    argv = ["--arm", "ibprobit", "--batch-size", "1024", "--micro-batch-size", "64"]
-    args = fj.build_argparser().parse_args(argv)
-    fj.check_micro_batch_required(args)  # must not raise
+def test_the_auto_probe_is_gone():
+    assert not hasattr(fj, "probe_micro_batch_size_ce")
+    assert not hasattr(fj, "check_micro_batch_required")
 
 
 def test_enable_mlflow_flags_were_removed():

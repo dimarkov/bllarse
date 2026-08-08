@@ -37,17 +37,61 @@ def test_steps_for_epochs_rejects_a_budget_yielding_no_steps():
         protocol.steps_for_epochs(1000, 0.001, 512)
 
 
+def test_steps_for_samples_matches_the_tuning_budget():
+    # 2,000,000 samples, drop-remainder, at each rung of the ladder.
+    at = protocol.steps_for_samples
+    assert at(protocol.MAX_SAMPLES, 256) == 7812
+    assert at(protocol.MAX_SAMPLES, 512) == 3906
+    assert at(protocol.MAX_SAMPLES, 1024) == 1953
+    assert at(protocol.MAX_SAMPLES, 2048) == 976
+    assert at(protocol.MAX_SAMPLES, 4096) == 488
+
+
+def test_steps_for_samples_rejects_a_budget_yielding_no_steps():
+    with pytest.raises(ValueError, match="zero steps"):
+        protocol.steps_for_samples(100, 512)
+
+
+def test_eval_every_steps_at_each_ladder_rung():
+    # EVAL_QUANTUM / batch. Integer at every rung because the ladder is powers
+    # of two and the quantum is 16,384.
+    assert protocol.eval_every_steps(256) == 64
+    assert protocol.eval_every_steps(512) == 32
+    assert protocol.eval_every_steps(1024) == 16
+    assert protocol.eval_every_steps(2048) == 8
+    assert protocol.eval_every_steps(4096) == 4
+
+
+def test_every_ladder_rung_yields_the_same_number_of_evaluations():
+    # THE property the sample-spaced grid exists for: eval index i means
+    # i * EVAL_QUANTUM samples for every trial in the study, so MedianPruner
+    # compares trials at matching amounts of data rather than matching steps.
+    counts = {
+        batch: protocol.steps_for_samples(protocol.MAX_SAMPLES, batch)
+        // protocol.eval_every_steps(batch)
+        for batch in (256, 512, 1024, 2048, 4096)
+    }
+    assert set(counts.values()) == {122}, counts
+
+
+def test_eval_every_steps_rejects_an_off_ladder_batch():
+    # Rounding here would hand back a grid whose samples_seen values differ per
+    # trial -- exactly the defect the quantum removes, but now invisible.
+    with pytest.raises(ValueError, match="whole number"):
+        protocol.eval_every_steps(768)
+
+
 def test_accum_plan_divides_evenly_when_it_can():
     assert protocol.accum_plan(4096, 64) == (64, 64, 4096)
 
 
-def test_accum_plan_reports_the_effective_batch_it_actually_achieves():
-    # 4096 / 100 rounds to 41 accumulation steps, so the effective batch is
-    # 4100, not 4096. Callers log the returned value, never the request --
-    # otherwise MLflow records a batch size the run did not use.
-    micro, num_accum, effective = protocol.accum_plan(4096, 100)
-    assert (micro, num_accum) == (100, 41)
-    assert effective == 4100
+def test_accum_plan_rejects_a_micro_batch_that_does_not_divide_the_target():
+    # Used to round: 4096 / 100 -> 41 accumulation steps -> an effective batch
+    # of 4100, not 4096. That silently mislabels every point of Fig 5's
+    # samples-seen axis, so a pinned micro-batch (design A8) must divide the
+    # target exactly or the plan is unrealisable.
+    with pytest.raises(ValueError, match="does not divide"):
+        protocol.accum_plan(4096, 100)
 
 
 def test_accum_plan_clamps_micro_to_the_target():
@@ -79,26 +123,11 @@ def test_shuffled_indices_differs_across_epochs_and_seeds():
     assert not np.array_equal(base, protocol.shuffled_indices(1000, seed=138, epoch=0))
 
 
-def test_dump_steps_spans_one_to_num_steps():
-    steps = protocol.dump_steps(5000)
-    assert len(steps) == protocol.DEFAULT_N_DUMPS
-    assert steps[0] == 1
-    assert steps[-1] == 5000
-    assert np.all(np.diff(steps) > 0)
-
-
-def test_ood_dump_steps_subsamples_and_always_keeps_the_last():
-    # With every_k=2 on 7 elements, the naive stride happens to include the last.
-    steps = np.array([1, 2, 4, 8, 16, 32, 64])
-    chosen = protocol.ood_dump_steps(steps, every_k=2)
-    assert np.array_equal(chosen, np.array([1, 4, 16, 64]))
-
-    # With every_k=4 on 7 elements, the naive stride misses the last (indices
-    # 0, 4 give elements [1, 16]), so the append logic must run.
-    chosen = protocol.ood_dump_steps(steps, every_k=4)
-    assert np.array_equal(chosen, np.array([1, 16, 64]))
-
-
-def test_ood_dump_steps_disabled_returns_empty():
-    steps = np.array([1, 2, 4])
-    assert len(protocol.ood_dump_steps(steps, every_k=0)) == 0
+def test_the_geometric_grid_is_gone():
+    # Design A2b: no geometric grid anywhere, fine-tuning or linear probing.
+    # A log-spaced grid cannot serve as a pruner key, a patience clock or an
+    # argmin search -- one "count" meant ~150 steps early and ~7,000 late --
+    # and it is now replaced by strides of the sample-spaced eval index. This
+    # asserts it cannot come back by accident.
+    assert not hasattr(protocol, "dump_steps")
+    assert not hasattr(protocol, "ood_dump_steps")

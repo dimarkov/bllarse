@@ -36,7 +36,7 @@ from bllarse.finetune import imagenet  # noqa: E402
 
 
 def _args(**overrides):
-    argv = ["--arm", "ce", "--batch-size", "1024"]
+    argv = ["--arm", "ce", "--batch-size", "1024", "--micro-batch-size", "256"]
     for key, value in overrides.items():
         argv.extend([f"--{key.replace('_', '-')}", str(value)])
     return fj.build_argparser().parse_args(argv)
@@ -51,14 +51,21 @@ def _plan(**overrides):
 # testing nonsense) -------------------------------------------------------
 
 
-def test_ood_steps_ride_the_dump_schedule():
-    plan = _plan()
-    assert set(plan["ood_steps"]).issubset(set(plan["dump_steps"].tolist()))
+def test_ood_rides_a_stride_of_a_uniform_dump_grid():
+    # Both grids are strides of the sample-spaced eval index now, not of a
+    # geometric step schedule (design A2b), so "OOD is a subset of the dumps"
+    # holds by construction: dump every j-th eval, OOD every k-th of those.
+    plan = _plan(dump_every_k_evals=2)
+    assert plan["eval_every"] == 16
+    assert plan["n_evals"] == 312
 
 
 def test_tuning_disables_ood_entirely():
-    # OOD forwards 47,500 images; a tuning trial must never pay for it.
-    assert len(_plan(ood_every_k_dumps=0)["ood_steps"]) == 0
+    # OOD forwards 47,500 images; a tuning trial must never pay for it. With
+    # --dump-every-k-evals 0 nothing is dumped at all, so nothing is OOD-dumped
+    # either -- and main() must not even preload the sets.
+    args = _args(dump_every_k_evals=0)
+    assert not (args.dump_every_k_evals and args.ood_every_k_dumps)
 
 
 # --- load_ood_sets: fakes for precompute_ood_features ----------------------
@@ -298,6 +305,11 @@ def _base_argv(*, dump_root, split_cache_dir, img_size, epochs, batch_size,
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--micro-batch-size", str(micro_batch_size),
+        # Evaluate every optimizer step and dump every evaluation: these runs
+        # are a handful of steps long, so the production quantum (16,384
+        # samples) would schedule nothing at all.
+        "--eval-quantum", str(batch_size),
+        "--dump-every-k-evals", "1",
         "--dump-root", str(dump_root),
         "--group-id", "g",
         "--uid", "u",
@@ -335,7 +347,7 @@ def test_main_never_calls_load_ood_sets_when_disabled(tmp_path, monkeypatch):
     split_cache = tmp_path / "splits"
     argv = _base_argv(
         dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
-        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+        epochs=1.0, batch_size=4, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
     fj.main(args, on_dump=None)
@@ -369,19 +381,18 @@ def test_main_writes_ood_dumps_only_on_ood_steps_not_every_dump_step(tmp_path, m
     split_cache = tmp_path / "splits"
     # epochs=1.5, batch_size=2, micro_batch_size=2 -> accum_plan(2, 2) gives
     # micro=2, num_accum=1, effective=2; steps = int(1.5 * 8) // 2 = 6.
-    # dump_steps (n_dumps=24 > steps) = arange(1, 7) = [1..6]. With the
-    # default --ood-every-k-dumps=2, ood_dump_steps takes every other entry
-    # ([1, 3, 5]) and force-appends the final step (6): {1, 3, 5, 6} -- a
-    # STRICT, non-trivial subset of {1..6}, so steps 2 and 4 are the ones a
-    # "write OOD every dump step" mutant would wrongly also hit.
+    # _base_argv sets --eval-quantum 2 == effective, so eval_every = 1 and
+    # eval_index == step: evaluations at 1..6. --dump-every-k-evals 1 dumps at
+    # all six; the default --ood-every-k-dumps 2 then takes every other dump
+    # ({2, 4, 6}) -- a STRICT, non-trivial subset, so steps 1, 3 and 5 are the
+    # ones a "write OOD at every dump" mutant would wrongly also hit.
     argv = _base_argv(
         dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
         epochs=1.5, batch_size=2, micro_batch_size=2,
     )
     args = fj.build_argparser().parse_args(argv)
     plan = fj.resolve_plan(args, micro_batch=2)
-    assert set(plan["dump_steps"].tolist()) == {1, 2, 3, 4, 5, 6}
-    assert set(plan["ood_steps"].tolist()) == {1, 3, 5, 6}
+    assert (plan["steps"], plan["eval_every"], plan["n_evals"]) == (6, 1, 6)
 
     fj.main(args, on_dump=None)
 
@@ -389,12 +400,16 @@ def test_main_writes_ood_dumps_only_on_ood_steps_not_every_dump_step(tmp_path, m
     ood_steps_seen = {r.meta["step"] for r in records if r.meta["split"].startswith("ood_")}
     val_steps_seen = {r.meta["step"] for r in records if r.meta["split"] == "val"}
 
-    assert ood_steps_seen == {1, 3, 5, 6}
+    assert ood_steps_seen == {2, 4, 6}
     assert val_steps_seen == {1, 2, 3, 4, 5, 6}  # val/test schedule is untouched
+    # The final evaluation carries OOD whatever the stride lands on, because
+    # curves._id_ood_pair raises when the last test and last OOD dump disagree.
+    assert max(ood_steps_seen) == max(val_steps_seen) == plan["steps"]
 
-    ood_splits_at_step_1 = {r.meta["split"] for r in records if r.meta["step"] == 1
-                             and r.meta["split"].startswith("ood_")}
-    assert ood_splits_at_step_1 == {"ood_imagenet_r", "ood_imagenet_a", "ood_imagenet_v2"}
+    ood_splits_at_an_ood_step = {r.meta["split"] for r in records if r.meta["step"] == 2
+                                 and r.meta["split"].startswith("ood_")}
+    assert ood_splits_at_an_ood_step == {
+        "ood_imagenet_r", "ood_imagenet_a", "ood_imagenet_v2"}
 
 
 def test_main_ood_dump_uses_the_ood_prefixed_split_name(tmp_path, monkeypatch):

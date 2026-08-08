@@ -1,8 +1,11 @@
 """Full-network fine-tuning of DINOv3 on ImageNet-1k -- JAX arms.
 
-One arm per invocation (`--arm ce|ibprobit`), writing eval dumps on a log-spaced
-schedule so temperature scaling, Brier and OOD detection are all computed post
-hoc by the same code that scores the probing figures.
+One arm per invocation (`--arm ce|ibprobit`). val_nll is evaluated every
+`--eval-quantum` SAMPLES -- uniformly, not on a log-spaced step grid -- so the
+eval index means the same amount of training at every rung of the batch ladder
+and is usable as a pruner key and a patience clock. Dumps are written in the
+same format the probing figures are scored from, so temperature scaling, Brier
+and OOD detection are all computed post hoc by that same code.
 
 This is NOT scripts/dinov3/full_finetune_comparison.py, which stays as the
 IVON/EVON benchmarking harness with inline metrics. The two share their jitted
@@ -11,6 +14,7 @@ kernels via bllarse.finetune.jax_steps.
 
 import argparse
 import gc
+import math
 import os
 import time
 from pathlib import Path
@@ -36,7 +40,7 @@ from bllarse.losses import CrossEntropy  # noqa: E402
 # cost for no benefit, so inheriting it must be impossible by accident.
 FINETUNE_IMG_SIZE = 224
 
-# fp16-safe mask sentinel for evaluate_and_dump's `subset` masking.
+# fp16-safe mask sentinel for evaluate_split's `subset` masking.
 # evaldump.write_dump stores logits as float16 (max finite magnitude 65504),
 # and float16(-1e9) OVERFLOWS to -inf: entropy_ood_score and fit_temperature
 # on such a row silently return NaN while msp_ood_score still looks healthy,
@@ -86,45 +90,90 @@ def check_arm_flags(args) -> None:
         )
 
 
-def check_micro_batch_required(args) -> None:
-    """The auto-probe is not wired for --arm ibprobit.
+def _write_best(args, best, last_eval_index):
+    """Write the buffered argmin-val_nll evaluation.
 
-    Omitting --micro-batch-size makes main() auto-probe the largest micro batch
-    that fits. Doing that for the ibprobit arm needs a real IBProbit head, and
-    this script has no ibprobit prober -- only probe_micro_batch_size_ce, which
-    never touches IBProbit at all. (full_finetune_comparison.py does have one,
-    probe_micro_batch_size; wiring an equivalent here is unfinished work, not a
-    blocked dependency: the constructor knobs it needs landed with the
-    process-noise merge.) Until then --arm ibprobit must pass
-    --micro-batch-size explicitly.
+    Called from a `finally`, so it runs whether the loop finished its budget or
+    was stopped by an EarlyConvergence raised out of `on_dump`. With patience
+    enabled that is the ORDINARY path, not an edge case: a converged trial
+    leaves `main` by exception, and a `_write_best` outside the `finally` would
+    silently produce no dump for exactly the trials that converged.
+
+    `best` is None only if not a single evaluation happened, which
+    `resolve_plan` already refuses -- so reaching it here means the loop died
+    before its first evaluation, and raising beats leaving an empty dump
+    directory that scores as a missing run.
     """
-    if args.arm == "ibprobit" and args.micro_batch_size is None:
-        raise SystemExit(
-            "[finetune] --micro-batch-size is required for --arm ibprobit: this "
-            "script has no auto-probe for that arm (only the ce one). Pass "
-            "--micro-batch-size explicitly."
+    if best is None:
+        raise ValueError(
+            f"{args.uid}: no evaluation ran, so there is no dump to write."
         )
+    for split_name, logits, labels in best["splits"]:
+        evaldump.write_dump(
+            args.dump_root, args.group_id, args.uid, best["step"],
+            logits, labels,
+            arm=args.arm, split=split_name, logit_kind="softmax_logits",
+            seed=args.seed, samples_seen=best["samples_seen"],
+            # Recorded here because only this loop knows how many evaluations
+            # there were. A run writes one dump, so nothing downstream can tell
+            # a converged optimum from a budget that ran out -- and those two
+            # call for opposite corrections to the campaign.
+            at_last_eval=best["eval_index"] == last_eval_index,
+        )
+    print(
+        f"[finetune] {args.uid}: best val_nll={best['val_nll']:.4f} at step "
+        f"{best['step']} (eval {best['eval_index']} of {last_eval_index}, "
+        f"{best['samples_seen']} samples)"
+        + (" AT LAST EVAL -- truncated, not converged"
+           if best["eval_index"] == last_eval_index else "")
+        + f"; wrote {len(best['splits'])} dumps",
+        flush=True,
+    )
 
 
 def resolve_plan(args, micro_batch: int) -> dict:
-    """Turn (target batch, micro batch, epoch cap) into the concrete schedule.
+    """Turn (target batch, micro batch, budget) into the concrete schedule.
 
     `steps` is derived from the ACHIEVED effective batch, not the requested one:
     Fig 5's x-axis is samples seen, so a plan built on a batch size the run does
-    not use would mislabel every point on it.
+    not use would mislabel every point on it. Since design A8 pins the micro
+    batch to a divisor of every ladder rung, `accum_plan` now guarantees the two
+    agree -- but the derivation stays on the achieved value, because the pinned
+    constant and the ladder are separately editable.
+
+    The budget is EITHER --max-samples (tuning) or --epochs (the final
+    campaign), never both: tuning is capped in samples so the tuned batch size
+    transfers, and the final run is capped at 4 epochs.
     """
     micro, num_accum, effective = protocol.accum_plan(args.batch_size, micro_batch)
-    steps = protocol.steps_for_epochs(
-        imagenet.IMAGENET_N_TRAIN, args.epochs, effective
-    )
-    schedule = protocol.dump_steps(steps, args.n_dumps)
+    if args.max_samples:
+        steps = protocol.steps_for_samples(args.max_samples, effective)
+    else:
+        steps = protocol.steps_for_epochs(
+            imagenet.IMAGENET_N_TRAIN, args.epochs, effective
+        )
+    eval_every = protocol.eval_every_steps(effective, args.eval_quantum)
+    n_evals = steps // eval_every
+    if n_evals < 1:
+        raise SystemExit(
+            f"[finetune] budget of {steps} steps at effective batch {effective} "
+            f"is shorter than one evaluation interval ({eval_every} steps = "
+            f"{args.eval_quantum} samples). The run would produce no dump."
+        )
     return {
         "micro": micro,
         "num_accum": num_accum,
         "effective_batch": effective,
         "steps": steps,
-        "dump_steps": schedule,
-        "ood_steps": protocol.ood_dump_steps(schedule, args.ood_every_k_dumps),
+        # Evaluation is scheduled on SAMPLES, not steps: `eval_quantum` samples
+        # pass between consecutive val_nll measurements no matter which rung of
+        # the ladder this run sits on, so eval index i is the same samples_seen
+        # for every trial in a study. That is what makes the index usable as a
+        # MedianPruner key and as a patience clock -- neither of which the
+        # log-spaced step grid this replaces could support.
+        "eval_every": eval_every,
+        "n_evals": n_evals,
+        "eval_quantum": args.eval_quantum,
     }
 
 
@@ -141,8 +190,16 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--epochs", type=float, default=4.0,
-        help="Epoch cap. Float so a tuning trial can ask for a fraction of a "
-             "pass; steps are derived from this and the effective batch.",
+        help="Epoch cap for the final campaign. Ignored when --max-samples is "
+             "given; steps are derived from this and the effective batch.",
+    )
+    p.add_argument(
+        "--max-samples", type=int, default=0,
+        help="Sample budget, overriding --epochs when nonzero. This is what "
+             "tuning uses (protocol.MAX_SAMPLES = 2,000,000): at a fixed STEP "
+             "budget samples_seen = steps * batch, so large batches would be "
+             "handed more data and the tuned batch size would not transfer to "
+             "the final run.",
     )
     p.add_argument(
         "--batch-size", type=int, required=True,
@@ -150,11 +207,14 @@ def build_argparser() -> argparse.ArgumentParser:
              "is the tuned quantity; --micro-batch-size is a memory artifact.",
     )
     p.add_argument(
-        "--micro-batch-size", type=int, default=None,
-        help="Per-forward batch. Omit to auto-probe the largest that fits.",
+        "--micro-batch-size", type=int, required=True,
+        help="Per-forward batch, a memory artifact absorbed by "
+             "num_accum = batch_size / micro_batch_size. REQUIRED and must "
+             "divide --batch-size exactly. Measure it once per arm and per GPU "
+             "with scripts/finetune/probe_micro_batch.py and pin the result "
+             "(design A8) -- the old per-run auto-probe made every trial pay "
+             "a doubling-until-OOM search whose answer never changed.",
     )
-    p.add_argument("--batch-size-init", type=int, default=32)
-    p.add_argument("--batch-size-max", type=int, default=8192)
 
     p.add_argument("--lr", type=float, default=1e-4, help="Trunk learning rate")
     p.add_argument(
@@ -199,11 +259,31 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Beta(1, 1/eps_init) prior on the contamination rate (mean ~ eps_init). "
                         "Forgetting rho = 1 - B/N set automatically.")
 
-    p.add_argument("--n-dumps", type=int, default=protocol.DEFAULT_N_DUMPS)
+    p.add_argument(
+        "--eval-quantum", type=int, default=protocol.EVAL_QUANTUM,
+        help="Samples between consecutive val_nll evaluations. Must be a whole "
+             "number of --batch-size steps, which every rung of the ladder "
+             "satisfies by construction.",
+    )
+    p.add_argument(
+        "--eval-splits", default="val+test", choices=["val", "val+test"],
+        help="Which pinned splits to forward at each evaluation. Tuning passes "
+             "`val`: the objective is val_nll alone, and forwarding the 30k "
+             "test partition 122 times would roughly double the campaign.",
+    )
+    p.add_argument(
+        "--dump-every-k-evals", type=int, default=0,
+        help="Write a full dump on every k-th evaluation, giving Fig 5 its "
+             "trajectory. 0 (the default, and what tuning uses) writes exactly "
+             "ONE dump per run: the buffered argmin-val_nll evaluation. At "
+             "1000 classes a val dump is 40 MB, so 122 of them would be 4.9 GB "
+             "per run.",
+    )
     p.add_argument(
         "--ood-every-k-dumps", type=int, default=2,
         help="Write OOD dumps on every k-th scheduled dump. 0 disables OOD "
-             "entirely, which is what tuning trials use.",
+             "entirely, which is what tuning trials use. Requires "
+             "--dump-every-k-evals, since it strides that grid.",
     )
     p.add_argument("--eval-chunk", type=int, default=256)
     p.add_argument("--val-fraction", type=float, default=imagenet.DEFAULT_VAL_FRACTION)
@@ -306,19 +386,23 @@ def load_ood_sets(args, img_size):
     return loaded
 
 
-def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
-                      split, step, samples_seen, args, mean, std, key,
-                      subset=None):
-    """Forward one preloaded eval set in chunks and write its dump.
+def evaluate_split(arm, backbone, head_or_loss, images_uint8, labels, *,
+                   args, mean, std, key, subset=None):
+    """Forward one preloaded eval set in chunks. Returns (logits, scalars).
 
-    Returns the scalar metrics so the caller can drive `on_dump`.
+    Deliberately does NOT write. Evaluation now happens every `eval_quantum`
+    samples -- 122 times in a tuning run -- while at most a stride of those
+    points is ever dumped, so computing and writing had to come apart. The
+    caller buffers the argmin's logits in memory and writes once, from
+    `_write_best`.
+
     Normalization happens per chunk (imagenet.normalize_chunk), so the float32
     expansion only ever covers `--eval-chunk` images at a time.
 
     `subset`, if given, restricts scoring to those class indices: every other
-    logit is driven to MASK_NEG before the dump is written and before metrics
-    are computed, so both share the same masked view (OOD evaluation over
-    ImageNet-R/-A, which cover only 200 of the 1000 classes).
+    logit is driven to MASK_NEG before metrics are computed, so a later dump
+    and the scalars reported here share the same masked view (OOD evaluation
+    over ImageNet-R/-A, which cover only 200 of the 1000 classes).
     """
     inference_bb = eqx.nn.inference_mode(backbone, True)
     chunks = []
@@ -340,22 +424,15 @@ def evaluate_and_dump(arm, backbone, head_or_loss, images_uint8, labels, *,
         keep[np.asarray(subset)] = True
         logits = np.where(keep, logits, MASK_NEG)
 
-    evaldump.write_dump(
-        args.dump_root, args.group_id, args.uid, step,
-        logits, labels,
-        arm=arm, split=split,
-        # "softmax_logits" on BOTH arms, and for IBProbit that is not a
-        # convenience: `IBProbit.__call__(with_logits=True)` returns
-        # `_mixture_logp`, which is normalized by construction --
-        # (1-eps)*1 + K*(eps/K) == 1 -- so softmaxing it is a no-op that
-        # recovers the mixture exactly. That is the same kind of array the VBLL
-        # arm dumps (log of its predictive) under the same label, and
-        # metrics.classification_metrics is correct on it. Labelling it
-        # "moderated_score" instead made run_curve refuse every IBProbit dump.
-        logit_kind="softmax_logits",
-        seed=args.seed, samples_seen=samples_seen,
-    )
-    return metrics.classification_metrics(logits, labels)
+    # Dumps carry logit_kind="softmax_logits" on BOTH arms, and for IBProbit
+    # that is not a convenience: `IBProbit.__call__(with_logits=True)` returns
+    # `_mixture_logp`, which is normalized by construction --
+    # (1-eps)*1 + K*(eps/K) == 1 -- so softmaxing it is a no-op that recovers
+    # the mixture exactly. That is the same kind of array the VBLL arm dumps
+    # (log of its predictive) under the same label, and
+    # metrics.classification_metrics is correct on it. Labelling it
+    # "moderated_score" instead made run_curve refuse every IBProbit dump.
+    return logits, metrics.classification_metrics(logits, labels)
 
 
 @eqx.filter_jit
@@ -371,71 +448,20 @@ def eval_logits_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
     return logits
 
 
-def probe_micro_batch_size_ce(backbone, args, embed_dim, num_classes, img_size,
-                              init_bs, max_bs, key):
-    """Double the micro-batch size until the CE micro-step OOMs; return the
-    last size that fits. This is the per-forward micro-batch -- the target
-    (effective) batch is reached by gradient accumulation over several of
-    these.
-
-    Modelled on full_finetune_comparison.probe_micro_batch_size (same
-    doubling structure, OOM-substring detection, per-attempt
-    jax.clear_caches()+gc.collect(), and "even the smallest does not fit"
-    RuntimeError), but built on jax_steps.ce_micro_grad with a throwaway
-    eqx.nn.Linear head and CrossEntropy loss instead of build_ibprobit --
-    so, unlike that function, this one never constructs an IBProbit head and
-    does not depend on its constructor at all. See check_micro_batch_required
-    for why the ibprobit arm cannot use this (or any) auto-probe yet.
-    """
-    bf16 = args.bf16
-    loss_fn = CrossEntropy(args.label_smooth, num_classes)
-    bs = init_bs
-    last_ok = None
-    while bs <= max_bs:
-        # Initialised before the try, same reasoning as the fix to
-        # full_finetune_comparison.probe_micro_batch_size: a `finally: del
-        # head` must never raise UnboundLocalError over a real exception.
-        head = None
-        try:
-            key, head_key = jr.split(key)
-            head = eqx.nn.Linear(embed_dim, num_classes, key=head_key)
-            images = jnp.zeros((bs, 3, img_size, img_size), dtype=jnp.float32)
-            labels = jnp.zeros((bs,), dtype=jnp.int32)
-            _, loss = jax_steps.ce_micro_grad(
-                (backbone, head), loss_fn, images, labels, key, bf16=bf16)
-            jax.block_until_ready(loss)
-            last_ok = bs
-            print(f"[finetune] probe micro_batch_size={bs} OK")
-        except Exception as e:
-            msg = str(e)
-            if "RESOURCE_EXHAUSTED" in msg or "out of memory" in msg.lower() or "OOM" in msg:
-                print(f"[finetune] probe micro_batch_size={bs} OOM, backing off")
-                break
-            raise
-        finally:
-            del head
-            jax.clear_caches()
-            gc.collect()
-        bs *= 2
-
-    if last_ok is None:
-        raise RuntimeError(f"Even micro_batch_size={init_bs} does not fit in memory.")
-    return last_ok
-
 
 def main(args, on_dump=None) -> None:
-    """Fine-tune one arm: gradient accumulation to the target batch, eval dumps
-    of both val and test on a log-spaced step schedule.
+    """Fine-tune one arm: gradient accumulation to the target batch, val_nll
+    evaluated every `--eval-quantum` samples.
 
-    `on_dump(dump_index, step, scalars)` matches the hook
-    bllarse.tuning.objective.evaluate passes, so the Phase 2 tuning campaign can
-    drive this script without a wrapper. Any exception `on_dump` raises (e.g.
-    objective.EarlyConvergence) propagates out of this loop uncaught -- the
-    caller is responsible for catching it.
+    `on_dump(eval_index, step, samples_seen, scalars)` matches the hook
+    bllarse.tuning.objective.evaluate passes, so the tuning campaign drives this
+    script without a wrapper. Any exception `on_dump` raises (e.g.
+    objective.EarlyConvergence, optuna.TrialPruned) propagates out of this loop
+    uncaught -- the caller is responsible for catching it. The buffered argmin
+    dump is still written on the way out, from a `finally`.
     """
     check_img_size(args)
     check_arm_flags(args)
-    check_micro_batch_required(args)
     if args.uid is None:
         # fig1_curves.UID_RE parses a uid as {model}_{dataset}_seed{seed}. A
         # uid of just {model}_{arm}_seed{seed} (e.g. dinov3_large_ce_seed137)
@@ -470,21 +496,11 @@ def main(args, on_dump=None) -> None:
 
     backbone = eqx.nn.inference_mode(get_pretrained_backbone(args.model, model_key), True)
 
-    micro = args.micro_batch_size
-    if micro is None:
-        # check_micro_batch_required (above) already refused --arm ibprobit
-        # with no --micro-batch-size, so reaching here means --arm ce: the
-        # local CE-only prober never constructs an IBProbit head.
-        key, probe_key = jr.split(key)
-        print("[finetune] probing maximal micro-batch size...")
-        micro = probe_micro_batch_size_ce(
-            backbone, args, embed_dim, num_classes, args.img_size,
-            args.batch_size_init, args.batch_size_max, probe_key,
-        )
-        print(f"[finetune] probed micro-batch size: {micro}")
-    plan = resolve_plan(args, micro)
+    plan = resolve_plan(args, args.micro_batch_size)
     print(f"[finetune] arm={args.arm} effective_batch={plan['effective_batch']} "
-          f"= {plan['num_accum']} x micro {plan['micro']}, steps={plan['steps']}")
+          f"= {plan['num_accum']} x micro {plan['micro']}, steps={plan['steps']}, "
+          f"eval every {plan['eval_every']} steps ({plan['eval_quantum']} "
+          f"samples) = {plan['n_evals']} evals")
 
     # Pinned val/test partition over the official validation split, preloaded
     # once as uint8 and normalized per chunk at eval time.
@@ -492,8 +508,14 @@ def main(args, on_dump=None) -> None:
         args.split_cache_dir, n=len(eval_split), val_fraction=args.val_fraction
     )
     eval_labels_all = np.asarray(eval_split[ds_config["label_key"]])
+    # `val` alone during tuning: the objective is val_nll, and forwarding the
+    # 30k test partition at all 122 evaluations would roughly double the
+    # campaign for a number nothing reads.
+    split_names = args.eval_splits.split("+")
     eval_sets = {}
     for name, idx in (("val", val_idx), ("test", test_idx)):
+        if name not in split_names:
+            continue
         eval_sets[name] = (
             imagenet.load_images_uint8(eval_split, ds_config["img_key"],
                                        args.img_size, idx),
@@ -501,11 +523,11 @@ def main(args, on_dump=None) -> None:
         )
         print(f"[finetune] preloaded {name}: {len(idx)} images")
 
-    # Guarded on len(...) rather than truthiness of --ood-every-k-dumps
-    # itself: ood_dump_steps is what actually decides whether any step is
-    # scheduled, and a tuning trial (--ood-every-k-dumps 0) must never pay
-    # the 47,500-image preload cost.
-    ood_sets = load_ood_sets(args, args.img_size) if len(plan["ood_steps"]) else []
+    # OOD rides a stride of the dump grid, which is itself a stride of the eval
+    # grid -- so with --dump-every-k-evals 0 (tuning) nothing is scheduled and
+    # the 47,500-image preload must never be paid.
+    ood_enabled = bool(args.dump_every_k_evals and args.ood_every_k_dumps)
+    ood_sets = load_ood_sets(args, args.img_size) if ood_enabled else []
 
     if args.arm == "ce":
         loss_fn = CrossEntropy(args.label_smooth, num_classes)
@@ -543,101 +565,166 @@ def main(args, on_dump=None) -> None:
         optimizer = optax.adamw(args.lr, weight_decay=args.weight_decay)
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
 
-    dump_set = set(int(s) for s in plan["dump_steps"])
-    ood_step_set = set(int(s) for s in plan["ood_steps"])
     micro_iter = stream_micro_batches(
         train_split, ds_config, plan["micro"], args.img_size, mean, std,
         plan["steps"] * plan["num_accum"], args.seed,
     )
 
-    dump_index = 0
+    # The argmin-val_nll evaluation, held in memory and written once from the
+    # `finally` below. Buffering rather than writing every point is what keeps a
+    # tuning run to one 40 MB dump instead of 122 of them.
+    best = None
+    eval_index = 0
     train_time = 0.0
-    for step in range(1, plan["steps"] + 1):
-        step_t0 = time.perf_counter()
-        train_key = jr.fold_in(fwd_key, step)
-        grads_acc, all_fts, all_labels = None, [], []
+    try:
+        for step in range(1, plan["steps"] + 1):
+            step_t0 = time.perf_counter()
+            train_key = jr.fold_in(fwd_key, step)
+            grads_acc, all_fts, all_labels = None, [], []
 
-        for _ in range(plan["num_accum"]):
-            images, labels = next(micro_iter)
-            if args.arm == "ibprobit":
-                if step == 1:
-                    fts, _ = jax_steps.ibprobit_micro_forward_nograd(
-                        backbone, loss_fn, images, labels, train_key, bf16=args.bf16)
+            for _ in range(plan["num_accum"]):
+                images, labels = next(micro_iter)
+                if args.arm == "ibprobit":
+                    if step == 1:
+                        fts, _ = jax_steps.ibprobit_micro_forward_nograd(
+                            backbone, loss_fn, images, labels, train_key, bf16=args.bf16)
+                    else:
+                        grads, fts, _ = jax_steps.ibprobit_micro_forward(
+                            backbone, loss_fn, images, labels, train_key, bf16=args.bf16)
+                        grads_acc = grads if grads_acc is None else jax_steps._tree_add(
+                            grads, grads_acc)
+                    all_fts.append(fts)
+                    all_labels.append(labels)
                 else:
-                    grads, fts, _ = jax_steps.ibprobit_micro_forward(
-                        backbone, loss_fn, images, labels, train_key, bf16=args.bf16)
+                    grads, _ = jax_steps.ce_micro_grad(
+                        (backbone, head), loss_fn, images, labels, train_key,
+                        bf16=args.bf16)
                     grads_acc = grads if grads_acc is None else jax_steps._tree_add(
                         grads, grads_acc)
-                all_fts.append(fts)
-                all_labels.append(labels)
+
+            if args.arm == "ibprobit":
+                if step > 1:
+                    backbone, opt_state = jax_steps.apply_grads(
+                        backbone, grads_acc, opt_state, optimizer, plan["num_accum"])
+                loss_fn = loss_fn.update(
+                    jnp.concatenate(all_fts), jnp.concatenate(all_labels),
+                    num_iters=args.num_update_iters)
+                head_or_loss = loss_fn
             else:
-                grads, _ = jax_steps.ce_micro_grad(
-                    (backbone, head), loss_fn, images, labels, train_key,
-                    bf16=args.bf16)
-                grads_acc = grads if grads_acc is None else jax_steps._tree_add(
-                    grads, grads_acc)
+                (backbone, head), opt_state = jax_steps.apply_grads(
+                    (backbone, head), grads_acc, opt_state, optimizer, plan["num_accum"])
+                head_or_loss = head
 
-        if args.arm == "ibprobit":
+            # Excludes eval/dump time below (banked before that block starts) and
+            # step 1 (JIT compilation, not steady-state throughput) -- mirrors
+            # full_finetune_comparison.run_arm's warmup exclusion.
+            step_time = time.perf_counter() - step_t0
             if step > 1:
-                backbone, opt_state = jax_steps.apply_grads(
-                    backbone, grads_acc, opt_state, optimizer, plan["num_accum"])
-            loss_fn = loss_fn.update(
-                jnp.concatenate(all_fts), jnp.concatenate(all_labels),
-                num_iters=args.num_update_iters)
-            head_or_loss = loss_fn
-        else:
-            (backbone, head), opt_state = jax_steps.apply_grads(
-                (backbone, head), grads_acc, opt_state, optimizer, plan["num_accum"])
-            head_or_loss = head
+                train_time += step_time
 
-        # Excludes eval/dump time below (banked before that block starts) and
-        # step 1 (JIT compilation, not steady-state throughput) -- mirrors
-        # full_finetune_comparison.run_arm's warmup exclusion.
-        step_time = time.perf_counter() - step_t0
-        if step > 1:
-            train_time += step_time
+            # Evaluation is spaced in SAMPLES, so this fires every `eval_every`
+            # steps and eval index i means i * eval_quantum samples on every rung
+            # of the ladder.
+            if step % plan["eval_every"]:
+                continue
 
-        if step in dump_set:
             samples_seen = step * plan["effective_batch"]
-            scalars = {}
-            for name in ("val", "test"):
-                images_uint8, labels = eval_sets[name]
-                out = evaluate_and_dump(
+            eval_index = samples_seen // plan["eval_quantum"]
+            payload, scalars = [], {}
+            for name, (images_uint8, labels) in eval_sets.items():
+                logits, out = evaluate_split(
                     args.arm, backbone, head_or_loss, images_uint8, labels,
-                    split=name, step=step, samples_seen=samples_seen,
                     args=args, mean=mean, std=std, key=fwd_key,
                 )
+                payload.append((name, logits, labels))
                 scalars.update({f"{name}_{k}": v for k, v in out.items()})
-            if not np.isfinite(scalars["val_nll"]):
-                # A diverged run would otherwise train silently to the full
-                # step budget, burning the rest of the wall-clock/compute
-                # budget on a broken model.
-                raise RuntimeError(
-                    f"[finetune] step {step}: val_nll={scalars['val_nll']!r} "
-                    f"is not finite -- the run has diverged."
-                )
-            if step in ood_step_set:
-                for name, images_uint8, labels, subset in ood_sets:
-                    evaluate_and_dump(
-                        args.arm, backbone, head_or_loss, images_uint8, labels,
-                        split=f"ood_{name}", step=step, samples_seen=samples_seen,
-                        args=args, mean=mean, std=std, key=fwd_key, subset=subset,
-                    )
-            print(f"[finetune] step {step}/{plan['steps']} " + " ".join(
-                f"{k}={v:.4f}" for k, v in sorted(scalars.items())))
-            if on_dump is not None:
-                on_dump(dump_index, step, scalars)
-            dump_index += 1
-            # gc.collect() only -- NOT jax.clear_caches() here. Dropping the
-            # compiled fwd+bwd graph plus the eval-chunk shapes on every dump
-            # (up to --n-dumps times a run) forces a full cold XLA recompile
-            # each time: this repo has no persistent compilation cache
-            # configured, so at --n-dumps 24 that is an estimated 20-70
-            # minutes of a 4-hour run. full_finetune_comparison.py only clears
-            # once, at the very end of a run, for the same reason -- see below.
-            gc.collect()
 
-    jax.clear_caches()
+            # `isfinite` guards the `best is None` arm specifically. Without it a
+            # non-finite FIRST value becomes `best`, every later `v < nan` is
+            # False, and the run keeps its diverged evaluation as the argmin for
+            # the rest of the budget. A non-finite value carries no information
+            # about improvement and is never adopted.
+            val_nll = float(scalars["val_nll"])
+            if math.isfinite(val_nll) and (best is None or val_nll < best["val_nll"]):
+                best = {
+                    "val_nll": val_nll,
+                    "step": step,
+                    "eval_index": eval_index,
+                    "samples_seen": samples_seen,
+                    "splits": payload,
+                }
+
+            # Checked AFTER the buffer update so one bad evaluation cannot discard
+            # a good dump -- but still fatal, because a diverged run would
+            # otherwise train silently to the full budget on a broken model.
+            if not np.isfinite(val_nll):
+                raise RuntimeError(
+                    f"[finetune] step {step}: val_nll={val_nll!r} is not finite "
+                    f"-- the run has diverged."
+                )
+
+            # Trajectory dumps for Fig 5. With --dump-every-k-evals 0 (tuning)
+            # nothing is written here and the run's only disk write is the
+            # buffered argmin, from _write_best.
+            # The final evaluation always dumps, whatever the stride lands on.
+            # curves._id_ood_pair raises when the last test dump and the last
+            # OOD dump sit at different steps, and Table 1's converged endpoint
+            # is read from exactly that point -- so a stride that misses the
+            # end (len(evals) not 1 mod k) would break scoring rather than
+            # merely thinning the trajectory. The geometric schedule this
+            # replaces force-appended the last step for the same reason.
+            is_last_eval = eval_index >= plan["n_evals"]
+            if args.dump_every_k_evals and (
+                is_last_eval or eval_index % args.dump_every_k_evals == 0
+            ):
+                dump_index = eval_index // args.dump_every_k_evals
+                for name, logits, labels in payload:
+                    evaldump.write_dump(
+                        args.dump_root, args.group_id, args.uid, step,
+                        logits, labels, arm=args.arm, split=name,
+                        logit_kind="softmax_logits", seed=args.seed,
+                        samples_seen=samples_seen,
+                    )
+                if ood_sets and (is_last_eval or dump_index % args.ood_every_k_dumps == 0):
+                    for name, images_uint8, labels, subset in ood_sets:
+                        logits, _ = evaluate_split(
+                            args.arm, backbone, head_or_loss, images_uint8, labels,
+                            args=args, mean=mean, std=std, key=fwd_key, subset=subset,
+                        )
+                        evaldump.write_dump(
+                            args.dump_root, args.group_id, args.uid, step,
+                            logits, labels, arm=args.arm, split=f"ood_{name}",
+                            logit_kind="softmax_logits", seed=args.seed,
+                            samples_seen=samples_seen,
+                        )
+
+            print(f"[finetune] eval {eval_index}/{plan['n_evals']} "
+                  f"step {step}/{plan['steps']} " + " ".join(
+                      f"{k}={v:.4f}" for k, v in sorted(scalars.items())))
+            if on_dump is not None:
+                on_dump(eval_index, step, samples_seen, scalars)
+            # gc.collect() only -- NOT jax.clear_caches() here. Dropping the
+            # compiled fwd+bwd graph plus the eval-chunk shapes on every
+            # evaluation forces a full cold XLA recompile each time: this repo
+            # has no persistent compilation cache configured, and at 122
+            # evaluations that would dwarf the run itself.
+            # full_finetune_comparison.py only clears once, at the very end of a
+            # run, for the same reason -- see below.
+            gc.collect()
+    finally:
+        # Reached whether the loop finished its budget, was stopped by an
+        # EarlyConvergence raised out of `on_dump` (the ordinary path once
+        # patience is on), or died -- so the argmin dump exists either way
+        # and the run stays scoreable.
+        #
+        # Only when no trajectory was written. With --dump-every-k-evals set,
+        # the trajectory IS the record and `early_stop` selects the reporting
+        # point from it, exactly as the probing Fig 1 path does; adding a
+        # buffered argmin on top would mix two dump semantics in one run --
+        # one row carrying `at_last_eval` and the rest not.
+        if not args.dump_every_k_evals:
+            _write_best(args, best, eval_index)
+        jax.clear_caches()
 
     # Steady-state train throughput: probe_throughput.verdict needs a train
     # img/s to compare against the loader's decode rate, and nothing else in

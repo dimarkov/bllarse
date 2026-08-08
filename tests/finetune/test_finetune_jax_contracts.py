@@ -4,7 +4,7 @@ Deliberately NOT an end-to-end run against a real DINOv3 backbone or the real
 ImageNet-1k dataset: that needs an A100 and is covered by the Raven smoke in
 the plan's exit criteria. What IS exercised here, with fakes standing in for
 equimo/datasets, is the actual control flow of `main`, `stream_micro_batches`
-and `evaluate_and_dump` -- because every failure mode this module cares about
+and `evaluate_split` -- because every failure mode this module cares about
 is silent: a run that violates one of these invariants produces dump files
 that load fine and figures that are wrong.
 
@@ -25,7 +25,6 @@ surrounding control flow -- in particular "no optimizer step at step == 1" --
 checked against the real `main` loop.
 """
 
-import inspect
 import re
 import sys
 import time
@@ -188,6 +187,11 @@ def _base_argv(*, arm, dump_root, split_cache_dir, img_size, epochs, batch_size,
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--micro-batch-size", str(micro_batch_size),
+        # Evaluate every optimizer step and dump every evaluation: these runs
+        # are a handful of steps long, so the production quantum (16,384
+        # samples) would schedule nothing at all.
+        "--eval-quantum", str(batch_size),
+        "--dump-every-k-evals", "1",
         "--dump-root", str(dump_root),
         "--group-id", "g",
         "--uid", "u",
@@ -202,16 +206,6 @@ def _base_argv(*, arm, dump_root, split_cache_dir, img_size, epochs, batch_size,
 # --- Specification tests (pre-existing resolve_plan / evaldump contracts) --
 
 
-def test_dump_steps_and_ood_steps_never_disagree_about_the_final_step():
-    plan = fj.resolve_plan(
-        fj.build_argparser().parse_args(["--arm", "ce", "--batch-size", "512"]),
-        micro_batch=64,
-    )
-    # curves._id_ood_pair raises if the final test dump and the final ood dump
-    # sit at different steps, so the schedules must agree at the endpoint.
-    assert plan["ood_steps"][-1] == plan["dump_steps"][-1]
-
-
 def test_samples_seen_tracks_the_effective_batch(tmp_path):
     """samples_seen is Fig 5's x-axis; it must count the effective batch."""
     evaldump.write_dump(
@@ -224,97 +218,14 @@ def test_samples_seen_tracks_the_effective_batch(tmp_path):
     assert record.meta["samples_seen"] == 7168
 
 
-# --- auto-probe contract: build_argparser must cover what the prober reads -
-#
-# main()'s auto-probe path (when --micro-batch-size is omitted) calls
-# full_finetune_comparison.probe_micro_batch_size, which unconditionally
-# builds an IBProbit head via build_ibprobit -- regardless of --arm, since the
-# prober always measures the heavier of the two arms' micro-steps. That
-# function reads ten args.* attributes finetune_jax's build_argparser did not
-# originally define, so the auto-probe path raised AttributeError (masked by
-# an UnboundLocalError from build_ibprobit's `finally: del loss_fn`) on the
-# documented default invocation. The list below is DERIVED from the actual
-# source via a regex over `args.<name>` accesses, not hardcoded, so this test
-# keeps working if that attribute set changes again.
+def test_evaluate_split_returns_logits_and_scalars_without_writing(tmp_path):
+    """evaluate_split computes; it never writes.
 
-
-def _args_attrs_touched(fn) -> set:
-    """Every `args.<name>` attribute access textually present in fn's source."""
-    return set(re.findall(r"\bargs\.([A-Za-z_][A-Za-z0-9_]*)\b", inspect.getsource(fn)))
-
-
-def test_probe_micro_batch_size_args_are_all_defined_on_finetune_jax_namespace():
-    import full_finetune_comparison as ffc  # noqa: E402 -- heavy, kept local to this test
-
-    touched = _args_attrs_touched(ffc.probe_micro_batch_size) | _args_attrs_touched(
-        ffc.build_ibprobit
-    )
-    # Sanity: the regex must actually have found the ten IBProbit knobs (and
-    # bf16/optimizer/estimator), or this test would trivially pass on zero
-    # attributes and catch nothing.
-    assert {"q_init", "px", "alpha", "kappa", "warmup", "eps_init",
-            "bf16", "optimizer"} <= touched
-
-    args = fj.build_argparser().parse_args(["--arm", "ibprobit", "--batch-size", "4"])
-    missing = sorted(name for name in touched if not hasattr(args, name))
-    assert not missing, (
-        f"finetune_jax build_argparser is missing attributes the auto-probe "
-        f"path reads: {missing}"
-    )
-
-
-def test_main_ce_arm_auto_probes_via_the_local_ce_prober(tmp_path, monkeypatch):
-    """C1: the CE arm's auto-probe (no --micro-batch-size) must dispatch to
-    finetune_jax.probe_micro_batch_size_ce, NOT
-    full_finetune_comparison.probe_micro_batch_size -- the latter builds an
-    IBProbit head via build_ibprobit regardless of --arm, which is a TypeError
-    against this branch's IBProbit constructor (masked into an
-    UnboundLocalError by ffc's `finally: del loss_fn`). Monkeypatched to a
-    stub so no real probe runs.
+    Evaluation now happens every eval_quantum samples -- 122 times in a tuning
+    run -- while at most a stride of those points is dumped, so a function that
+    wrote on every call would produce 4.9 GB per run. The caller buffers the
+    argmin's logits and writes once, from _write_best.
     """
-    embed_dim, num_classes, img_size = 5, 3, 4
-    _install_fake_heavy_modules(
-        monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
-        train_n=8, eval_n=10,
-    )
-    calls = []
-
-    def fake_prober(backbone, args, embed_dim_, num_classes_, img_size_,
-                    init_bs, max_bs, key):
-        calls.append((init_bs, max_bs))
-        return 2
-
-    monkeypatch.setattr(fj, "probe_micro_batch_size_ce", fake_prober)
-
-    dump_root = tmp_path / "dumps"
-    split_cache = tmp_path / "splits"
-    argv = [
-        "--arm", "ce", "--model", "fake_model", "--dataset", "fake",
-        "--img-size", str(img_size), "--allow-non-224",
-        "--epochs", "1.0", "--batch-size", "4",
-        "--dump-root", str(dump_root), "--group-id", "g", "--uid", "u",
-        "--split-cache-dir", str(split_cache), "--seed", "137",
-        "--ood-every-k-dumps", "0",
-        # --micro-batch-size deliberately omitted -- that's what triggers the
-        # auto-probe path this test targets.
-    ]
-    args = fj.build_argparser().parse_args(argv)
-    fj.main(args, on_dump=None)
-
-    assert len(calls) == 1, "probe_micro_batch_size_ce was not called exactly once"
-    assert calls[0] == (args.batch_size_init, args.batch_size_max)
-
-
-# --- evaluate_and_dump: exercises the REAL function, not a hand transcript -
-#
-# The brief's version of the "both splits" test called evaldump.write_dump
-# directly with hand-picked arguments, which does not exercise
-# evaluate_and_dump at all -- a broken evaluate_and_dump (e.g. one that
-# swapped `split` or dropped a chunk) would still pass it. This version drives
-# the real function.
-
-
-def test_evaluate_and_dump_writes_both_splits_with_the_effective_batch_samples_seen(tmp_path):
     key = jax.random.PRNGKey(0)
     embed_dim, num_classes, n = 5, 4, 7
     backbone = DummyBackbone(proj=jax.random.normal(key, (3, embed_dim)))
@@ -325,35 +236,25 @@ def test_evaluate_and_dump_writes_both_splits_with_the_effective_batch_samples_s
     mean, std = np.zeros(3), np.ones(3)
 
     args = fj.build_argparser().parse_args([
-        "--arm", "ce", "--batch-size", "4", "--eval-chunk", "3",
+        "--arm", "ce", "--batch-size", "4", "--micro-batch-size", "4",
+        "--eval-chunk", "3",
         "--dump-root", str(tmp_path), "--group-id", "g", "--uid", "u",
     ])
 
-    for step, samples_seen in ((1, 4), (3, 12)):
-        for split in ("val", "test"):
-            fj.evaluate_and_dump(
-                "ce", backbone, head, images_uint8, labels,
-                split=split, step=step, samples_seen=samples_seen,
-                args=args, mean=mean, std=std, key=key,
-            )
+    logits, scalars = fj.evaluate_split(
+        "ce", backbone, head, images_uint8, labels,
+        args=args, mean=mean, std=std, key=key,
+    )
 
-    by_split = {}
-    seen_samples = {}
-    for record in evaldump.iter_dumps(tmp_path, "g", "u"):
-        by_split.setdefault(record.meta["split"], set()).add(record.meta["step"])
-        seen_samples[(record.meta["split"], record.meta["step"])] = record.meta["samples_seen"]
-        # eval_chunk=3 over n=7 forces 3 chunks (3, 3, 1); every image must be
-        # scored exactly once, not dropped or duplicated by the chunk loop.
-        assert record.logits.shape == (n, num_classes)
-
-    assert by_split["val"] == by_split["test"] == {1, 3}
-    assert seen_samples[("val", 1)] == 4
-    assert seen_samples[("test", 3)] == 12
+    # eval_chunk=3 over n=7 forces 3 chunks (3, 3, 1); every image must be
+    # scored exactly once, not dropped or duplicated by the chunk loop.
+    assert logits.shape == (n, num_classes)
+    assert "nll" in scalars
+    assert not list(evaldump.iter_dumps(tmp_path, "g", "u"))
 
 
-def test_evaluate_and_dump_subset_masks_logits_outside_the_subset(tmp_path):
-    """The override this task adds: `subset` must actually mask logits, not
-    just be accepted and ignored (Task 6 will only need to CALL this)."""
+def test_evaluate_split_subset_masks_logits_outside_the_subset(tmp_path):
+    """`subset` must actually mask logits, not just be accepted and ignored."""
     key = jax.random.PRNGKey(1)
     embed_dim, num_classes, n = 6, 5, 6
     backbone = DummyBackbone(proj=jax.random.normal(key, (3, embed_dim)))
@@ -362,39 +263,32 @@ def test_evaluate_and_dump_subset_masks_logits_outside_the_subset(tmp_path):
     labels = np.random.default_rng(3).integers(0, num_classes, size=(n,)).astype(np.int64)
     mean, std = np.zeros(3), np.ones(3)
     args = fj.build_argparser().parse_args([
-        "--arm", "ce", "--batch-size", "4",
+        "--arm", "ce", "--batch-size", "4", "--micro-batch-size", "4",
         "--dump-root", str(tmp_path), "--group-id", "g", "--uid", "u",
     ])
 
-    fj.evaluate_and_dump(
+    full_logits, _ = fj.evaluate_split(
         "ce", backbone, head, images_uint8, labels,
-        split="val", step=1, samples_seen=4, args=args, mean=mean, std=std, key=key,
+        args=args, mean=mean, std=std, key=key,
     )
-    unmasked = next(
-        r for r in evaldump.iter_dumps(tmp_path, "g", "u") if r.meta["split"] == "val"
-    )
-    full_logits = unmasked.logits.astype(np.float32)
+    full_logits = np.asarray(full_logits, dtype=np.float32)
     # Pick the subset to deliberately exclude row 0's top class, so masking
     # is guaranteed to move that row's prediction -- a no-op mask (e.g. one
     # that always includes the argmax) would let this pass by accident.
     excluded = int(np.argmax(full_logits[0]))
     subset = [c for c in range(num_classes) if c != excluded]
 
-    out = fj.evaluate_and_dump(
+    masked_logits, out = fj.evaluate_split(
         "ce", backbone, head, images_uint8, labels,
-        split="test", step=1, samples_seen=4, args=args, mean=mean, std=std, key=key,
-        subset=subset,
+        args=args, mean=mean, std=std, key=key, subset=subset,
     )
-    masked = next(
-        r for r in evaldump.iter_dumps(tmp_path, "g", "u") if r.meta["split"] == "test"
-    )
-    masked_logits = masked.logits.astype(np.float32)
+    masked_logits = np.asarray(masked_logits, dtype=np.float32)
 
     # The excluded class is driven to a large negative value everywhere...
     assert np.all(masked_logits[:, excluded] < -1000)
-    # ...every kept class is left alone (float16 round-trip tolerance)...
+    # ...every kept class is left alone...
     for c in subset:
-        np.testing.assert_allclose(masked_logits[:, c], full_logits[:, c], atol=0.05)
+        np.testing.assert_allclose(masked_logits[:, c], full_logits[:, c], atol=1e-5)
     # ...and row 0's prediction actually changed as a result.
     assert int(np.argmax(masked_logits[0])) != excluded
     # The returned metrics are computed on the MASKED array, not the raw one.
@@ -516,23 +410,22 @@ def test_main_ce_arm_dumps_both_splits_at_every_scheduled_step(tmp_path, monkeyp
     argv = _base_argv(
         arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
         # imagenet.IMAGENET_N_TRAIN is patched to 8; epochs=1.0 * 8 // effective(4) = 2 steps.
-        # batch_size=5 (REQUESTED) deliberately differs from the ACHIEVED
-        # effective_batch=4 (accum_plan(5, 2) -> micro=2, num_accum=2,
-        # effective=4, since round(5/2)=2): with batch_size=4 == effective the
-        # samples_seen assertions below cannot tell "step * requested" apart
-        # from "step * achieved", so a bug that used args.batch_size directly
-        # would pass silently.
+        # accum_plan(4, 2) -> micro=2, num_accum=2, effective=4. Request and
+        # achieved now always agree, because design A8 pins the micro batch to
+        # a divisor of the target and accum_plan raises otherwise -- the case
+        # this test used to distinguish (requested 5, achieved 4) is no longer
+        # reachable, and test_protocol asserts it raises instead.
         # OOD is off here: this test is about the val/test schedule, not OOD,
         # and leaving --ood-every-k-dumps at its default would make main()
         # call load_ood_sets, which reaches out to precompute_ood_features
         # (network) -- see test_finetune_jax_ood.py for the OOD-specific
         # coverage.
-        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+        epochs=1.0, batch_size=4, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
 
     dump_calls = []
-    fj.main(args, on_dump=lambda i, s, sc: dump_calls.append((i, s, dict(sc))))
+    fj.main(args, on_dump=lambda i, s, n, sc: dump_calls.append((i, s, n, dict(sc))))
 
     records = list(evaldump.iter_dumps(dump_root, "g", "u"))
     by_split = {}
@@ -549,9 +442,13 @@ def test_main_ce_arm_dumps_both_splits_at_every_scheduled_step(tmp_path, monkeyp
     assert samples_seen[("val", 1)] == 4
     assert samples_seen[("test", 2)] == 8
 
-    assert [c[0] for c in dump_calls] == [0, 1]
+    # eval_index = samples_seen // eval_quantum, and the quantum is set to the
+    # batch here, so index i means i * 4 samples -- the same amount of training
+    # for any rung of the ladder, which is what makes it a valid pruner key.
+    assert [c[0] for c in dump_calls] == [1, 2]
     assert [c[1] for c in dump_calls] == [1, 2]
-    for _, _, scalars in dump_calls:
+    assert [c[2] for c in dump_calls] == [4, 8]
+    for _, _, _, scalars in dump_calls:
         assert set(scalars) == {
             "val_acc", "val_ece", "val_nll", "val_brier",
             "test_acc", "test_ece", "test_nll", "test_brier",
@@ -590,7 +487,7 @@ def test_main_ce_arm_actually_trains_not_a_no_op(tmp_path, monkeypatch):
 
     real_ce_micro_grad = jax_steps.ce_micro_grad
     real_apply_grads = jax_steps.apply_grads
-    real_evaluate_and_dump = fj.evaluate_and_dump
+    real_evaluate_split = fj.evaluate_split
 
     def capturing_ce_micro_grad(model, loss_fn, images, labels, key, bf16=False):
         grads, loss = real_ce_micro_grad(model, loss_fn, images, labels, key, bf16=bf16)
@@ -604,13 +501,13 @@ def test_main_ce_arm_actually_trains_not_a_no_op(tmp_path, monkeypatch):
         apply_calls.append((jax.tree.map(lambda a: np.array(a), grads), num_accum))
         return real_apply_grads(model, grads, opt_state, optimizer, num_accum)
 
-    def capturing_evaluate_and_dump(arm, backbone, head_or_loss, *rest, **kw):
+    def capturing_evaluate_split(arm, backbone, head_or_loss, *rest, **kw):
         dump_snapshots.append((backbone, head_or_loss))
-        return real_evaluate_and_dump(arm, backbone, head_or_loss, *rest, **kw)
+        return real_evaluate_split(arm, backbone, head_or_loss, *rest, **kw)
 
     monkeypatch.setattr(jax_steps, "ce_micro_grad", capturing_ce_micro_grad)
     monkeypatch.setattr(jax_steps, "apply_grads", capturing_apply_grads)
-    monkeypatch.setattr(fj, "evaluate_and_dump", capturing_evaluate_and_dump)
+    monkeypatch.setattr(fj, "evaluate_split", capturing_evaluate_split)
 
     dump_root = tmp_path / "dumps"
     split_cache = tmp_path / "splits"
@@ -618,7 +515,7 @@ def test_main_ce_arm_actually_trains_not_a_no_op(tmp_path, monkeypatch):
         arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
         # OOD off -- this test is about the grads/apply_grads control flow,
         # not OOD; see the note in the sibling test above.
-        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+        epochs=1.0, batch_size=4, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
     fj.main(args, on_dump=None)
@@ -728,7 +625,7 @@ def test_main_ibprobit_arm_skips_the_optimizer_step_at_step_one(tmp_path, monkey
         # batch_size=5 requested, effective=4 achieved (see the CE test above
         # for why); 1.5 * 8 // 4 = 3 steps either way. OOD off -- see the note
         # in the CE test above.
-        epochs=1.5, batch_size=5, micro_batch_size=2, num_update_iters=3,
+        epochs=1.5, batch_size=4, micro_batch_size=2, num_update_iters=3,
         ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
@@ -784,7 +681,8 @@ def test_main_default_uid_includes_the_dataset_before_the_arm(tmp_path, monkeypa
     argv = [
         "--arm", "ce", "--model", "fake_model", "--dataset", "fake",
         "--img-size", str(img_size), "--allow-non-224",
-        "--epochs", "1.0", "--batch-size", "5", "--micro-batch-size", "2",
+        "--epochs", "1.0", "--batch-size", "4", "--micro-batch-size", "2",
+        "--eval-quantum", "4", "--dump-every-k-evals", "1",
         "--dump-root", str(dump_root), "--group-id", "g",
         "--split-cache-dir", str(split_cache), "--seed", "137",
         "--ood-every-k-dumps", "0",
@@ -832,7 +730,7 @@ def test_main_ce_arm_head_lr_defaults_to_the_100x_trunk_rate(tmp_path, monkeypat
     split_cache = tmp_path / "splits"
     argv = _base_argv(
         arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
-        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+        epochs=1.0, batch_size=4, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
     assert args.head_lr is None  # sentinel preserved for check_arm_flags
@@ -894,7 +792,7 @@ def test_main_reports_train_throughput_excluding_step_one(tmp_path, monkeypatch,
     # arithmetic on this arm's sibling). n_timed = steps - 1 = 2.
     argv = _base_argv(
         arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
-        epochs=1.5, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+        epochs=1.5, batch_size=4, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
     fj.main(args, on_dump=None)
@@ -941,22 +839,26 @@ def test_main_raises_when_val_nll_is_not_finite_at_a_dump(tmp_path, monkeypatch)
         monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
         train_n=8, eval_n=10,
     )
-    real_evaluate_and_dump = fj.evaluate_and_dump
+    real_evaluate_split = fj.evaluate_split
+    calls = {"n": 0}
 
-    def poisoned_evaluate_and_dump(arm, backbone, head_or_loss, *rest, split, **kw):
-        out = real_evaluate_and_dump(arm, backbone, head_or_loss, *rest, split=split, **kw)
-        if split == "val":
+    def poisoned_evaluate_split(arm, backbone, head_or_loss, *rest, **kw):
+        logits, out = real_evaluate_split(arm, backbone, head_or_loss, *rest, **kw)
+        # The val split is evaluated first at each point, so poisoning the
+        # first call of each pair poisons val specifically.
+        if calls["n"] % 2 == 0:
             out = dict(out)
             out["nll"] = float("nan")
-        return out
+        calls["n"] += 1
+        return logits, out
 
-    monkeypatch.setattr(fj, "evaluate_and_dump", poisoned_evaluate_and_dump)
+    monkeypatch.setattr(fj, "evaluate_split", poisoned_evaluate_split)
 
     dump_root = tmp_path / "dumps"
     split_cache = tmp_path / "splits"
     argv = _base_argv(
         arm="ce", dump_root=dump_root, split_cache_dir=split_cache, img_size=img_size,
-        epochs=1.0, batch_size=5, micro_batch_size=2, ood_every_k_dumps=0,
+        epochs=1.0, batch_size=4, micro_batch_size=2, ood_every_k_dumps=0,
     )
     args = fj.build_argparser().parse_args(argv)
 
