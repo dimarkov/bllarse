@@ -215,13 +215,12 @@ def main(args, on_dump=None):
             f"optimiser steps, so a fractional interval is unschedulable."
         )
     eval_every = quantum // args.batch_size
-    report_grid = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
     print(
         f"[vbll] {args.uid}: {args.epochs} epochs x {n_batches} steps "
         f"= {total_steps} steps ({total_steps * args.batch_size} samples), "
         f"eval every {eval_every} steps ({quantum} samples, "
         f"{quantum / len(train_f):.2f} epochs) = {total_steps // eval_every} evals, "
-        f"{len(report_grid)} reported"
+        f"every {args.report_every} reported"
     )
 
     with child_run(vars(args), run_name=args.uid, tags={
@@ -329,7 +328,7 @@ def main(args, on_dump=None):
                             )
 
                     scalars = {"val_nll": float(val_nll)}
-                    if step in report_grid:
+                    if eval_index % args.report_every == 0:
                         test_logits, _ = _forward(
                             head, test_f, device, args.predictive_samples
                         )
@@ -368,9 +367,14 @@ def build_argparser():
     p.add_argument("--eval-quantum", type=int, default=0,
                    help="Samples between evaluations. 0 derives it from the "
                         "dataset's batch ladder (tuning.space.eval_quantum).")
-    p.add_argument("--n-dumps", type=int, default=40,
-                   help="Points on the geometric grid that throttles MLflow "
-                        "and stdout. NOT the evaluation grid.")
+    p.add_argument("--report-every", type=int, default=10,
+                   help="Report to MLflow and stdout on every k-th EVALUATION. "
+                        "A stride of the evaluation grid, so reported points "
+                        "are uniform in samples like everything else -- this "
+                        "replaced a geometric grid, which put most of its "
+                        "resolution where the samples-seen axis has least. "
+                        "Throttling only: it has never driven evaluation, "
+                        "dumps, scoring or early stopping.")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)

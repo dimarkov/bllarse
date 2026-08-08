@@ -56,7 +56,7 @@ BASE = dict(
     px=True,
     no_learn_q=True,
     eps_init=1e-12,
-    n_dumps=40,
+    report_every=10,
     val_fraction=0.1,
     img_size=224,
 )

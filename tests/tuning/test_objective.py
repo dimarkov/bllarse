@@ -210,7 +210,7 @@ def test_a_real_trial_runs_end_to_end_on_the_jax_arm(tmp_path):
             # batch_cap(600) is 256, not a whole number of 100-sample steps, so
             # _derive_quantum falls back to the batch itself: one evaluation per
             # step, 30 of them, indexed 1..30 on the sample grid.
-            "epochs": 5, "n_dumps": 4, "batch_size": 100, "no_hf_cache": True,
+            "epochs": 5, "report_every": 1, "batch_size": 100, "no_hf_cache": True,
         },
         dump_root=tmp_path / "dumps", group_id="e2e", uid="trial0",
         on_dump=lambda i, step, samples, s: reported.append((i, samples)),

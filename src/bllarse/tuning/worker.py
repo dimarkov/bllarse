@@ -27,10 +27,12 @@ from bllarse.tuning import space
 
 DIRECTION = "minimize"
 
-# Points on the geometric grid that throttles MLflow and stdout in the training
-# scripts. NOT the evaluation grid: evaluation is spaced in samples (see
-# space.eval_quantum), and the pruner's key is that sample-spaced index.
-N_DUMPS = 40
+# Report to MLflow and stdout on every k-th EVALUATION. A stride of the
+# evaluation grid (space.eval_quantum), so reported points are uniform in
+# samples -- this replaced a geometric grid, which put most of its resolution
+# where the samples-seen axis has least. Throttling only: the pruner's key is
+# the eval index itself, not this.
+REPORT_EVERY = 10
 
 # Fires only once 20 trials have completed, and never in a trial's first
 # PRUNER_WARMUP_EVALS evaluations, so early noise cannot kill a config that
@@ -180,7 +182,7 @@ def trial_config(
         # campaign's evaluation grid is recorded in the trial config and cannot
         # drift if the ladder is ever re-capped mid-campaign.
         "eval_quantum": space.eval_quantum(dataset),
-        "n_dumps": N_DUMPS,
+        "report_every": REPORT_EVERY,
         "val_fraction": 0.1,
         "enable_mlflow": enable_mlflow,
         "mlflow_experiment": mlflow_experiment,

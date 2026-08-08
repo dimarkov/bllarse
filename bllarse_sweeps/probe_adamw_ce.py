@@ -82,7 +82,7 @@ BASE = dict(
     enable_mlflow=True,
     mlflow_experiment="bllarse-probing",
     arm="adamw_ce",
-    n_dumps=40,
+    report_every=10,
     val_fraction=0.1,
 )
 

@@ -49,7 +49,7 @@ def test_probe_writes_dumps_and_learns(fake_features, tmp_path):
         # (fully deterministic -- both the fixture rng and --seed are fixed),
         # comfortably above the 0.9 bar.
         "--epochs", "1000",
-        "--n-dumps", "5",
+        "--report-every", "1",
         "--seed", "137",
         "--no-hf-cache",
     ])
@@ -96,7 +96,7 @@ def test_probe_dumps_ood_scores_when_an_ood_dataset_is_given(fake_features, tmp_
         "--group-id", "smoke",
         "--uid", "smoke_ood",
         "--epochs", "4",
-        "--n-dumps", "3",
+        "--report-every", "1",
         "--seed", "137",
         "--no-hf-cache",
     ])
@@ -143,7 +143,7 @@ def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
         "--group-id", "smoke",
         "--uid", "smoke_toobig",
         "--epochs", "2",
-        "--n-dumps", "2",
+        "--report-every", "1",
         "--batch-size", "601",  # fake_features has 600 training rows
         "--seed", "137",
         "--no-hf-cache",
@@ -152,7 +152,7 @@ def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
         probe.main(args)
 
 
-def _run(fake_features, tmp_path, uid, *, epochs, batch_size, n_dumps):
+def _run(fake_features, tmp_path, uid, *, epochs, batch_size, report_every=1):
     import probe
 
     args = probe.build_argparser().parse_args([
@@ -161,7 +161,7 @@ def _run(fake_features, tmp_path, uid, *, epochs, batch_size, n_dumps):
         "--split-cache-dir", str(tmp_path / "splits"),
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "sched", "--uid", uid,
-        "--epochs", str(epochs), "--n-dumps", str(n_dumps),
+        "--epochs", str(epochs), "--report-every", str(report_every),
         "--batch-size", str(batch_size), "--seed", "137", "--no-hf-cache",
     ])
     probe.main(args)
@@ -205,7 +205,7 @@ def test_samples_seen_is_exact(fake_features, tmp_path):
     """Drop-remainder means every step is exactly batch_size samples. The old
     epoch * len(train_f) overcounted by the dropped tail -- 2.6% on
     oxford_pets -- which biased the compute axis the figures are plotted on."""
-    records = _run(fake_features, tmp_path, "exact", epochs=10, batch_size=100, n_dumps=8)
+    records = _run(fake_features, tmp_path, "exact", epochs=10, batch_size=100)
     for record in records:
         assert record.meta["samples_seen"] == record.meta["step"] * 100
 
@@ -214,8 +214,8 @@ def test_the_samples_axis_is_comparable_across_batch_sizes(fake_features, tmp_pa
     """The reason the schedule moved to samples: two runs with different batch
     sizes must be placeable on one x-axis. Same sample budget, different batch
     size -> same final samples_seen, different step counts."""
-    coarse = _run(fake_features, tmp_path, "bs100", epochs=10, batch_size=100, n_dumps=8)
-    fine = _run(fake_features, tmp_path, "bs50", epochs=10, batch_size=50, n_dumps=8)
+    coarse = _run(fake_features, tmp_path, "bs100", epochs=10, batch_size=100)
+    fine = _run(fake_features, tmp_path, "bs50", epochs=10, batch_size=50)
 
     coarse_final = max(r.meta["samples_seen"] for r in coarse)
     fine_final = max(r.meta["samples_seen"] for r in fine)
@@ -323,7 +323,7 @@ def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypat
         "--split-cache-dir", str(tmp_path / "splits"),
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "hp", "--uid", "hp_0",
-        "--epochs", "2", "--n-dumps", "2", "--seed", "137", "--no-hf-cache",
+        "--epochs", "2", "--report-every", "1", "--seed", "137", "--no-hf-cache",
     ])
     probe.main(args)
 
@@ -341,14 +341,14 @@ def test_on_dump_is_called_once_per_dump_with_val_nll(fake_features, tmp_path):
         "--split-cache-dir", str(tmp_path / "splits"),
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "cb", "--uid", "cb_0",
-        "--epochs", "10", "--n-dumps", "5", "--batch-size", "100",
+        "--epochs", "10", "--report-every", "1", "--batch-size", "100",
         "--seed", "137", "--no-hf-cache",
     ])
     probe.main(args, on_dump=lambda i, step, samples, scalars: seen.append((i, step, scalars)))
 
     # 600 rows / 100 = 6 steps per epoch x 10 epochs = 60 steps, and the
     # quantum falls back to the batch here, so one evaluation per step.
-    # --n-dumps 5 now throttles MLflow and stdout only; it does not gate the
+    # --report-every throttles MLflow and stdout only; it does not gate the
     # callback, which is what the pruner and patience ride on.
     assert len(seen) == 60, "one callback per EVALUATION, not per reported dump"
     assert [i for i, _, _ in seen] == list(range(1, 61)), (
@@ -377,7 +377,7 @@ def test_an_exception_from_on_dump_propagates(fake_features, tmp_path):
         "--split-cache-dir", str(tmp_path / "splits"),
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "cb", "--uid", "cb_boom",
-        "--epochs", "4", "--n-dumps", "3", "--batch-size", "100",
+        "--epochs", "4", "--report-every", "1", "--batch-size", "100",
         "--seed", "137", "--no-hf-cache",
     ])
     with pytest.raises(Sentinel):

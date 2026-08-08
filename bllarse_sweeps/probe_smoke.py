@@ -12,10 +12,10 @@ GROUP_ID = "probe_smoke"
 
 _MLFLOW = dict(enable_mlflow=True, mlflow_experiment="bllarse-probing")
 
-_JAX = dict(**_MLFLOW, arm="adamw_ce", epochs=4, n_dumps=3, batch_size=512,
+_JAX = dict(**_MLFLOW, arm="adamw_ce", epochs=4, report_every=1, batch_size=512,
             learning_rate=1e-3, weight_decay=1e-4, val_fraction=0.1,
             model="dinov3_small", seed=137, group_id=GROUP_ID)
-_TORCH = dict(**_MLFLOW, epochs=4, n_dumps=3, batch_size=512,
+_TORCH = dict(**_MLFLOW, epochs=4, report_every=1, batch_size=512,
               learning_rate=1e-3, weight_decay=1e-4, val_fraction=0.1,
               parameterization="diagonal",
               vbll_type="discriminative", device="cuda",

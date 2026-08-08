@@ -25,45 +25,6 @@ class DumpRecord:
     meta: dict[str, Any]
 
 
-def dump_schedule(num_steps: int, n_dumps: int = 40) -> np.ndarray:
-    """Log-spaced eval steps: dense early, sparse late.
-
-    Fig 5's claim is that the calibration gap is largest early, so resolution
-    belongs there. Dumping all `num_steps` points would be ~5 GB per run for no
-    additional information about the claim.
-
-    Rounding a geometric grid to integers collapses its early points -- at
-    num_steps=100 the first twenty all land below 3 -- so a naive unique() drops
-    exactly the resolution this schedule exists to provide, and silently returns
-    fewer points than were asked for. Each step is therefore advanced to at least
-    one past its predecessor, giving exactly min(num_steps, n_dumps) distinct
-    steps.
-
-    Gaps trend upward but are not monotone: where the forced-increment region
-    meets the geometric one they can dip by exactly one, at roughly 2% of sizes.
-    Verified by brute force over 118k (n_dumps, num_steps) combinations -- the
-    dip never exceeds one.
-
-    Always includes step 1 and step `num_steps`.
-    """
-    if num_steps < 1:
-        raise ValueError("num_steps must be >= 1")
-    if n_dumps < 2:
-        raise ValueError("n_dumps must be >= 2 so the schedule spans 1..num_steps")
-    if num_steps <= n_dumps:
-        return np.arange(1, num_steps + 1)
-
-    steps: list[int] = []
-    previous = 0
-    for value in np.geomspace(1, num_steps, n_dumps):
-        step = max(int(round(value)), previous + 1)
-        if step > num_steps:
-            break
-        steps.append(step)
-        previous = step
-    return np.asarray(steps, dtype=int)
-
-
 def dump_dir(root, group_id: str, uid: str) -> Path:
     return Path(root) / group_id / uid
 

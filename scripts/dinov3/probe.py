@@ -348,20 +348,13 @@ def main(args, on_dump=None):
         )
     eval_every = quantum // args.batch_size
 
-    # The geometric grid survives, demoted to throttling MLflow and stdout. It
-    # is NOT the evaluation grid any more: it was sized as a figure artifact
-    # for 500-step runs (~400 MB of arrays per run), and at 30,000 steps its
-    # final interval spans ~7,000 steps -- 145 to 1,394 epochs depending on the
-    # dataset, hundreds of times coarser than the epoch-boundary evaluation
-    # this protocol was introduced to improve on.
-    report_grid = set(evaldump.dump_schedule(total_steps, n_dumps=args.n_dumps).tolist())
     n_evals = total_steps // eval_every
     print(
         f"[probe] {args.uid}: {args.epochs} epochs x {per_epoch} steps "
         f"= {total_steps} steps ({total_steps * args.batch_size} samples), "
         f"eval every {eval_every} steps ({quantum} samples, "
         f"{quantum / len(train_f):.2f} epochs) = {n_evals} evals, "
-        f"{len(report_grid)} reported"
+        f"every {args.report_every} reported"
     )
 
     with child_run(vars(args), run_name=args.uid, tags={
@@ -492,11 +485,12 @@ def main(args, on_dump=None):
                             ))
 
                     scalars = {"val_nll": float(val_nll)}
-                    if step in report_grid:
-                        # MLflow and stdout stay on the geometric grid: the full
-                        # metric set needs test logits and a temperature fit,
-                        # and 30,000 MLflow points per run would be its own
-                        # outage.
+                    if eval_index % args.report_every == 0:
+                        # A stride of the EVALUATION grid, so reported points
+                        # are uniform in samples like everything else. The
+                        # throttle exists because the full metric set needs
+                        # test logits and a temperature fit, and one MLflow
+                        # point per evaluation would be its own outage.
                         scalars = report_step(
                             run, step, samples_seen, epoch,
                             _logits_for(head, loss_fn, test_f, test_l), test_l,
@@ -536,10 +530,14 @@ def build_argparser():
                         "which is the only value that is a whole number of "
                         "steps at every rung. Set explicitly only for a "
                         "batch_size that is off-ladder.")
-    p.add_argument("--n-dumps", type=int, default=40,
-                   help="Points on the geometric grid that throttles MLflow "
-                        "and stdout. NOT the evaluation grid -- see "
-                        "--eval-quantum.")
+    p.add_argument("--report-every", type=int, default=10,
+                   help="Report to MLflow and stdout on every k-th EVALUATION. "
+                        "A stride of the evaluation grid, so reported points "
+                        "are uniform in samples like everything else -- this "
+                        "replaced a geometric grid, which put most of its "
+                        "resolution where the samples-seen axis has least. "
+                        "Throttling only: it has never driven evaluation, "
+                        "dumps, scoring or early stopping.")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)

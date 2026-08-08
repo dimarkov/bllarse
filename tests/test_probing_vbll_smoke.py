@@ -80,7 +80,7 @@ def test_vbll_probe_writes_dumps_and_learns(fake_features, tmp_path):
         # this exact fixture and seed, no transform of any kind applied to
         # the features): 0.98 test accuracy by epoch 1000.
         "--epochs", "1000",
-        "--n-dumps", "5",
+        "--report-every", "1",
         "--seed", "137",
         "--device", "cpu",
     ])
@@ -130,7 +130,7 @@ def test_hf_repo_flag_threads_through_every_load_cached_features_call(
         "--group-id", "smoke",
         "--uid", "vbll_hf",
         "--epochs", "1",
-        "--n-dumps", "2",
+        "--report-every", "1",
         "--seed", "137",
         "--device", "cpu",
     ]
@@ -165,7 +165,7 @@ def test_batch_size_larger_than_dataset_raises_instead_of_training_zero_steps(
         "--group-id", "smoke",
         "--uid", "vbll_toobig",
         "--epochs", "2",
-        "--n-dumps", "2",
+        "--report-every", "1",
         "--batch-size", "601",  # fake_features has 600 training rows
         "--seed", "137",
         "--device", "cpu",
@@ -267,7 +267,7 @@ def test_head_params_is_logged_as_a_run_param(fake_features, tmp_path, monkeypat
         "--split-cache-dir", str(tmp_path / "splits"),
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "hp", "--uid", "vbll_hp_0",
-        "--epochs", "2", "--n-dumps", "2", "--seed", "137", "--device", "cpu",
+        "--epochs", "2", "--report-every", "1", "--seed", "137", "--device", "cpu",
     ])
     probing_vbll.main(args)
 
@@ -289,13 +289,13 @@ def test_on_dump_is_called_once_per_dump_with_val_nll(fake_features, tmp_path):
         "--split-cache-dir", str(tmp_path / "splits"),
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "cb", "--uid", "cb_0",
-        "--epochs", "10", "--n-dumps", "5", "--batch-size", "100",
+        "--epochs", "10", "--report-every", "1", "--batch-size", "100",
         "--seed", "137", "--device", "cpu",
     ])
     probing_vbll.main(args, on_dump=lambda i, step, samples, s: seen.append((i, step, s)))
 
     # 600 rows / 100 = 6 steps per epoch x 10 epochs = 60 steps, one
-    # evaluation each (the quantum falls back to the batch here). --n-dumps 5
+    # evaluation each (the quantum falls back to the batch here). --report-every
     # throttles MLflow and stdout only; it no longer gates the callback.
     assert len(seen) == 60, "one callback per EVALUATION, not per reported dump"
     assert [i for i, _, _ in seen] == list(range(1, 61)), (
@@ -318,7 +318,7 @@ def test_an_exception_from_on_dump_propagates(fake_features, tmp_path):
         "--split-cache-dir", str(tmp_path / "splits"),
         "--dump-root", str(tmp_path / "dumps"),
         "--group-id", "cb", "--uid", "cb_boom",
-        "--epochs", "4", "--n-dumps", "3", "--batch-size", "100",
+        "--epochs", "4", "--report-every", "1", "--batch-size", "100",
         "--seed", "137", "--device", "cpu",
     ])
     with pytest.raises(Sentinel):

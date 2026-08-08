@@ -56,7 +56,7 @@ BASE = dict(
     arm="ibprobit",
     px=True,
     no_learn_q=True,
-    n_dumps=40,
+    report_every=10,
     val_fraction=0.1,
 )
 

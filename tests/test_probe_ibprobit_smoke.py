@@ -57,7 +57,7 @@ def _run(tmp_path, cache, uid, extra=()):
         "--uid", uid,
         "--batch-size", "64",
         "--epochs", "12",
-        "--n-dumps", "5",
+        "--report-every", "1",
         "--num-update-iters", "32",
         "--px",
         "--seed", "137",
@@ -172,7 +172,7 @@ def test_a_whole_optuna_trial_runs_end_to_end(fake_features, tmp_path, monkeypat
     # stands in for its cached features, so the loaded names have to match it.
     config.update({"model": "dinov3_small", "dataset": "fake",
                    "num_classes": 3, "img_size": 224, "epochs": 12,
-                   "n_dumps": 5, "no_hf_cache": True})
+                   "report_every": 1, "no_hf_cache": True})
     # `arm` must survive: adapters.config_to_argv turns it into --arm, and
     # dropping it would silently run the adamw_ce arm under an ibprobit study.
     assert config["arm"] == "ibprobit"

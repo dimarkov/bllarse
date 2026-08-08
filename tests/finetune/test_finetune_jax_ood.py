@@ -430,7 +430,7 @@ def test_main_ood_dump_uses_the_ood_prefixed_split_name(tmp_path, monkeypatch):
 
     dump_root = tmp_path / "dumps"
     split_cache = tmp_path / "splits"
-    # epochs chosen so num_steps == n_dumps' natural single-step case: 1 step
+    # epochs chosen for the single-step case: 1 step
     # total, so it is trivially also the final (and only, and thus always
     # OOD-scheduled) step.
     argv = _base_argv(
