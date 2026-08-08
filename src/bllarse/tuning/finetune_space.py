@@ -39,17 +39,32 @@ ARMS = ("ce", "vbll", "ibprobit", "ibprobit_noeps")
 # on a per-trial grid.
 BATCH_SIZES = (256, 512, 1024, 2048, 4096)
 
-# Per-forward batch, measured once per arm and per GPU with
-# scripts/finetune/probe_micro_batch.py and pinned here.
+# The GPU MICRO_BATCH was measured on. The constants below are valid for this
+# device and nothing else -- a smaller card OOMs on them, a larger one leaves
+# memory unused, and neither is visible from a finished run's config.
+MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
+
+# Per-forward batch, measured per arm with
+# scripts/finetune/probe_micro_batch.py (dinov3_huge, 224, bf16) and pinned.
 #
-# EMPTY UNTIL MEASURED, deliberately. A plausible-looking default would either
-# OOM three hours into a trial or leave memory unused across the whole
-# campaign, and neither is visible from the config afterwards. `micro_batch`
-# raises with the command to run rather than guessing.
+# Both JAX arms measured 64; 128 OOMs on both. They agree because the trunk
+# dominates: IBProbit's head state is ~20 MB at D=1281, K=1000, since `Sigma`
+# is (d, d) shared across classes rather than per-class.
 #
-# Values must satisfy floor_to_ladder_divisor: a power of two no larger than
-# 256 (the ladder's gcd), so num_accum is exact at every rung.
-MICRO_BATCH: dict[str, int] = {}
+# 64, not the 16 the earlier full_finetune_comparison runs used. That 16 was
+# set by hand and never probed, so those runs took 4x more micro-steps per
+# optimizer step than the hardware required.
+#
+# `vbll` is absent until the PyTorch arm exists to measure it against -- a
+# different framework and a different activation profile, so the JAX number
+# does not transfer. `micro_batch` raises rather than borrowing it.
+#
+# Values must satisfy probe_micro_batch.floor_to_ladder_divisor: a power of two
+# no larger than 256 (the ladder's gcd), so num_accum is exact at every rung.
+MICRO_BATCH: dict[str, int] = {
+    "ce": 64,
+    "ibprobit": 64,
+}
 
 # Pinned, not searched -- the ONE head axis the probing campaign transfers as a
 # value. Its per-dataset optima spanned 0.076 to 0.204, a 2.7x range across

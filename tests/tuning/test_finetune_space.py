@@ -58,9 +58,28 @@ def test_the_ladder_is_powers_of_two():
 def test_micro_batch_refuses_to_guess():
     # Hardware-specific and unrecoverable from a finished run's config, so an
     # unmeasured arm must fail loudly at submit time rather than OOM three
-    # hours into a trial or silently leave memory unused all campaign.
+    # hours into a trial or silently leave memory unused all campaign. `vbll`
+    # is the live case: a different framework with a different activation
+    # profile, so the JAX measurement must not be borrowed for it.
+    assert "vbll" not in fs.MICRO_BATCH
     with pytest.raises(KeyError, match="probe_micro_batch"):
-        fs.micro_batch("ce")
+        fs.micro_batch("vbll")
+
+
+def test_the_measured_jax_micro_batches_are_pinned():
+    # Measured on A100-SXM4-40GB, dinov3_huge at 224 with bf16: both arms fit
+    # 64 and OOM at 128. They agree because the trunk dominates -- IBProbit's
+    # head is ~20 MB, since Sigma is (d, d) shared across classes.
+    assert fs.MICRO_BATCH["ce"] == 64
+    assert fs.MICRO_BATCH["ibprobit"] == 64
+    assert "A100" in fs.MICRO_BATCH_DEVICE
+
+
+@pytest.mark.parametrize("arm", ["ce", "ibprobit", "ibprobit_noeps"])
+def test_the_pinned_values_divide_every_rung(arm):
+    micro = fs.micro_batch(arm)
+    for rung in fs.BATCH_SIZES:
+        assert rung % micro == 0, (arm, rung, micro)
 
 
 def test_any_pinned_micro_batch_divides_every_rung(monkeypatch):
