@@ -13,8 +13,19 @@ import numpy as np
 # The tuning campaign's sample budget. A budget in SAMPLES, not steps: at a
 # fixed step budget `samples_seen = steps * batch`, so large batches would be
 # handed more data and the tuned batch size would not transfer to the final run.
-# 2,000,000 / 1,281,167 = 1.561 epochs.
-MAX_SAMPLES = 2_000_000
+#
+# 1,000,000 / 1,281,167 = 0.781 epochs, and 1e6 / EVAL_QUANTUM = 61 evaluations
+# at every rung of the ladder.
+#
+# Halved from 2,000,000 once throughput was measured rather than assumed: at
+# the measured ~40 img/s a 2M-sample trial is ~14 h of training alone, so the
+# campaign did not fit its own compute budget. The risk this carries is
+# directional and worth stating -- a shorter budget favours configs that move
+# FAST, i.e. high trunk learning rates, which is also the catastrophic
+# forgetting direction. Read `truncated` off the trials: if it is true almost
+# everywhere, the ranking is being made on runs that were all still improving,
+# and the budget is the binding constraint rather than the search.
+MAX_SAMPLES = 1_000_000
 
 # Samples between consecutive val_nll evaluations, for every trial.
 #

@@ -66,10 +66,18 @@ PATIENCE = 20
 WARMUP_EVALS = 10
 
 # Every trial evaluates val ONLY. The objective is val_nll, and forwarding the
-# 30k test partition at all 122 evaluations would roughly double the campaign
-# for a number nothing reads. val_fraction 0.4 over the official 50k validation
-# split gives 20k val / 30k test.
-VAL_FRACTION = 0.4
+# test partition at every evaluation would cost as much again for a number
+# nothing reads.
+#
+# 0.2 over the official 50k validation split gives 10k val / 40k test -- the
+# same split imagenet.DEFAULT_VAL_FRACTION uses. Halved from 0.4 (20k val)
+# because evaluation was ~29% of a trial at the measured throughput: 61
+# evaluations x 10k images is ~1.4 h against ~7 h of training.
+#
+# 10k is still a large selection set. Its standard error on val_nll is ~1.4x
+# that of 20k, which matters only if trials are separated by less than that --
+# and configs that close cannot be distinguished by a longer budget either.
+VAL_FRACTION = 0.2
 EVAL_SPLITS = "val"
 
 # No trajectory dumps and no OOD during tuning: the run writes exactly one

@@ -41,10 +41,10 @@ def test_every_rung_divides_the_eval_quantum():
 
 
 def test_every_rung_gets_the_same_number_of_evaluations():
-    # 2,000,000 / 16,384. THE property the sample-spaced grid exists for: eval
+    # 1,000,000 / 16,384. THE property the sample-spaced grid exists for: eval
     # index i means i * 16,384 samples on every rung, so MedianPruner compares
     # trials at matching amounts of data rather than matching steps.
-    assert fs.eval_count() == 122
+    assert fs.eval_count() == 61
 
 
 def test_the_ladder_is_powers_of_two():
@@ -275,7 +275,7 @@ def test_the_top_rung_evaluates_after_every_optimizer_step():
     # TPE is allowed to explore rather than have prejudged for it (design D5:
     # batch tolerance is a method property).
     assert protocol.eval_every_steps(16_384) == 1
-    assert protocol.steps_for_samples(protocol.MAX_SAMPLES, 16_384) == 122
+    assert protocol.steps_for_samples(protocol.MAX_SAMPLES, 16_384) == 61
 
 
 def test_the_pinned_micro_batch_divides_the_new_top_rungs(monkeypatch):

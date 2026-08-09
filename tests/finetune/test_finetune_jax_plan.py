@@ -77,11 +77,11 @@ def test_resolve_plan_refuses_a_micro_batch_that_does_not_divide_the_target():
 
 
 def test_resolve_plan_evaluates_on_a_uniform_sample_grid():
-    plan = fj.resolve_plan(_args(batch_size=1024, max_samples=2_000_000), micro_batch=256)
+    plan = fj.resolve_plan(_args(batch_size=1024, max_samples=1_000_000), micro_batch=256)
     assert plan["eval_quantum"] == 16_384
     assert plan["eval_every"] == 16
-    assert plan["steps"] == 1953
-    assert plan["n_evals"] == 122
+    assert plan["steps"] == 976
+    assert plan["n_evals"] == 61
 
 
 def test_every_ladder_rung_gets_the_same_number_of_evaluations():
@@ -92,11 +92,11 @@ def test_every_ladder_rung_gets_the_same_number_of_evaluations():
     # batch-256 one and the pruner compared them anyway.
     counts = {
         batch: fj.resolve_plan(
-            _args(batch_size=batch, max_samples=2_000_000), micro_batch=256
+            _args(batch_size=batch, max_samples=1_000_000), micro_batch=256
         )["n_evals"]
-        for batch in (256, 512, 1024, 2048, 4096)
+        for batch in (256, 512, 1024, 2048, 4096, 8192, 16384)
     }
-    assert set(counts.values()) == {122}, counts
+    assert set(counts.values()) == {61}, counts
 
 
 def test_resolve_plan_refuses_a_budget_shorter_than_one_evaluation():
@@ -113,9 +113,9 @@ def test_max_samples_overrides_the_epoch_cap():
     # Tuning is capped in samples so the tuned batch size transfers; the final
     # campaign is capped at 4 epochs. --max-samples selects the former.
     plan = fj.resolve_plan(
-        _args(batch_size=1024, epochs=4.0, max_samples=2_000_000), micro_batch=256
+        _args(batch_size=1024, epochs=4.0, max_samples=1_000_000), micro_batch=256
     )
-    assert plan["steps"] == 1953  # not steps_for_epochs(...) == 5004
+    assert plan["steps"] == 976  # not steps_for_epochs(...) == 5004
 
 
 def test_resolve_plan_accepts_a_fractional_epoch_for_tuning():
