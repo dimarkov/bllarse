@@ -253,3 +253,33 @@ def test_only_the_top_of_the_trunk_range_differs_between_arms():
     # that slice.
     assert fs.IBPROBIT_TRUNK_LR_BOX[0] == fs.TRUNK_LR_BOX[0]
     assert fs.IBPROBIT_TRUNK_LR_BOX[1] < fs.TRUNK_LR_BOX[1]
+
+
+def test_the_ladder_reaches_the_eval_quantum():
+    """The ceiling is the quantum, and nothing else.
+
+    A rung larger than EVAL_QUANTUM cannot divide it, so the evaluation grid
+    would be unschedulable there. 16,384 divides itself, so it is the largest
+    batch this protocol can carry -- and memory does not enter into it, since
+    gradient accumulation absorbs the effective batch entirely (design A8).
+    The design doc's "here the ceiling is memory" capped this at 4096, which
+    also excluded the one large-batch operating point the codebase has real
+    evidence for: the earlier production runs used 16,384.
+    """
+    assert max(fs.BATCH_SIZES) == protocol.EVAL_QUANTUM == 16_384
+
+
+def test_the_top_rung_evaluates_after_every_optimizer_step():
+    # At the ceiling a step IS a quantum, so eval_every collapses to 1 and the
+    # 2M budget is 122 steps. A genuinely different training regime, and one
+    # TPE is allowed to explore rather than have prejudged for it (design D5:
+    # batch tolerance is a method property).
+    assert protocol.eval_every_steps(16_384) == 1
+    assert protocol.steps_for_samples(protocol.MAX_SAMPLES, 16_384) == 122
+
+
+def test_the_pinned_micro_batch_divides_the_new_top_rungs(monkeypatch):
+    monkeypatch.setattr(fs, "MICRO_BATCH", {"ce": 32, "ibprobit": 32})
+    for rung in (8192, 16384):
+        assert rung % fs.micro_batch("ce") == 0
+        protocol.accum_plan(rung, fs.micro_batch("ce"))

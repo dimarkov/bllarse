@@ -30,14 +30,32 @@ REPORTED_SEEDS = tuple(range(137, 147))
 
 ARMS = ("ce", "vbll", "ibprobit", "ibprobit_noeps")
 
-# EFFECTIVE (accumulated) batch. Memory does not bound this -- accumulation
-# absorbs it -- so the ladder is bounded by what is worth spending trials on.
+# EFFECTIVE (accumulated) batch.
 #
-# Every rung divides protocol.EVAL_QUANTUM, which is what makes evaluation
-# schedulable at the same samples_seen values on all of them. A rung that did
-# not would raise in protocol.eval_every_steps rather than silently evaluating
-# on a per-trial grid.
-BATCH_SIZES = (256, 512, 1024, 2048, 4096)
+# The ceiling is protocol.EVAL_QUANTUM, and that is the ONLY thing bounding it.
+# Every rung must divide the quantum or the evaluation grid is unschedulable
+# for that rung (protocol.eval_every_steps raises rather than silently
+# evaluating on a per-trial grid), and 16,384 divides itself -- so it is the
+# largest batch this protocol can carry, and every rung from 256 up yields
+# exactly 122 evaluations.
+#
+# It is NOT bounded by memory. The design doc said "here the ceiling is memory"
+# and capped the ladder at 4096, but gradient accumulation absorbs the
+# effective batch entirely -- that is the whole reason the micro batch is
+# pinned separately (design A8). At the top rung a step is 512 micro-steps of
+# 32; nothing about that is memory-limited.
+#
+# 16,384 also matches the probing campaign's MAX_BATCH and is the batch the
+# earlier full_finetune_comparison production runs actually used, so excluding
+# it would have excluded the one large-batch operating point this codebase has
+# real evidence for.
+#
+# The top rungs are a genuinely different regime, not just bigger: at 16,384
+# the whole 2M-sample budget is 122 optimizer steps and evaluation happens
+# after EVERY step. Whether that trains well is exactly what design D5 means by
+# treating batch tolerance as a method property -- so it is TPE's to discover,
+# not the ladder's to prejudge.
+BATCH_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384)
 
 # The GPU MICRO_BATCH was measured on. The constants below are valid for this
 # device and nothing else -- a smaller card OOMs on them, a larger one leaves
