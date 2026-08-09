@@ -149,3 +149,22 @@ def test_both_jitted_eval_entry_points_exist_on_the_training_script():
 
     for name in ("eval_logits_ce", "eval_logits_ibprobit"):
         assert callable(getattr(finetune_jax, name)), name
+
+
+def test_equimo_shim_resolves_the_dinov3_factories():
+    """One shim, used everywhere.
+
+    equimo 1.1.1 moved `equimo.models` -> `equimo.vision.models`. Hardcoding
+    either path breaks on the machine with the other version, and the failure
+    is misleading: the ImportError from the missing SUBMODULE reads exactly
+    like the package being absent. That cost a job twice -- once through
+    vit_classification, once through a benchmark that reimplemented the same
+    try/except -- so this pins that the shared helper resolves the factories
+    the fine-tuning scripts actually call.
+    """
+    from bllarse.finetune import equimo_vision_models
+
+    models = equimo_vision_models()
+    for factory in ("dinov3_vitl16_pretrain_lvd1689m",
+                    "dinov3_vith16plus_pretrain_lvd1689m"):
+        assert hasattr(models, factory), factory

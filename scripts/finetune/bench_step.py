@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import optax
 from jax import random as jr
 
-from bllarse.finetune import jax_steps
+from bllarse.finetune import equimo_vision_models, jax_steps
 from bllarse.losses import CrossEntropy
 
 # equimo factory per backbone name, and the FLOP-relevant shape facts. Depth
@@ -71,7 +71,10 @@ def step_flops(spec, micro: int, img_size: int) -> float:
 
 
 def build(model: str, num_classes: int, key):
-    import equimo.models as equimo_models
+    # Via the shared shim: equimo 1.1.1 moved `equimo.models` to
+    # `equimo.vision.models`, and hardcoding either path breaks on the machine
+    # with the other version. See bllarse.finetune.equimo_vision_models.
+    equimo_models = equimo_vision_models()
     spec = MODELS[model]
     # pretrained=False: random weights, identical shapes. The whole point --
     # this runs with no HF cache and no network.
