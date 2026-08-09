@@ -15,10 +15,18 @@ from typing import Any
 
 from bllarse.finetune import protocol
 
-# The only backbone tuned, matching the probing campaign's choice. The paper's
-# arguments centre on huge, and a config tuned here is transplanted across the
-# ladder for the figures with that stated rather than buried.
-TUNING_MODEL = "dinov3_huge"
+# The backbone tuned. dinov3_large (304M), NOT huge (840M): at the measured
+# throughput a huge trial is ~8.4 h against large's ~3 h, and the search budget
+# buys roughly three times as many trials per A100-hour on large.
+#
+# The cost is stated rather than hidden: a config tuned on large is
+# TRANSPLANTED to huge for the final runs, so the reported operating point was
+# not selected on the backbone it is reported at. Fig 1 already transplants in
+# the other direction (huge's probing config across the whole ladder), so the
+# paper carries this class of assumption either way -- but it is an assumption,
+# and the direction here is the less comfortable one, since large has 24 layers
+# at width 1024 against huge's 32 at 1280.
+TUNING_MODEL = "dinov3_large"
 
 # One seed per trial, not probing's two. Right for a 40-second probe; here it
 # would double a ~880 A100-hour campaign.
@@ -37,7 +45,7 @@ ARMS = ("ce", "vbll", "ibprobit", "ibprobit_noeps")
 # for that rung (protocol.eval_every_steps raises rather than silently
 # evaluating on a per-trial grid), and 16,384 divides itself -- so it is the
 # largest batch this protocol can carry, and every rung from 256 up yields
-# exactly 122 evaluations.
+# exactly 61 evaluations.
 #
 # It is NOT bounded by memory. The design doc said "here the ceiling is memory"
 # and capped the ladder at 4096, but gradient accumulation absorbs the
@@ -51,7 +59,7 @@ ARMS = ("ce", "vbll", "ibprobit", "ibprobit_noeps")
 # real evidence for.
 #
 # The top rungs are a genuinely different regime, not just bigger: at 16,384
-# the whole 2M-sample budget is 122 optimizer steps and evaluation happens
+# the whole 1M-sample budget is 61 optimizer steps and evaluation happens
 # after EVERY step. Whether that trains well is exactly what design D5 means by
 # treating batch tolerance as a method property -- so it is TPE's to discover,
 # not the ladder's to prejudge.
@@ -111,18 +119,21 @@ WISHART_SCALE = 0.13
 # not the absence of one. At 1e-12, b0 = 1e12 swamps the recursion's `+sum(r)`
 # term in float32 and eps holds at 1e-12.
 #
-# Six decades below EPS_INIT_BOX's floor, so "searched and tiny" and
-# "numerically absent" stay distinguishable outcomes.
+# Four decades below EPS_INIT_BOX's floor (1e-8), so "searched and tiny" and
+# "numerically absent" stay distinguishable outcomes. The gap narrowed when the
+# searched floor was lowered; four decades is still far more than the recursion
+# can traverse, but it is the quantity to re-check if that floor drops again.
 IBPROBIT_NOEPS_INIT = 1e-12
 
 # Beta(1, 1/eps_init) prior mean on the contamination rate.
 #
-# The floor is three decades below anything the probing campaign selected
-# (1.1e-3 to 3.3e-2). That is deliberate extra room downward: if the tuned
-# value lands on or near 1e-6, the SEARCHED arm has answered the ablation's
-# question by itself -- the head switched contamination off when it was free
-# to keep it -- which is a stronger result than the pinned arm winning.
-EPS_INIT_BOX = (1e-6, 1e-1)
+# The floor is FIVE decades below anything the probing campaign selected
+# (1.1e-3 to 3.3e-2). That is deliberate room downward: if the tuned value
+# lands near 1e-8, the SEARCHED arm has answered the ablation's question by
+# itself -- the head switched contamination off when it was free to keep it --
+# which is a stronger result than a separately-tuned pinned arm winning, and it
+# costs nothing but box width on an axis TPE explores in log space.
+EPS_INIT_BOX = (1e-8, 1e-1)
 
 # CAVI iterations per macro batch.
 #

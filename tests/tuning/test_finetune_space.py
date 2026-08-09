@@ -157,13 +157,14 @@ def test_vbll_does_not_search_capacity():
 
 
 def test_eps_box_reaches_far_below_what_probing_selected():
-    # Probing's optima spanned 1.1e-3 to 3.3e-2. The floor is three decades
+    # Probing's optima spanned 1.1e-3 to 3.3e-2. The floor is FIVE decades
     # lower so that "the head switched contamination off when free to keep it"
-    # is a reachable, readable outcome of the SEARCHED arm.
+    # is a reachable, readable outcome of the SEARCHED arm -- a stronger result
+    # than a separately-tuned pinned arm winning, and free on a log-space axis.
     trial = RecordingTrial()
     fs.suggest(trial, "ibprobit")
     kind, low, high, log = trial.axes["eps_init"]
-    assert (low, high, log) == (1e-6, 1e-1, True)
+    assert (low, high, log) == (1e-8, 1e-1, True)
 
 
 def test_the_pinned_and_searched_eps_stay_distinguishable():

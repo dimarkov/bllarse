@@ -41,7 +41,7 @@ def test_every_arm_carries_the_tuning_protocol(arm):
     assert config["max_samples"] == 1_000_000
     assert config["eval_quantum"] == 16_384
     assert config["img_size"] == 224
-    assert config["model"] == "dinov3_huge"
+    assert config["model"] == "dinov3_large"
     assert config["val_fraction"] == 0.2
     assert config["bf16"] is True
 
