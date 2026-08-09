@@ -141,6 +141,22 @@ PRIOR_SCALE_BOX = (1e-1, 1e3)
 TRUNK_LR_BOX = (1e-6, 1e-3)
 TRUNK_WD_BOX = (1e-5, 1e-1)
 
+# Both IBProbit arms cap the trunk rate half a decade lower than CE and VBLL.
+#
+# The head is assimilated in CLOSED FORM once per optimizer step, from the
+# features the trunk produced during that step's accumulation window. A trunk
+# moving fast enough leaves those sufficient statistics describing a feature
+# distribution the trunk has already left, so the head is always fitting a
+# representation one step stale. The optimiser-driven arms have no equivalent
+# failure: their head is updated by the same gradient step as the trunk and
+# tracks it by construction.
+#
+# So this is not a shared budget cut applied unevenly -- it is a property of
+# the conjugate update, and the asymmetry is reported rather than hidden. The
+# lower bound is unchanged, so the arm can still reach every trunk rate the
+# others can except the top half-decade.
+IBPROBIT_TRUNK_LR_BOX = (1e-6, 5e-4)
+
 # The head rate is ALWAYS at least 5x the trunk rate. Because the RATIO is the
 # searched axis, this is a floor on the box rather than a rejected-sample
 # constraint: every config TPE draws satisfies it by construction, and no trial
@@ -209,7 +225,10 @@ def _suggest_ibprobit(trial: Any, *, search_eps: bool) -> dict[str, Any]:
     """
     params: dict[str, Any] = {
         "batch_size": trial.suggest_categorical("batch_size", list(BATCH_SIZES)),
-        "lr": trial.suggest_float("lr", *TRUNK_LR_BOX, log=True),
+        # IBPROBIT_TRUNK_LR_BOX, not TRUNK_LR_BOX: the closed-form head refits
+        # from features the trunk has already moved past once the trunk is fast
+        # enough. See the constant.
+        "lr": trial.suggest_float("lr", *IBPROBIT_TRUNK_LR_BOX, log=True),
         "weight_decay": trial.suggest_float("weight_decay", *TRUNK_WD_BOX, log=True),
         "q_init": trial.suggest_float("q_init", *Q_INIT_BOX, log=True),
         "num_update_iters": trial.suggest_categorical(

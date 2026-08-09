@@ -218,3 +218,38 @@ def test_tuning_seed_is_disjoint_from_the_reported_seeds():
 def test_suggest_rejects_an_unknown_arm():
     with pytest.raises(ValueError, match="unknown arm"):
         fs.suggest(RecordingTrial(), "ivon")
+
+
+@pytest.mark.parametrize("arm", ["ibprobit", "ibprobit_noeps"])
+def test_ibprobit_caps_the_trunk_rate_half_a_decade_below_the_others(arm):
+    """The closed-form head cannot track a fast trunk.
+
+    IBProbit assimilates its head once per optimizer step from the features
+    that step's accumulation window produced. Past some trunk rate those
+    sufficient statistics describe a representation the trunk has already left,
+    so the head is permanently one step stale. The optimiser-driven arms have
+    no equivalent failure -- their head is updated by the same gradient step as
+    the trunk.
+    """
+    trial = RecordingTrial()
+    fs.suggest(trial, arm)
+    _kind, low, high, log = trial.axes["lr"]
+    assert (low, high, log) == (1e-6, 5e-4, True)
+
+
+@pytest.mark.parametrize("arm", ["ce", "vbll"])
+def test_the_optimiser_driven_arms_keep_the_full_trunk_range(arm):
+    # The cap is a property of the conjugate update, not a budget cut applied
+    # unevenly -- so it must NOT leak onto the arms that do not need it.
+    trial = RecordingTrial()
+    fs.suggest(trial, arm)
+    _kind, low, high, log = trial.axes["lr"]
+    assert (low, high, log) == (1e-6, 1e-3, True)
+
+
+def test_only_the_top_of_the_trunk_range_differs_between_arms():
+    # Same floor on every arm: the cap removes the top half-decade and nothing
+    # else, so IBProbit can still reach every trunk rate the others can bar
+    # that slice.
+    assert fs.IBPROBIT_TRUNK_LR_BOX[0] == fs.TRUNK_LR_BOX[0]
+    assert fs.IBPROBIT_TRUNK_LR_BOX[1] < fs.TRUNK_LR_BOX[1]
