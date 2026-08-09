@@ -741,7 +741,12 @@ def main(args, on_dump=None) -> None:
         print(f"[finetune] train time: {train_time:.3f}s total "
               f"(no post-compile step to report a rate for)")
 
-    print(f"[finetune] done: {dump_index} dumps under "
+    # eval_index, not dump_index: dump_index is bound only inside the
+    # trajectory branch, so with --dump-every-k-evals 0 (every tuning trial) it
+    # never exists and this line raised UnboundLocalError AFTER the run had
+    # trained correctly and written its dump -- turning a good trial into a
+    # FAILED one at the very last statement.
+    print(f"[finetune] done: {eval_index} evaluations under "
           f"{args.dump_root}/{args.group_id}/{args.uid}")
 
 

@@ -168,3 +168,31 @@ def test_enable_mlflow_flags_were_removed():
         )
 
 
+
+
+def test_main_has_no_unbound_locals_on_the_tuning_path():
+    """Every name `main` reads must be bound on the --dump-every-k-evals 0 path.
+
+    `dump_index` is assigned only inside the trajectory-dump branch, which a
+    tuning trial never enters, yet the closing summary referenced it. The run
+    trained correctly, wrote its dump, and THEN died with UnboundLocalError on
+    its last statement -- Optuna recorded a FAILED trial for a run that had
+    succeeded. A compile-level check catches this class without a GPU.
+    """
+    import symtable
+    import inspect
+
+    source = inspect.getsource(fj.main)
+    # Dedent so symtable can parse the method body standalone.
+    lines = source.splitlines()
+    indent = len(lines[0]) - len(lines[0].lstrip())
+    dedented = "\n".join(line[indent:] if len(line) > indent else line
+                         for line in lines)
+    table = symtable.symtable(dedented, "main", "exec").get_children()[0]
+
+    # Names assigned only under a conditional are still "local" to symtable, so
+    # this cannot prove general safety -- but it does pin the specific one.
+    assert "dump_index" not in {
+        s.get_name() for s in table.get_symbols()
+        if s.is_referenced() and not s.is_assigned()
+    }
