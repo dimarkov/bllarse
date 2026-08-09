@@ -7,7 +7,10 @@ authors = [
     { name = "Dimitrije Markovic", email = "5038100+dimarkov@users.noreply.github.com" },
     { name = "Conor Heins", email = "conor.heins@gmail.com" }
 ]
-requires-python = ">=3.11"
+# 3.12 is the floor because jax 0.11 requires it. Every environment
+# this project runs in (local venv, the Raven fine-tuning venv, both
+# container images) is already 3.12, so this drops no platform in use.
+requires-python = ">=3.12"
 dependencies = [
     "datasets>=3.5.0",
     "equimo>=0.3.3",
@@ -15,7 +18,13 @@ dependencies = [
     "tqdm>=4.67.1",
     "pillow>=11.1.0",
     "ipykernel>=6.29.5",
-    "jax[cuda]>=0.6.2",
+    # PINNED, not a floor. `>=0.6.2` let every environment resolve whatever
+    # was newest the day it was built, so the local venv landed on 0.10.0 and
+    # Raven's on 0.9.2 -- a difference nobody chose, sitting inside every
+    # cross-machine throughput comparison. Campaign results have to be
+    # attributable to the campaign, not to which day an environment was
+    # created.
+    "jax[cuda]==0.11.0",
     "optax>=0.2.4",
     "tfp-nightly[jax]>=0.25",
     "dotenv<1.0.0",

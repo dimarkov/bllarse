@@ -99,14 +99,24 @@ def _write_best(args, best, last_eval_index):
     leaves `main` by exception, and a `_write_best` outside the `finally` would
     silently produce no dump for exactly the trials that converged.
 
-    `best` is None only if not a single evaluation happened, which
-    `resolve_plan` already refuses -- so reaching it here means the loop died
-    before its first evaluation, and raising beats leaving an empty dump
-    directory that scores as a missing run.
+    `best` is None for TWO reasons that need telling apart, because they call
+    for opposite responses. Either no evaluation ran (a budget shorter than one
+    eval interval, which `resolve_plan` already refuses), or evaluations ran
+    and every one was non-finite -- a diverged run, which is a result. On the
+    probing side the single-cause message sent a reader hunting a budget bug on
+    a run that had completed 30,000 evaluations of pure nan.
     """
     if best is None:
+        if not last_eval_index:
+            raise ValueError(
+                f"{args.uid}: no evaluation ran, so there is no dump to write. "
+                f"The step budget is shorter than one eval interval."
+            )
         raise ValueError(
-            f"{args.uid}: no evaluation ran, so there is no dump to write."
+            f"{args.uid}: {last_eval_index} evaluations ran and EVERY ONE had "
+            f"a non-finite val_nll, so there is no dump to write. This is a "
+            f"diverged run, not a misconfigured budget -- the argmin buffer "
+            f"only ever accepts finite values."
         )
     for split_name, logits, labels in best["splits"]:
         evaldump.write_dump(

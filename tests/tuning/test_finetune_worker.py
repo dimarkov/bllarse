@@ -38,7 +38,7 @@ def _params(arm):
 @pytest.mark.parametrize("arm", fw.SCRIPTS)
 def test_every_arm_carries_the_tuning_protocol(arm):
     config = fw.trial_config(arm, params=_params(arm))
-    assert config["max_samples"] == 1_000_000
+    assert config["max_samples"] == 2_000_000
     assert config["eval_quantum"] == 16_384
     assert config["img_size"] == 224
     assert config["model"] == "dinov3_large"

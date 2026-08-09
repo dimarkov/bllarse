@@ -216,15 +216,26 @@ def _write_best(args, best, last_eval_index):
     """Write the buffered argmin-val_nll evaluation. The run's ONLY disk write.
 
     Called from a `finally`, so it runs whether the loop finished its budget or
-    was stopped by an EarlyConvergence raised out of `on_dump`. `best` is None
-    only if not a single evaluation happened -- a budget shorter than one eval
-    interval -- which is a misconfiguration rather than a result, so it raises
-    instead of leaving an empty dump directory that scores as a missing run.
+    was stopped by an EarlyConvergence raised out of `on_dump`.
+
+    `best` is None for TWO reasons that need telling apart, because they call
+    for opposite responses. Either no evaluation ran at all (a budget shorter
+    than one eval interval -- a misconfiguration), or evaluations ran and every
+    single one was non-finite (the run diverged -- a result). The message used
+    to name only the first, and duly sent a reader hunting for a budget bug on
+    a run that had completed 30,000 evaluations of pure nan.
     """
     if best is None:
+        if not last_eval_index:
+            raise ValueError(
+                f"{args.uid}: no evaluation ran, so there is no dump to write. "
+                f"The step budget is shorter than one eval interval."
+            )
         raise ValueError(
-            f"{args.uid}: no evaluation ran, so there is no dump to write. "
-            f"The step budget is shorter than one eval interval."
+            f"{args.uid}: {last_eval_index} evaluations ran and EVERY ONE had "
+            f"a non-finite val_nll, so there is no dump to write. This is a "
+            f"diverged run, not a misconfigured budget -- the argmin buffer "
+            f"only ever accepts finite values."
         )
     for split_name, logits, labels, score in best["splits"]:
         evaldump.write_dump(

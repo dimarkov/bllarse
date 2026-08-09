@@ -40,13 +40,13 @@ def test_steps_for_epochs_rejects_a_budget_yielding_no_steps():
 def test_steps_for_samples_matches_the_tuning_budget():
     # 2,000,000 samples, drop-remainder, at each rung of the ladder.
     at = protocol.steps_for_samples
-    assert at(protocol.MAX_SAMPLES, 256) == 3906
-    assert at(protocol.MAX_SAMPLES, 512) == 1953
-    assert at(protocol.MAX_SAMPLES, 1024) == 976
-    assert at(protocol.MAX_SAMPLES, 2048) == 488
-    assert at(protocol.MAX_SAMPLES, 4096) == 244
-    assert at(protocol.MAX_SAMPLES, 8192) == 122
-    assert at(protocol.MAX_SAMPLES, 16384) == 61
+    assert at(protocol.MAX_SAMPLES, 256) == 7812
+    assert at(protocol.MAX_SAMPLES, 512) == 3906
+    assert at(protocol.MAX_SAMPLES, 1024) == 1953
+    assert at(protocol.MAX_SAMPLES, 2048) == 976
+    assert at(protocol.MAX_SAMPLES, 4096) == 488
+    assert at(protocol.MAX_SAMPLES, 8192) == 244
+    assert at(protocol.MAX_SAMPLES, 16384) == 122
 
 
 def test_steps_for_samples_rejects_a_budget_yielding_no_steps():
@@ -73,7 +73,7 @@ def test_every_ladder_rung_yields_the_same_number_of_evaluations():
         // protocol.eval_every_steps(batch)
         for batch in (256, 512, 1024, 2048, 4096, 8192, 16384)
     }
-    assert set(counts.values()) == {61}, counts
+    assert set(counts.values()) == {122}, counts
 
 
 def test_eval_every_steps_rejects_an_off_ladder_batch():

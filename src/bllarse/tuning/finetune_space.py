@@ -45,7 +45,7 @@ ARMS = ("ce", "vbll", "ibprobit", "ibprobit_noeps")
 # for that rung (protocol.eval_every_steps raises rather than silently
 # evaluating on a per-trial grid), and 16,384 divides itself -- so it is the
 # largest batch this protocol can carry, and every rung from 256 up yields
-# exactly 61 evaluations.
+# exactly 122 evaluations.
 #
 # It is NOT bounded by memory. The design doc said "here the ceiling is memory"
 # and capped the ladder at 4096, but gradient accumulation absorbs the
@@ -59,7 +59,7 @@ ARMS = ("ce", "vbll", "ibprobit", "ibprobit_noeps")
 # real evidence for.
 #
 # The top rungs are a genuinely different regime, not just bigger: at 16,384
-# the whole 1M-sample budget is 61 optimizer steps and evaluation happens
+# the whole 2M-sample budget is 122 optimizer steps and evaluation happens
 # after EVERY step. Whether that trains well is exactly what design D5 means by
 # treating batch tolerance as a method property -- so it is TPE's to discover,
 # not the ladder's to prejudge.

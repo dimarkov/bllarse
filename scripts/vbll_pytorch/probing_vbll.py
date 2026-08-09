@@ -103,9 +103,16 @@ def _write_best(args, best, last_eval_index):
     `on_dump` still leaves the run scoreable.
     """
     if best is None:
+        if not last_eval_index:
+            raise ValueError(
+                f"{args.uid}: no evaluation ran, so there is no dump to write. "
+                f"The step budget is shorter than one eval interval."
+            )
         raise ValueError(
-            f"{args.uid}: no evaluation ran, so there is no dump to write. "
-            f"The step budget is shorter than one eval interval."
+            f"{args.uid}: {last_eval_index} evaluations ran and EVERY ONE had "
+            f"a non-finite val_nll, so there is no dump to write. This is a "
+            f"diverged run, not a misconfigured budget -- the argmin buffer "
+            f"only ever accepts finite values."
         )
     for split_name, logits, labels, score in best["splits"]:
         evaldump.write_dump(
