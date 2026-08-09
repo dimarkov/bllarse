@@ -2,9 +2,10 @@
 
 This is Fig 1 proper, not the single-backbone stand-in: the x-axis is the
 backbone ladder, which is the claim the figure exists to support -- that the
-advantage does not wash out as the backbone gets stronger. IBProbit is absent
-pending the q change; the three lines here are the comparators it will be
-measured against.
+advantage does not wash out as the backbone gets stronger.
+
+Four lines: AdamW+CE, AdamW+CE+TS, VBLL and IBProbit. TS is a series on CE
+alone, not a per-arm variant -- see LINES.
 
 Every point is that run's VAL-OPTIMAL step, not its endpoint (see
 scripts/analysis/fig1_curves.py). The companion figure plots the endpoint
@@ -35,10 +36,26 @@ METRICS = [("acc", "Accuracy ↑"), ("ece", "ECE (20 bin) ↓"),
            ("nll", "NLL ↓"), ("brier", "Brier ↓")]
 
 # (label, arm, metric prefix, colour, marker)
+#
+# The `ts_` prefix appears on adamw_ce ALONE, and that is the comparison the
+# paper makes: temperature scaling is the cheap post-hoc fix available to a
+# plain softmax head, so it belongs beside CE as its own comparator. VBLL and
+# IBProbit are shown RAW because their claim is calibration by construction --
+# temperature-scaling them would measure how much a one-parameter rescaling can
+# rescue a method that says it does not need one.
+#
+# (The ts_ numbers exist for every arm in fig1_curves.json and are worth a
+# sentence in the text: on food101 CE+TS reaches ECE 0.0081 against IBProbit's
+# raw 0.0073, so the calibration advantage is not unconditional. It does not
+# belong on this figure, which would then have seven lines.)
 LINES = [
     ("AdamW+CE",    "adamw_ce", "",    "#4C72B0", "o"),
     ("AdamW+CE+TS", "adamw_ce", "ts_", "#55A868", "s"),
     ("VBLL",        "vbll",     "",    "#C44E52", "^"),
+    # Absent until now: fig1_curves.GROUPS grew to four arms when the campaign
+    # did, and this list did not -- so the figure silently plotted three series
+    # from a four-arm experiment.
+    ("IBProbit",    "ibprobit", "",    "#8172B2", "D"),
 ]
 
 
@@ -86,10 +103,10 @@ def make_figure(summary, out_path):
                 ax.set_xlabel("DINOv3 scale", fontsize=8)
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False,
+    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False,
                fontsize=9, bbox_to_anchor=(0.5, 1.005))
     fig.suptitle(
-        "Fig 1 (IBProbit absent) — linear probing on frozen DINOv3, "
+        "Fig 1 — linear probing on frozen DINOv3, "
         "10 seeds, bands ±1 sd\n"
         "each point at its val-optimal step; only H+ was tuned, "
         "its config applied across the ladder",

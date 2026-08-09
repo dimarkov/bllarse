@@ -1,4 +1,4 @@
-"""Draft Fig 2: OOD detection from frozen DINOv3-H+ features, without IBProbit.
+"""Fig 2: OOD detection from frozen DINOv3-H+ features.
 
 Reads the JSON written by scripts/analysis/fig2_detection.py (which runs where
 the dumps are). Three ID/OOD pairs across the columns, the three detection
@@ -42,6 +42,9 @@ SERIES = [
     ("adamw_ce", "entropy", "CE / entropy",   "#6C8EBF"),
     ("vbll",     "msp",     "VBLL / MSP",     "#C44E52"),
     ("vbll",     "entropy", "VBLL / entropy", "#D98C8E"),
+    # Added with the campaign's third arm; this list had been left at two.
+    ("ibprobit", "msp",     "IBProbit / MSP",     "#8172B2"),
+    ("ibprobit", "entropy", "IBProbit / entropy", "#A093C7"),
 ]
 
 # ID control: the four classification metrics, keyed by ID dataset. Undefined on
@@ -49,7 +52,8 @@ SERIES = [
 # the detection panels -- but without them a detection number is uninterpretable.
 ID_METRICS = [("acc", "Accuracy ↑"), ("ece", "ECE ↓"), ("nll", "NLL ↓"), ("brier", "Brier ↓")]
 ID_DATASETS = [("cifar10", "CIFAR-10"), ("cifar100", "CIFAR-100")]
-ID_ARMS = [("adamw_ce", "AdamW+CE", "#4C72B0"), ("vbll", "VBLL", "#C44E52")]
+ID_ARMS = [("adamw_ce", "AdamW+CE", "#4C72B0"), ("vbll", "VBLL", "#C44E52"),
+           ("ibprobit", "IBProbit", "#8172B2")]
 
 
 def make_figure(summary, out_path):
@@ -94,7 +98,7 @@ def make_figure(summary, out_path):
                 ax.set_ylabel(metric_label, fontsize=9)
 
     fig.suptitle(
-        "DRAFT Fig 2 — OOD detection from frozen DINOv3-H+ features, IBProbit absent\n"
+        "Fig 2 — OOD detection from frozen DINOv3-H+ features\n"
         "hyperparameters tuned for in-distribution val_nll, not for OOD; "
         "bands are ±1 sd over seeds",
         fontsize=9.5, y=1.02,
