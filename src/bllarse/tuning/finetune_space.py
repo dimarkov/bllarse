@@ -46,18 +46,25 @@ MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 
 # Per-forward batch, per arm, for dinov3_huge at 224 with bf16.
 #
-# 16 is the EMPIRICALLY PROVEN value: eleven full_finetune_comparison runs of
-# ~6 hours each completed on it, peaking at 24.05 GiB of 42.4 GB.
+# 32 on both arms; 64 OOMs on both. Measured by
+# scripts/finetune/probe_micro_batch.py running a FULL optimizer step --
+# optimizer state allocated, two micro-batches accumulated, apply_grads, then a
+# jitted eval chunk -- because a bare micro-grad measurement is not the peak the
+# loop reaches.
 #
-# It is deliberately NOT the 64 that scripts/finetune/probe_micro_batch.py
-# first reported. That probe measured `ce_micro_grad` in ISOLATION, while the
-# real loop calls the same kernel holding ~13.5 GB it never allocated -- AdamW's
-# two moment buffers (2 x 3.4 GB at 840M fp32 params) from `optimizer.init`,
-# plus the `grads_acc` accumulation buffer. 3.4 + 22.6 = 26 GB fits in 40;
-# 13.5 + 22.6 = 36 GB does not, and a smoke trial OOMed on exactly that.
-# The probe now allocates the optimizer state, accumulates two micro-batches,
-# runs apply_grads and forwards an eval chunk, so it measures the peak the loop
-# actually reaches.
+# It cross-checks against two independent data points. Eleven
+# full_finetune_comparison runs completed at micro=16 on a 32 GB card, and the
+# fixed state here is ~13.5 GB (AdamW's two moment buffers at 2 x 3.4 GB for
+# 840M fp32 params, plus the grads_acc buffer). Activations scale about
+# linearly in the micro batch, so 13.5 + A(16) fits 32 GB and 13.5 + A(32) fits
+# 40 GB while A(64) does not -- which is exactly what the probe found.
+#
+# Two earlier answers were wrong and are recorded so they are not re-derived:
+# 64 came from measuring `ce_micro_grad` in ISOLATION (3.4 GB of backbone
+# instead of 13.5 GB of resident state -- 26 GB fits in 40, 36 GB does not, and
+# a smoke trial OOMed on exactly that); 4 came from a probe whose eval leg ran
+# OUTSIDE jit, materialising a bf16 copy of the whole backbone and every
+# layer's activations instead of letting XLA fuse them.
 #
 # `vbll` is absent until the PyTorch arm exists to measure it against -- a
 # different framework and a different activation profile, so the JAX number
@@ -66,8 +73,8 @@ MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 # Values must satisfy probe_micro_batch.floor_to_ladder_divisor: a power of two
 # no larger than 256 (the ladder's gcd), so num_accum is exact at every rung.
 MICRO_BATCH: dict[str, int] = {
-    "ce": 16,
-    "ibprobit": 16,
+    "ce": 32,
+    "ibprobit": 32,
 }
 
 # Pinned, not searched -- the ONE head axis the probing campaign transfers as a

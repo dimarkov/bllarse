@@ -66,14 +66,14 @@ def test_micro_batch_refuses_to_guess():
         fs.micro_batch("vbll")
 
 
-def test_the_pinned_micro_batch_is_the_one_that_actually_ran():
-    # 16, not the 64 an isolated micro-grad measurement suggested. Eleven ~6 h
-    # full_finetune_comparison runs completed at 16, peaking at 24.05 GiB of
-    # 42.4 GB; a smoke trial at 64 OOMed, because the real loop holds AdamW's
-    # two moment buffers and grads_acc -- ~13.5 GB the isolated kernel never
-    # allocated.
-    assert fs.MICRO_BATCH["ce"] == 16
-    assert fs.MICRO_BATCH["ibprobit"] == 16
+def test_the_pinned_micro_batch_matches_the_full_step_measurement():
+    # 32 on both arms, 64 OOMs on both, measured by running a FULL optimizer
+    # step (optimizer state + accumulation + apply_grads + jitted eval), not a
+    # bare micro-grad. Cross-checks against micro=16 having run on a 32 GB card:
+    # ~13.5 GB of fixed state plus activations that scale about linearly means
+    # 16 fits 32 GB and 32 fits 40 GB while 64 does not.
+    assert fs.MICRO_BATCH["ce"] == 32
+    assert fs.MICRO_BATCH["ibprobit"] == 32
     assert "A100" in fs.MICRO_BATCH_DEVICE
 
 
