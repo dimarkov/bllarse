@@ -73,11 +73,23 @@ mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 [[ -n "${BLLARSE_HF_HOME:-}" ]] && export HF_HOME="$BLLARSE_HF_HOME"
 [[ -n "${BLLARSE_EVAL_DUMP_ROOT:-}" ]] && mkdir -p "$BLLARSE_EVAL_DUMP_ROOT"
 
-# See slurm_tune.sh for the full account: XLA's CUDA-graph command-buffer
-# capture collides with the platform allocator and kills workers mid-trial with
-# `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` at large batches. The empty value
-# disables command buffers. Do NOT remove this as a no-op flag.
-export XLA_FLAGS="--xla_gpu_enable_command_buffer="
+# NO XLA_FLAGS here, deliberately.
+#
+# slurm_tune.sh sets `--xla_gpu_enable_command_buffer=` and must: the probing
+# image (bllarse-jax.def) puts XLA_PYTHON_CLIENT_ALLOCATOR=platform in its
+# %environment, and CUDA-graph capture collides with that allocator, killing
+# workers mid-trial with CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED.
+#
+# This path runs in a VENV, which sets no such allocator, so the collision
+# cannot occur -- and disabling command buffers here cost a measured 2.2x:
+# 18.29 img/s with them off against 40.27 img/s with them on, same config, same
+# node, dinov3_huge at batch 512 / micro 32. A 32-layer ViT launches thousands
+# of small kernels per accumulated step and CUDA graphs are what amortise the
+# launches.
+#
+# If this ever moves back into a container that pins the platform allocator,
+# the flag has to come back WITH it. The flag is a property of the allocator,
+# not of the model.
 
 set -a; [ -f .env.secrets ] && . ./.env.secrets; set +a
 

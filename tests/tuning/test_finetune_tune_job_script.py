@@ -58,11 +58,22 @@ def test_it_puts_the_repo_src_ahead_of_the_venv(text):
     assert 'export PYTHONPATH="${repo_root}/src' in text
 
 
-def test_it_disables_xla_command_buffers(text):
-    # XLA's CUDA-graph command-buffer capture collides with the platform
-    # allocator and kills workers mid-trial at large batches. Verified live on
-    # the probing side before being added there; same failure mode here.
-    assert "--xla_gpu_enable_command_buffer=" in text
+def test_it_does_not_disable_xla_command_buffers(text):
+    """The opposite of the probing job script, on purpose.
+
+    slurm_tune.sh must disable command buffers because the probing IMAGE pins
+    XLA_PYTHON_CLIENT_ALLOCATOR=platform and CUDA-graph capture collides with
+    it. This path runs in a venv with no such allocator, and disabling them
+    measured 18.29 img/s against 40.27 img/s enabled -- a 2.2x tax for a
+    collision that cannot happen here.
+
+    The flag is a property of the ALLOCATOR, not of the model: if this ever
+    moves into a container that pins that allocator, it has to come back.
+    """
+    active = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "xla_gpu_enable_command_buffer" not in active
 
 
 def test_it_refuses_to_start_without_its_required_variables(text):
