@@ -85,6 +85,19 @@ EVAL_SPLITS = "val"
 DUMP_EVERY_K_EVALS = 0
 OOD_EVERY_K_DUMPS = 0
 
+# Where the pre-decoded uint8 training shard lives (bllarse.finetune.shards).
+#
+# Read from the environment because the path is a property of the cluster, not
+# of the campaign -- 193 GB of ImageNet-1k train that no repo constant should
+# name. `finetune_jax`'s argparser reads the same variable as its own default,
+# so the shard would be picked up even if this were absent; it is carried
+# through the CONFIG anyway so the study records which trials used it. An
+# unset variable is not a silent wrong answer, it is a silent SLOW one -- the
+# JPEG path measures ~40 img/s against the shard's ~220, which turns a 3 h
+# trial into 14 h and a 24 h worker's 7 trials into 1. The SLURM entry point
+# refuses to start without it for that reason.
+TRAIN_SHARDS_ENV = "BLLARSE_FT_SHARDS"
+
 VBLL_FIXED = {
     "parameterization": "diagonal",
     "vbll_type": "discriminative",
@@ -175,10 +188,18 @@ def trial_config(
     max_samples: int = protocol.MAX_SAMPLES,
     dump_root: Any = None,
     bf16: bool = True,
+    train_shards: Any = None,
 ) -> dict[str, Any]:
-    """A full training config for one sampled parameter set."""
+    """A full training config for one sampled parameter set.
+
+    `train_shards` defaults to $BLLARSE_FT_SHARDS; pass `""` to force the JPEG
+    path (which is what a machine without a built shard has to do).
+    """
     if arm not in SCRIPTS:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(SCRIPTS)}")
+
+    if train_shards is None:
+        train_shards = os.environ.get(TRAIN_SHARDS_ENV, "")
 
     params = dict(params)
     # head_lr is a MULTIPLE of the trunk rate, not an independent axis -- the
@@ -202,6 +223,8 @@ def trial_config(
     }
     if dump_root is not None:
         config["dump_root"] = str(dump_root)
+    if train_shards:
+        config["train_shards"] = str(train_shards)
 
     if arm == "vbll":
         config.update(VBLL_FIXED)
@@ -247,6 +270,10 @@ def make_objective(
         trial.set_user_attr("eval_quantum", protocol.EVAL_QUANTUM)
         trial.set_user_attr("micro_batch_size", config["micro_batch_size"])
         trial.set_user_attr("effective_batch", config["batch_size"])
+        # Recorded so a trial's wall-clock is interpretable after the fact: the
+        # same config costs ~3 h off the shard and ~14 h off JPEGs, and nothing
+        # else in the trial distinguishes the two.
+        trial.set_user_attr("train_shards", config.get("train_shards", ""))
 
         # The objective IS this minimum -- see objective.evaluate's `score`
         # note. Tracked here rather than read back off the dump because the

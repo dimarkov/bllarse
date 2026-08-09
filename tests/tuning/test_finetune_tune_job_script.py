@@ -78,8 +78,21 @@ def test_it_does_not_disable_xla_command_buffers(text):
 
 def test_it_refuses_to_start_without_its_required_variables(text):
     for var in ("BLLARSE_FT_ARM", "BLLARSE_FT_TRIALS",
-                "BLLARSE_FT_STORAGE", "BLLARSE_FT_VENV"):
+                "BLLARSE_FT_STORAGE", "BLLARSE_FT_VENV", "BLLARSE_FT_SHARDS"):
         assert var in text
+
+
+def test_it_checks_the_training_shard_before_taking_a_gpu(text):
+    """The one failure in this campaign that is slow rather than wrong.
+
+    Without a shard finetune_jax decodes JPEGs and every trial still completes
+    and is still scored -- at ~40 img/s against ~220, so a 24 h worker finishes
+    1 trial instead of 7 and the campaign silently takes five times as long.
+    Nothing in the results would look off.
+    """
+    assert "shard_meta=" in text
+    assert 'if [[ ! -f "$shard_meta" ]]; then' in text
+    assert "exit 2" in text
 
 
 def test_it_resolves_symlinked_paths(text):

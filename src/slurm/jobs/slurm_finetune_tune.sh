@@ -25,12 +25,31 @@
 
 set -euo pipefail
 
-for var in BLLARSE_FT_ARM BLLARSE_FT_TRIALS BLLARSE_FT_STORAGE BLLARSE_FT_VENV; do
+for var in BLLARSE_FT_ARM BLLARSE_FT_TRIALS BLLARSE_FT_STORAGE BLLARSE_FT_VENV \
+           BLLARSE_FT_SHARDS BLLARSE_FT_DATASET; do
   if [[ -z "${!var:-}" ]]; then
     echo "[ft-tune] ERROR: $var is not set." >&2
     exit 2
   fi
 done
+
+# The shard is checked HERE, before a GPU-hour is spent, because its absence is
+# a silent SLOW failure rather than a loud wrong one. finetune_jax falls back to
+# decoding JPEGs, which measured ~40 img/s against the shard's ~220: every trial
+# would still complete and still be scored, but a 24 h worker would finish 1
+# instead of 7 and the campaign would quietly take five times as long.
+#
+# open_shard's own refusal of an INCOMPLETE shard covers the other half (a
+# partial 193 GB file is mostly zeros, and zeros train as valid black images);
+# this only has to catch the path being wrong or unmounted.
+shard_meta="$(readlink -f "$BLLARSE_FT_SHARDS")/${BLLARSE_FT_DATASET}_train_${BLLARSE_FT_IMG_SIZE:-224}.json"
+if [[ ! -f "$shard_meta" ]]; then
+  echo "[ft-tune] ERROR: no training shard at $shard_meta." >&2
+  echo "[ft-tune] Build it once with scripts/finetune/build_shards.py, or" >&2
+  echo "[ft-tune] unset BLLARSE_FT_SHARDS to accept the ~5x slower JPEG path." >&2
+  exit 2
+fi
+export BLLARSE_FT_SHARDS
 
 if [[ $(type -t module || true) == function ]]; then
   module purge >/dev/null 2>&1 || true

@@ -141,6 +141,35 @@ def test_trial_config_rejects_an_unknown_arm():
         fw.trial_config("ivon", params={})
 
 
+# --- The pre-decoded training shard -----------------------------------------
+
+
+def test_the_shard_path_travels_in_the_config_not_only_the_environment(monkeypatch):
+    """So the STUDY records which trials read a shard.
+
+    finetune_jax's argparser defaults --train-shards from the same variable, so
+    the trial would find the shard either way. What the environment alone
+    cannot do is tell you, months later, why one trial took 3 h and another 14.
+    """
+    monkeypatch.setenv(fw.TRAIN_SHARDS_ENV, "/ptmp/user/shards")
+    config = fw.trial_config("ce", params=_params("ce"))
+    assert config["train_shards"] == "/ptmp/user/shards"
+
+
+def test_an_unset_shard_variable_leaves_the_key_out_entirely(monkeypatch):
+    # Not `""`: config_to_argv would emit `--train-shards ''`, which is the
+    # same fallback but now looks deliberate in the recorded config.
+    monkeypatch.delenv(fw.TRAIN_SHARDS_ENV, raising=False)
+    assert "train_shards" not in fw.trial_config("ce", params=_params("ce"))
+
+
+def test_an_explicit_empty_string_forces_the_jpeg_path(monkeypatch):
+    # A machine with no built shard has to be able to run a trial anyway.
+    monkeypatch.setenv(fw.TRAIN_SHARDS_ENV, "/ptmp/user/shards")
+    config = fw.trial_config("ce", params=_params("ce"), train_shards="")
+    assert "train_shards" not in config
+
+
 # --- Study identity and the pruner ------------------------------------------
 
 
