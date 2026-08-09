@@ -76,3 +76,19 @@ def test_it_resolves_symlinked_paths(text):
     # repeatedly cost a job by existing on the host and not where the process
     # actually looks.
     assert 'readlink -f' in text
+
+
+def test_it_unbuffers_python_stdout(text):
+    # Python block-buffers stdout to a file, so progress lines sit in an 8 KB
+    # buffer instead of the log. On a ~6 h trial that makes a hung job
+    # indistinguishable from a slow one.
+    assert "PYTHONUNBUFFERED=1" in text
+
+
+def test_it_configures_a_persistent_compilation_cache(text):
+    # Compiling the ViT-H fwd+bwd graph measured ~19 min, and finetune_jax
+    # clears caches in its `finally`, so each of a worker's 3 trials pays it
+    # again. Every trial has identical shapes (pinned micro batch, fixed eval
+    # chunk), so one cache entry serves the whole campaign.
+    assert "JAX_COMPILATION_CACHE_DIR" in text
+    assert "mkdir -p" in text

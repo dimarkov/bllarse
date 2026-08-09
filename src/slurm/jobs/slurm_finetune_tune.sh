@@ -50,6 +50,26 @@ mkdir -p "$storage_dir" slurm_logs
 # -- silently, since the package name is the same.
 export PYTHONPATH="${repo_root}/src${BLLARSE_FT_PYLIBS:+:${BLLARSE_FT_PYLIBS}}"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+
+# Python block-buffers stdout when it is a file, so every [finetune] progress
+# line sits in an 8 KB buffer instead of the log. On a ~6 h trial that makes a
+# hung job indistinguishable from a slow one -- the first smoke run reached 44
+# minutes with an empty log while it was in fact compiling normally.
+export PYTHONUNBUFFERED=1
+
+# Persistent XLA compilation cache, on the shared filesystem so every worker on
+# every node hits the same entries.
+#
+# Compiling the fwd+bwd graph for a 32-layer ViT-H measured ~19 minutes, and
+# finetune_jax calls jax.clear_caches() in its `finally`, so without this each
+# of the 3 trials in a worker pays it again. Across 306 trials that is ~100
+# A100-hours of pure compilation.
+#
+# It is cacheable because every trial has IDENTICAL shapes: the micro batch is
+# pinned (design A8) and the eval chunk is fixed, so batch_size varies only
+# num_accum, which is a Python loop count and not a traced dimension.
+export JAX_COMPILATION_CACHE_DIR="${BLLARSE_FT_JAX_CACHE:-/raven/ptmp/cheins/jax_cache}"
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 [[ -n "${BLLARSE_HF_HOME:-}" ]] && export HF_HOME="$BLLARSE_HF_HOME"
 [[ -n "${BLLARSE_EVAL_DUMP_ROOT:-}" ]] && mkdir -p "$BLLARSE_EVAL_DUMP_ROOT"
 
