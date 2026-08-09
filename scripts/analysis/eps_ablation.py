@@ -27,7 +27,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import numpy as np  # noqa: E402
+
+from bllarse import evaldump, metrics  # noqa: E402
 from fig1_curves import UID_RE, score_run  # noqa: E402
+
+# 4 backbones x 5 datasets x 10 seeds. Enumerated so a run that produced NO
+# dump at all is reported as such rather than quietly shrinking the matched
+# set: a diverged run raises before writing, so its absence IS the result.
+MODELS = ("dinov3_small", "dinov3_big", "dinov3_large", "dinov3_huge")
+DATASETS = ("oxford_pets", "dtd", "flowers102", "stanford_cars", "food101")
+SEEDS = tuple(range(137, 147))
 
 # The tuned arm first: deltas below are (noeps - tuned), so a POSITIVE delta on
 # a lower-is-better metric means dropping eps HURT.
@@ -35,8 +45,8 @@ TUNED_GROUP = "probe_ibprobit_fig1"
 NOEPS_GROUP = "probe_ibprobit_noeps_fig1"
 
 # Lower is better for all but acc.
-METRICS = ("nll", "acc", "ece", "brier", "ts_nll", "ts_ece")
-LOWER_IS_BETTER = {"nll", "ece", "brier", "ts_nll", "ts_ece"}
+METRICS = ("val_nll", "nll", "acc", "ece", "brier", "ts_nll", "ts_ece")
+LOWER_IS_BETTER = {"val_nll", "nll", "ece", "brier", "ts_nll", "ts_ece"}
 
 
 def collect_group(root, group_id):
@@ -52,9 +62,32 @@ def collect_group(root, group_id):
         scored = score_run(root, group_id, uid)
         if scored is None:
             continue
+        # val_nll at the same step the test metrics are read from. This is the
+        # SELECTION criterion, so it belongs beside the reported numbers -- an
+        # arm can win on val and lose on test, and that gap is worth seeing.
+        for record in evaldump.iter_dumps(root, group_id, uid):
+            if record.meta["split"] == "val" and record.meta["step"] == scored["step"]:
+                scored["val_nll"] = float(metrics.nll(record.logits, record.labels))
+                break
         key = (match["model"], match["dataset"], int(match["seed"]))
         out[key] = scored
     return out
+
+
+def missing_runs(root, group_id):
+    """Expected uids with no dump directory at all.
+
+    A diverged run raises inside _write_best before writing anything, so it
+    leaves no dump. Counting those separately matters here: "this arm failed to
+    produce a run" is an outcome of the ablation, not a gap in the data.
+    """
+    directory = os.path.join(root, group_id)
+    present = set(os.listdir(directory)) if os.path.isdir(directory) else set()
+    return sorted(
+        f"{m}_{d}_seed{s}"
+        for m in MODELS for d in DATASETS for s in SEEDS
+        if f"{m}_{d}_seed{s}" not in present
+    )
 
 
 def pair(tuned, noeps):
@@ -75,10 +108,16 @@ def _stats(values):
     }
 
 
-def summarize(pairs):
-    """Per (model, dataset) and overall, for each metric."""
+def summarize(pairs, by="model_dataset"):
+    """Per group and overall, for each metric.
+
+    `by="dataset"` collapses the four backbones, which is the view for deciding
+    which arm a FIGURE should show: the figure has a backbone axis, so a
+    per-dataset verdict is what carries across it.
+    """
     buckets = collections.defaultdict(lambda: collections.defaultdict(list))
     for (model, dataset, _seed), tuned, noeps in pairs:
+        model = model if by == "model_dataset" else ""
         for metric in METRICS:
             if metric in tuned and metric in noeps:
                 buckets[(model, dataset)][metric].append(
@@ -86,7 +125,8 @@ def summarize(pairs):
                 )
 
     rows = {}
-    for (model, dataset), by_metric in sorted(buckets.items()):
+    for (model, dataset), by_metric in sorted(
+            buckets.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         entry = {}
         for metric, values in by_metric.items():
             tuned_v = [t for t, _ in values]
@@ -103,7 +143,7 @@ def summarize(pairs):
                     1 for d in deltas if (d > 0) == (st.mean(deltas) > 0)
                 ),
             }
-        rows[f"{model}|{dataset}"] = entry
+        rows[f"{model}|{dataset}" if model else dataset] = entry
     return rows
 
 
@@ -151,6 +191,10 @@ def main():
     p.add_argument("--dump-root",
                    default=os.environ.get("BLLARSE_EVAL_DUMP_ROOT", "eval_dumps"))
     p.add_argument("--metric", default="nll", choices=METRICS)
+    p.add_argument("--by", default="dataset",
+                   choices=["dataset", "model_dataset"],
+                   help="dataset collapses the backbone ladder -- the view for "
+                        "deciding which arm a figure should show.")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 
@@ -163,10 +207,14 @@ def main():
     print(f"MATCHED pairs         : {len(pairs)}")
     print(f"unmatched (tuned only): {len(only_tuned)}")
     print(f"unmatched (noeps only): {len(only_noeps)}")
+    for label, group in (("tuned eps", TUNED_GROUP), ("eps=1e-12", NOEPS_GROUP)):
+        absent = missing_runs(args.dump_root, group)
+        print(f"NO DUMP AT ALL ({label:9s}): {len(absent)}"
+              + (f"  {absent}" if absent else ""))
     if not pairs:
         raise SystemExit("no matched pairs; nothing to compare")
 
-    rows = summarize(pairs)
+    rows = summarize(pairs, by=args.by)
     print()
     print(f"=== test {args.metric}, paired; delta = noeps - tuned "
           f"({'lower is better' if args.metric in LOWER_IS_BETTER else 'higher is better'}) ===")

@@ -28,11 +28,32 @@ from bllarse import evaldump, metrics
 # IBProbit head with eps_init pinned at 1e-12 instead of tuned -- and it is a
 # separate arm here rather than a variant of `ibprobit` because the two were
 # tuned independently and land on different hyperparameters.
+# "ibprobit" IS THE EPS-FREE VARIANT. The label carries no qualifier because
+# the method the paper presents has no contamination parameter -- so the
+# figures show `probe_ibprobit_noeps_{fig}`, not `probe_ibprobit_{fig}`.
+#
+# Read that mapping carefully before changing it: the group_id and the arm
+# label deliberately DISAGREE, which is exactly the kind of relabelling that
+# looks like a typo and gets "fixed" back into a silent swap of which sweep a
+# figure reports.
+#
+# The eps-tuned sweep is retained and reported as an ablation, not plotted
+# here. Measured over 199 matched (model, dataset, seed) pairs, the two arms
+# are indistinguishable on the selection criterion -- pooled val_nll delta
+# +0.0017 +- 0.0047, with the eps-free arm better on 98 of 199 -- while
+# accuracy and Brier marginally favour dropping eps. scripts/analysis/
+# eps_ablation.py regenerates those numbers.
+#
+# One caveat that belongs in the caption rather than in a comment: the eps-free
+# sweep has 199 of 200 runs. dinov3_huge/oxford_pets/seed144 produced non-finite
+# val_nll at every evaluation and wrote no dump, so that ONE cell carries 9
+# seeds instead of 10. The cause is not established -- it is not known whether
+# removing the mixture floor caused it or whether the eps parameterisation
+# itself is the numerically fragile part -- so it is reported, not explained.
 GROUPS = {
     "adamw_ce": "probe_adamw_ce_fig1",
     "vbll": "probe_vbll_fig1",
-    "ibprobit": "probe_ibprobit_fig1",
-    "ibprobit_noeps": "probe_ibprobit_noeps_fig1",
+    "ibprobit": "probe_ibprobit_noeps_fig1",
 }
 UID_RE = re.compile(r"^(?P<model>dinov3_[a-z0-9]+)_(?P<dataset>.+)_seed(?P<seed>\d+)$")
 METRIC_KEYS = ("acc", "ece", "nll", "brier")
