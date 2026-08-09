@@ -185,8 +185,28 @@ def test_learning_rate_is_searched_as_trunk_rate_and_ratio():
     trial = RecordingTrial()
     fs.suggest(trial, "ce")
     assert trial.axes["lr"] == ("float", 1e-6, 1e-3, True)
-    assert trial.axes["head_lr_ratio"] == ("float", 1.0, 1e3, True)
+    assert trial.axes["head_lr_ratio"] == ("float", 5.0, 1e3, True)
     assert "head_lr" not in trial.axes
+
+
+@pytest.mark.parametrize("arm", ["ce", "vbll"])
+def test_the_head_rate_is_always_at_least_five_times_the_trunk_rate(arm):
+    """A floor on the BOX, so every drawn config satisfies it by construction.
+
+    Ratio == 1 is one uniform rate across a pretrained 840M-parameter trunk and
+    a randomly initialised head, which need opposite things: fast enough to
+    overwrite the head's ~0.015 init scale inside 1.5 epochs is far too fast
+    for the trunk. Allowing the ratio to collapse to 1 contradicted the reason
+    this is parameterised as a ratio at all.
+    """
+    trial = RecordingTrial()
+    fs.suggest(trial, arm)
+    _kind, low, high, _log = trial.axes["head_lr_ratio"]
+    assert low >= fs.MIN_HEAD_LR_RATIO == 5.0
+    assert high > low
+    # RecordingTrial returns the low end, so the worst case a trial can draw
+    # is exactly the floor -- and even that keeps the head 5x faster.
+    assert low * 1.0 >= 5.0
 
 
 def test_tuning_seed_is_disjoint_from_the_reported_seeds():

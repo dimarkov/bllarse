@@ -139,8 +139,25 @@ PRIOR_SCALE_BOX = (1e-1, 1e3)
 # of 100. Two independent log-uniform axes spend trials sliding along that
 # diagonal. Same reparameterisation `space.py` applies for kl_ratio.
 TRUNK_LR_BOX = (1e-6, 1e-3)
-HEAD_LR_RATIO_BOX = (1.0, 1e3)
 TRUNK_WD_BOX = (1e-5, 1e-1)
+
+# The head rate is ALWAYS at least 5x the trunk rate. Because the RATIO is the
+# searched axis, this is a floor on the box rather than a rejected-sample
+# constraint: every config TPE draws satisfies it by construction, and no trial
+# is spent discovering that it should not.
+#
+# The floor was 1.0, which admitted ratio == 1 -- one uniform learning rate
+# across a pretrained 840M-parameter trunk and a randomly initialised head.
+# Those two need opposite things: any rate fast enough to overwrite the head's
+# ~0.015 init scale inside 1.5 epochs is far too fast for the trunk, and any
+# rate gentle enough for the trunk leaves the head near its init. That
+# opposition is the whole reason this is parameterised as a ratio, so allowing
+# the ratio to collapse to 1 contradicted the parameterisation.
+#
+# 5 is a floor, not a target: the box still spans to 1e3, and
+# full_finetune_comparison's own default sits at 100.
+MIN_HEAD_LR_RATIO = 5.0
+HEAD_LR_RATIO_BOX = (MIN_HEAD_LR_RATIO, 1e3)
 
 
 def micro_batch(arm: str) -> int:
