@@ -91,7 +91,7 @@ def build_optimizer(arm, backbone, head, *, lr, head_lr, weight_decay):
     return optimizer, optimizer.init(eqx.filter((backbone, head), eqx.is_array))
 
 
-def probe_ceiling(arm, backbone, loss_fn, head, optimizer, opt_state, *,
+def probe_ceiling(arm, backbone, loss_fn, head, make_optimizer, *,
                   img_size, init_bs, max_bs, eval_chunk, key, bf16,
                   num_update_iters) -> int:
     """Double the micro-batch until a FULL optimizer step OOMs.
@@ -117,6 +117,13 @@ def probe_ceiling(arm, backbone, loss_fn, head, optimizer, opt_state, *,
     `num_accum = 2` rather than the real ladder value: `grads_acc` is ONE
     param-sized buffer no matter how many micro-steps fold into it, so two is
     enough to allocate it and to exercise the add.
+
+    `make_optimizer` is a factory called ONCE PER ATTEMPT, not a prebuilt
+    state. `apply_grads` is `@eqx.filter_jit(donate="all-except-first")`, so it
+    DONATES `opt_state` -- reusing one across attempts hands the second attempt
+    a freed buffer and fails with `Array has been deleted with shape=int32[]`
+    (the AdamW step counter) rather than with an OOM. The model is not donated,
+    so backbone and head are safe to reuse.
     """
     bs = init_bs
     last_ok = None
@@ -129,7 +136,8 @@ def probe_ceiling(arm, backbone, loss_fn, head, optimizer, opt_state, *,
             images = jnp.zeros((bs, 3, img_size, img_size), dtype=jnp.float32)
             labels = jnp.zeros((bs,), dtype=jnp.int32)
             trial_backbone, trial_head = backbone, head
-            trial_loss, trial_state = loss_fn, opt_state
+            optimizer, trial_state = make_optimizer()
+            trial_loss = loss_fn
             fts = []
 
             for _ in range(2):
@@ -172,8 +180,11 @@ def probe_ceiling(arm, backbone, loss_fn, head, optimizer, opt_state, *,
 
             jax.block_until_ready(logits)
             last_ok = bs
+            peak = jax.local_devices()[0].memory_stats() or {}
+            peak_gib = peak.get("peak_bytes_in_use", 0) / 2**30
             print(f"[probe] {arm} micro_batch_size={bs} OK "
-                  f"(full step + eval chunk {eval_chunk})", flush=True)
+                  f"(full step + eval chunk {eval_chunk}), "
+                  f"peak {peak_gib:.2f} GiB", flush=True)
         except Exception as exc:
             message = str(exc)
             if any(m in message for m in _OOM_MARKERS) or \
@@ -247,17 +258,18 @@ def main(args) -> None:
         loss_fn = IBProbit(embed_dim, args.num_classes, key=head_key,
                            batch_size=LADDER_GCD)
 
-    # Allocated BEFORE the probe loop, exactly as finetune_jax.main does: this
-    # is ~2x params of resident state (AdamW's moment buffers) that the loop
-    # never gets to hand back, and omitting it is what made the first version
-    # of this probe report a micro-batch the real run OOMs on.
-    optimizer, opt_state = build_optimizer(
-        args.arm, backbone, head,
-        lr=args.lr, head_lr=args.head_lr, weight_decay=args.weight_decay)
-    print("[probe] optimizer state allocated", flush=True)
+    # A FACTORY, not a prebuilt state: apply_grads donates opt_state, so each
+    # attempt needs its own. The allocation itself is the point -- AdamW's two
+    # moment buffers are ~2x params of resident state (~6.7 GB on dinov3_huge)
+    # that the training loop never hands back, and omitting them is what made
+    # the first version of this probe report a micro-batch the real run OOMs on.
+    def make_optimizer():
+        return build_optimizer(
+            args.arm, backbone, head,
+            lr=args.lr, head_lr=args.head_lr, weight_decay=args.weight_decay)
 
     probed = probe_ceiling(
-        args.arm, backbone, loss_fn, head, optimizer, opt_state,
+        args.arm, backbone, loss_fn, head, make_optimizer,
         img_size=args.img_size, init_bs=args.batch_size_init,
         max_bs=args.batch_size_max, eval_chunk=args.eval_chunk,
         key=fwd_key, bf16=args.bf16, num_update_iters=args.num_update_iters,

@@ -99,3 +99,21 @@ def test_the_ce_optimizer_gives_the_head_zero_weight_decay():
     source = inspect.getsource(pmb.build_optimizer)
     assert "weight_decay=0.0" in source
     assert "multi_transform" in source
+
+
+def test_probe_ceiling_builds_a_fresh_optimizer_state_per_attempt():
+    """apply_grads is @eqx.filter_jit(donate="all-except-first").
+
+    It DONATES opt_state, so a state reused across attempts is a freed buffer
+    by the second one -- which surfaces as `Array has been deleted with
+    shape=int32[]` (the AdamW step counter), not as an OOM, and so gets
+    mistaken for the ceiling. This asserts the factory is called once per
+    attempt rather than hoisted.
+    """
+    import inspect
+
+    source = inspect.getsource(pmb.probe_ceiling)
+    assert "make_optimizer()" in source
+    # Inside the attempt body, not before the loop.
+    body = source.split("while bs <= max_bs:", 1)[1]
+    assert "make_optimizer()" in body
