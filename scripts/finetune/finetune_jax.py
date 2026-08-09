@@ -293,6 +293,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--group-id", default="finetune")
     p.add_argument("--uid", default=None)
     p.add_argument("--split-cache-dir", default=".cache/splits")
+    p.add_argument(
+        "--train-shards", default=os.environ.get("BLLARSE_FT_SHARDS", ""),
+        help="Directory holding a pre-decoded uint8 shard (see "
+             "scripts/finetune/build_shards.py). When set, training reads the "
+             "shard instead of decoding JPEGs -- measured ~5x on the step, "
+             "because decode contends with JAX dispatch for the GIL rather "
+             "than being slow in itself. Batch order is unchanged.",
+    )
     p.add_argument("--seed", type=int, default=137)
     p.add_argument("--device", default="gpu")
 
@@ -305,26 +313,35 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def stream_micro_batches(train_split, ds_config, micro, img_size, mean, std,
-                         total_micro, seed, num_workers=16):
+                         total_micro, seed, num_workers=16, shard=None):
     """Yield exactly `total_micro` micro-batches, reshuffling between passes.
 
     The permutation comes from protocol.shuffled_indices (numpy), NOT jax.random,
     so the PyTorch arm reproduces this exact order. Short trailing batches are
     skipped to keep the jitted shape constant.
 
-    Each epoch's decode+resize is wrapped in vit_classification.prefetch_iterator
-    (n_prefetch=10, same as full_finetune_comparison.stream_batches), so JPEG
-    decode for the NEXT micro-batch runs on a background thread while the
-    current one trains -- without it, decode is inline on the main thread and
-    overlap is one micro-batch deep. The wrap is per-epoch (a fresh generator
-    and a fresh prefetch_iterator each time `order` is reshuffled), mirroring
-    full_finetune_comparison.py exactly, rather than one prefetch_iterator over
-    an unbounded stream.
+    `shard`, when given, is a shards.ShardReader and replaces per-image JPEG
+    decode with one gather out of a memmap. The batch ORDER is identical either
+    way -- row i of a shard is row i of the split, which is exactly why the
+    shard is invisible to `shuffled_indices` and therefore to the PyTorch arm.
+    That equivalence is the load-bearing property; a shard that permuted its
+    rows would desynchronise the two arms silently.
+
+    Sharding matters because the step is not the bottleneck. On an A100 one
+    dinov3_large step runs at 220 img/s with synthetic inputs and ~40 through
+    this function's JPEG path -- decode contends with JAX dispatch for the GIL,
+    and a fresh ThreadPoolExecutor per micro-batch makes it worse.
+
+    Each epoch is wrapped in vit_classification.prefetch_iterator (n_prefetch=10)
+    so the NEXT micro-batch is prepared while the current one trains. Kept for
+    the shard path too: the gather is far cheaper than decode but still not
+    free, and overlapping it costs nothing.
     """
     from vit_classification import prefetch_iterator
 
-    n = len(train_split)
-    labels_all = np.asarray(train_split[ds_config["label_key"]])
+    n = len(shard) if shard is not None else len(train_split)
+    labels_all = (np.asarray(shard.labels) if shard is not None
+                  else np.asarray(train_split[ds_config["label_key"]]))
     emitted, epoch = 0, 0
     while emitted < total_micro:
         order = protocol.shuffled_indices(n, seed, epoch)
@@ -332,10 +349,13 @@ def stream_micro_batches(train_split, ds_config, micro, img_size, mean, std,
         def _epoch_batches(order=order):
             for start in range(0, n - micro + 1, micro):
                 batch_idx = order[start:start + micro]
-                images = imagenet.load_images_uint8(
-                    train_split, ds_config["img_key"], img_size, batch_idx,
-                    num_workers=num_workers,
-                )
+                if shard is not None:
+                    images = shard.take(batch_idx)
+                else:
+                    images = imagenet.load_images_uint8(
+                        train_split, ds_config["img_key"], img_size, batch_idx,
+                        num_workers=num_workers,
+                    )
                 yield (jnp.asarray(imagenet.normalize_chunk(images, mean, std)),
                        jnp.asarray(labels_all[batch_idx]))
 
@@ -565,9 +585,20 @@ def main(args, on_dump=None) -> None:
         optimizer = optax.adamw(args.lr, weight_decay=args.weight_decay)
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
 
+    shard = None
+    if args.train_shards:
+        from bllarse.finetune import shards as shards_mod
+        # open_shard REFUSES an incomplete shard: a partial 193 GB file is
+        # mostly zeros, and zeros train as valid black images -- the run would
+        # look merely bad rather than broken.
+        shard = shards_mod.open_shard(
+            args.train_shards, args.dataset, "train", args.img_size)
+        print(f"[finetune] training from shard: {len(shard)} rows "
+              f"({args.train_shards})")
+
     micro_iter = stream_micro_batches(
         train_split, ds_config, plan["micro"], args.img_size, mean, std,
-        plan["steps"] * plan["num_accum"], args.seed,
+        plan["steps"] * plan["num_accum"], args.seed, shard=shard,
     )
 
     # The argmin-val_nll evaluation, held in memory and written once from the

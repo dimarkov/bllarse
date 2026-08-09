@@ -864,3 +864,46 @@ def test_main_raises_when_val_nll_is_not_finite_at_a_dump(tmp_path, monkeypatch)
 
     with pytest.raises(RuntimeError, match=r"step 1.*val_nll"):
         fj.main(args, on_dump=None)
+
+
+# --- Sharding is a pure speed change ----------------------------------------
+
+
+def test_the_shard_path_and_the_jpeg_path_yield_identical_micro_batches(tmp_path):
+    """Same images, same labels, same order -- byte for byte.
+
+    A shard exists only to remove JPEG decode from the training loop (measured
+    220 img/s synthetic against ~40 through the live path on an A100). If it
+    changed the stream at all, the JAX and PyTorch arms would train on
+    different data under the same seed, and both would still produce plausible
+    loss curves -- there is no downstream check that could catch it.
+    """
+    from bllarse.finetune import shards
+
+    n, size, micro = 16, 4, 4
+    split = FakeDatasetSplit(_fake_images(n, size), [i % 3 for i in range(n)])
+    ds_config = {"img_key": "image", "label_key": "label"}
+    mean, std = np.zeros(3), np.ones(3)
+
+    shards.build_shard(
+        split, img_key="image", label_key="label", img_size=size,
+        root=tmp_path, dataset="fake", split="train", num_workers=2, chunk=8)
+    reader = shards.open_shard(tmp_path, "fake", "train", size)
+
+    fake_vit = types.ModuleType("vit_classification")
+    fake_vit.prefetch_iterator = _fake_prefetch_iterator
+    sys.modules["vit_classification"] = fake_vit
+    try:
+        total = 6
+        jpeg = list(fj.stream_micro_batches(
+            split, ds_config, micro, size, mean, std, total, seed=137))
+        sharded = list(fj.stream_micro_batches(
+            split, ds_config, micro, size, mean, std, total, seed=137,
+            shard=reader))
+    finally:
+        del sys.modules["vit_classification"]
+
+    assert len(jpeg) == len(sharded) == total
+    for (ji, jl), (si, sl) in zip(jpeg, sharded):
+        np.testing.assert_array_equal(np.asarray(ji), np.asarray(si))
+        np.testing.assert_array_equal(np.asarray(jl), np.asarray(sl))
