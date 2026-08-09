@@ -29,6 +29,7 @@ load_dotenv(".env.secrets", override=False)
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
+import optax  # noqa: E402
 from jax import random as jr  # noqa: E402
 
 from bllarse.finetune import jax_steps  # noqa: E402

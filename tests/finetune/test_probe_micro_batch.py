@@ -56,3 +56,46 @@ def test_floor_to_ladder_divisor_never_exceeds_the_measurement():
 def test_floor_to_ladder_divisor_rejects_a_nonpositive_measurement():
     with pytest.raises(ValueError, match="probed"):
         pmb.floor_to_ladder_divisor(0)
+
+
+# --- build_optimizer: exercised on CPU so a missing import cannot reach the
+# cluster. The first corrected probe run died on `NameError: name 'optax' is
+# not defined` after queueing behind a busy GPU partition -- a 45-minute
+# round trip for a one-line mistake that this catches in milliseconds.
+
+
+def _tiny_pair():
+    import equinox as eqx
+    import jax
+
+    key = jax.random.PRNGKey(0)
+    backbone = eqx.nn.Linear(4, 3, key=key)
+    head = eqx.nn.Linear(3, 2, key=key)
+    return backbone, head
+
+
+@pytest.mark.parametrize("arm", ["ce", "ibprobit"])
+def test_build_optimizer_returns_an_initialised_state(arm):
+    import equinox as eqx
+    import jax
+
+    backbone, head = _tiny_pair()
+    optimizer, state = pmb.build_optimizer(
+        arm, backbone, head, lr=1e-4, head_lr=1e-2, weight_decay=1e-2)
+    assert optimizer is not None
+    # The state must actually hold arrays -- that allocation IS the thing the
+    # probe exists to account for (AdamW's two moment buffers are ~2x params,
+    # ~6.7 GB on dinov3_huge, and omitting them is what made the first probe
+    # report a micro-batch the real run OOMs on).
+    leaves = [x for x in jax.tree.leaves(state) if eqx.is_array(x)]
+    assert leaves, f"{arm}: optimizer state allocated no arrays"
+
+
+def test_the_ce_optimizer_gives_the_head_zero_weight_decay():
+    # Design D6: head weight decay is 0 on every arm, so the probe's memory
+    # profile matches finetune_jax's rather than merely resembling it.
+    import inspect
+
+    source = inspect.getsource(pmb.build_optimizer)
+    assert "weight_decay=0.0" in source
+    assert "multi_transform" in source
