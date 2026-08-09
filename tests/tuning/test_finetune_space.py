@@ -66,12 +66,14 @@ def test_micro_batch_refuses_to_guess():
         fs.micro_batch("vbll")
 
 
-def test_the_measured_jax_micro_batches_are_pinned():
-    # Measured on A100-SXM4-40GB, dinov3_huge at 224 with bf16: both arms fit
-    # 64 and OOM at 128. They agree because the trunk dominates -- IBProbit's
-    # head is ~20 MB, since Sigma is (d, d) shared across classes.
-    assert fs.MICRO_BATCH["ce"] == 64
-    assert fs.MICRO_BATCH["ibprobit"] == 64
+def test_the_pinned_micro_batch_is_the_one_that_actually_ran():
+    # 16, not the 64 an isolated micro-grad measurement suggested. Eleven ~6 h
+    # full_finetune_comparison runs completed at 16, peaking at 24.05 GiB of
+    # 42.4 GB; a smoke trial at 64 OOMed, because the real loop holds AdamW's
+    # two moment buffers and grads_acc -- ~13.5 GB the isolated kernel never
+    # allocated.
+    assert fs.MICRO_BATCH["ce"] == 16
+    assert fs.MICRO_BATCH["ibprobit"] == 16
     assert "A100" in fs.MICRO_BATCH_DEVICE
 
 

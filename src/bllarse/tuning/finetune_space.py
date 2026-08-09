@@ -44,16 +44,20 @@ BATCH_SIZES = (256, 512, 1024, 2048, 4096)
 # memory unused, and neither is visible from a finished run's config.
 MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 
-# Per-forward batch, measured per arm with
-# scripts/finetune/probe_micro_batch.py (dinov3_huge, 224, bf16) and pinned.
+# Per-forward batch, per arm, for dinov3_huge at 224 with bf16.
 #
-# Both JAX arms measured 64; 128 OOMs on both. They agree because the trunk
-# dominates: IBProbit's head state is ~20 MB at D=1281, K=1000, since `Sigma`
-# is (d, d) shared across classes rather than per-class.
+# 16 is the EMPIRICALLY PROVEN value: eleven full_finetune_comparison runs of
+# ~6 hours each completed on it, peaking at 24.05 GiB of 42.4 GB.
 #
-# 64, not the 16 the earlier full_finetune_comparison runs used. That 16 was
-# set by hand and never probed, so those runs took 4x more micro-steps per
-# optimizer step than the hardware required.
+# It is deliberately NOT the 64 that scripts/finetune/probe_micro_batch.py
+# first reported. That probe measured `ce_micro_grad` in ISOLATION, while the
+# real loop calls the same kernel holding ~13.5 GB it never allocated -- AdamW's
+# two moment buffers (2 x 3.4 GB at 840M fp32 params) from `optimizer.init`,
+# plus the `grads_acc` accumulation buffer. 3.4 + 22.6 = 26 GB fits in 40;
+# 13.5 + 22.6 = 36 GB does not, and a smoke trial OOMed on exactly that.
+# The probe now allocates the optimizer state, accumulates two micro-batches,
+# runs apply_grads and forwards an eval chunk, so it measures the peak the loop
+# actually reaches.
 #
 # `vbll` is absent until the PyTorch arm exists to measure it against -- a
 # different framework and a different activation profile, so the JAX number
@@ -62,8 +66,8 @@ MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 # Values must satisfy probe_micro_batch.floor_to_ladder_divisor: a power of two
 # no larger than 256 (the ladder's gcd), so num_accum is exact at every rung.
 MICRO_BATCH: dict[str, int] = {
-    "ce": 64,
-    "ibprobit": 64,
+    "ce": 16,
+    "ibprobit": 16,
 }
 
 # Pinned, not searched -- the ONE head axis the probing campaign transfers as a
