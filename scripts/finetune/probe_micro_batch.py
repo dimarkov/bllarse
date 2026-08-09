@@ -35,6 +35,12 @@ from jax import random as jr  # noqa: E402
 from bllarse.finetune import jax_steps  # noqa: E402
 from bllarse.losses import CrossEntropy  # noqa: E402
 
+# The training script itself, for its jitted eval entry points. Imported rather
+# than reimplemented: a local copy would drift, and the whole value of this
+# probe is that it measures the SAME compiled functions the run executes.
+# This file lives beside it, so sys.path[0] already covers the import.
+import finetune_jax  # noqa: E402
+
 # The batch ladder's gcd. Every rung (256, 512, 1024, 2048, 4096) is a multiple
 # of 256, so a micro batch that divides 256 divides all of them -- and one that
 # does not is unusable at the bottom rung whatever it measures.
@@ -166,17 +172,27 @@ def probe_ceiling(arm, backbone, loss_fn, head, make_optimizer, *,
                 head_or_loss = trial_head
 
             # Evaluation runs in the same process with all of the above live.
+            #
+            # Through finetune_jax's OWN jitted entry points, not a local
+            # re-implementation. Calling jax_steps.forward_features directly is
+            # not equivalent: outside jit, `bf16=True` materialises a full
+            # bf16 copy of the 840M-param backbone (~1.7 GB) alongside the fp32
+            # master weights instead of fusing the cast, and every one of the
+            # 32 layers' activations for `eval_chunk` images stays live with no
+            # fusion and no early free. That inflates the eval leg enough to
+            # depress the reported ceiling below what the run actually needs --
+            # the probe would be measuring its own un-jitted eval rather than
+            # the training step.
             eval_images = jnp.zeros(
                 (eval_chunk, 3, img_size, img_size), dtype=jnp.float32)
             inference_bb = eqx.nn.inference_mode(trial_backbone, True)
-            features = jax_steps.forward_features(
-                inference_bb, eval_images, key, bf16=bf16)
             if arm == "ibprobit":
-                _, logits = head_or_loss(
-                    features, jnp.zeros((eval_chunk,), dtype=jnp.int32),
-                    with_logits=True, loss_type=2)
+                logits = finetune_jax.eval_logits_ibprobit(
+                    inference_bb, head_or_loss, eval_images,
+                    jnp.zeros((eval_chunk,), dtype=jnp.int32), key, bf16=bf16)
             else:
-                logits = jax.vmap(head_or_loss)(features)
+                logits = finetune_jax.eval_logits_ce(
+                    inference_bb, head_or_loss, eval_images, key, bf16=bf16)
 
             jax.block_until_ready(logits)
             last_ok = bs

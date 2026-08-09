@@ -117,3 +117,35 @@ def test_probe_ceiling_builds_a_fresh_optimizer_state_per_attempt():
     # Inside the attempt body, not before the loop.
     body = source.split("while bs <= max_bs:", 1)[1]
     assert "make_optimizer()" in body
+
+
+def test_the_probe_evaluates_through_the_training_script_jitted_path():
+    """The eval leg must be the SAME compiled function the run uses.
+
+    Calling jax_steps.forward_features directly is not equivalent: outside jit,
+    bf16=True materialises a full bf16 copy of the backbone (~1.7 GB on
+    dinov3_huge) alongside the fp32 master weights instead of fusing the cast,
+    and all 32 layers' activations stay live with no early free. That inflates
+    the eval leg enough to depress the reported ceiling below what the run
+    needs -- the probe would measure its own un-jitted eval, not the step.
+    """
+    import inspect
+
+    source = inspect.getsource(pmb.probe_ceiling)
+    # Code only -- the comment above the call explains WHY the un-jitted path
+    # is wrong and would otherwise match the negative assertion below.
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "finetune_jax.eval_logits_ce" in code
+    assert "finetune_jax.eval_logits_ibprobit" in code
+    assert "jax_steps.forward_features" not in code
+
+
+def test_both_jitted_eval_entry_points_exist_on_the_training_script():
+    # Pins the import contract: a rename in finetune_jax must fail here, on
+    # CPU, rather than on a compute node after a queue wait.
+    import finetune_jax
+
+    for name in ("eval_logits_ce", "eval_logits_ibprobit"):
+        assert callable(getattr(finetune_jax, name)), name
