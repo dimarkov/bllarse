@@ -95,18 +95,31 @@ def emit_torch(args, images):
     if torch.cuda.is_available():
         model = model.cuda()
 
-    # NCHW: equimo's config says channels_first, and the shard is NHWC, so the
-    # transpose belongs on whichever side expects it. Getting this wrong
-    # produces garbage rather than a near-match, which is the good failure.
-    batch = torch.from_numpy(np.ascontiguousarray(images.transpose(0, 3, 1, 2)))
+    # Already NCHW: imagenet.normalize_chunk transposes NHWC -> (N, 3, H, W)
+    # itself, because equimo's models are channels_first. Transposing again
+    # here fed torch a (32, 224, 3, 224) tensor and it said so -- the good
+    # failure, and the reason both sides share one normalisation path.
+    batch = torch.from_numpy(np.ascontiguousarray(images))
     if torch.cuda.is_available():
         batch = batch.cuda()
 
     with torch.no_grad():
         out = model(pixel_values=batch)
-    # Index 0 of last_hidden_state is the CLS token. DINOv3 also carries
-    # register tokens after it; they are not the feature either arm uses.
-    features = out.last_hidden_state[:, 0]
+
+    # MEAN OF THE PATCH TOKENS -- not the CLS token, and not pooler_output.
+    #
+    # Measured, not assumed. Against the JAX reference on the same 32 rows:
+    # mean patch gives cosine 1.000000 and max relative difference 2.2e-6,
+    # while CLS and pooler_output (which are the same vector) give cosine
+    # 0.416 and mean-over-all-tokens gives 0.9995. Only one of those is the
+    # same feature.
+    #
+    # It is worth stating because the JAX side LOOKS like it takes CLS --
+    # jax_steps.forward_features indexes out[0] and used to call it the CLS
+    # token in a comment. It is equimo's pooled output, and equimo pools by
+    # averaging patch tokens.
+    n_skip = 1 + int(getattr(model.config, "num_register_tokens", 0) or 0)
+    features = out.last_hidden_state[:, n_skip:].mean(dim=1)
     return features.float().cpu().numpy()
 
 

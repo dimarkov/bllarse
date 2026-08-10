@@ -52,7 +52,19 @@ def forward_features(backbone, images, key, bf16=False):
     def single(x):
         out = backbone(x, key=key)
         if isinstance(out, tuple):
-            out = out[0]  # CLS token
+            # equimo's POOLED output, which for DINOv3 is the mean over patch
+            # tokens. This said "CLS token" for a long time and that was wrong:
+            # scripts/finetune/trunk_parity.py scored it against the
+            # transformers implementation on identical inputs and mean-patch
+            # matches at cosine 1.000000 / 2.2e-6 relative, while the CLS token
+            # matches at cosine 0.416.
+            #
+            # The distinction is load-bearing for the PyTorch VBLL arm, which
+            # has to reproduce this exact feature from a different library. An
+            # arm built on the comment rather than the behaviour would train
+            # perfectly well on a different representation and be quietly
+            # incomparable to this one.
+            out = out[0]
         return out.astype(jnp.float32) if bf16 else out
 
     return vmap(single)(images)
