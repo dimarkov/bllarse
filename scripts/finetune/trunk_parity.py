@@ -37,11 +37,12 @@ import numpy as np
 # check is reproducible and costs one page-in rather than a scan.
 DEFAULT_ROWS = 32
 
-# equimo's ViT returns the CLS token (jax_steps.forward_features takes out[0]
-# when the backbone returns a tuple). Anything else on the torch side -- mean
-# patch token, pooler output -- is a different feature and would show up here as
-# a total mismatch rather than a subtle one.
-POOLING = "cls"
+# equimo's out[0] is its POOLED output: for DINOv3, the mean over patch tokens.
+# The CLS token and transformers' pooler_output are the same vector as each
+# other and a DIFFERENT one from this -- cosine 0.416, 2.4x the norm -- so
+# picking either shows up here as a total mismatch rather than a subtle one.
+# That is the good failure, and it is the one this script actually caught.
+POOLING = "mean_patch"
 
 HF_CHECKPOINTS = {
     "dinov3_small": "facebook/dinov3-vits16plus-pretrain-lvd1689m",

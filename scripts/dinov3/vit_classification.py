@@ -183,13 +183,27 @@ def iterate_batches(dataset_split, img_key, label_key, batch_size, img_size, mea
 
 @eqx.filter_jit
 def extract_features(model, images, key):
-    """Extract features from ViT model (CLS token or global average)."""
+    """Extract features from a ViT: equimo's POOLED output, mean over patches.
+
+    NOT the CLS token, which this said for a long time. For DINOv3, equimo
+    pools by averaging the patch tokens; the CLS token is a different vector
+    (cosine 0.416 against this one, and 2.4x the norm).
+
+    Every cached .npz feature file -- and therefore every linear-probing number
+    in the paper -- is this feature. It is the same one
+    jax_steps.forward_features returns for the fine-tuning arms: the two paths
+    agree to 9.5e-07 on identical inputs, which is float noise from compiling
+    separately. Keep it that way; the figures compare probing and fine-tuning
+    of the same representation.
+
+    Measured by scripts/finetune/trunk_parity.py, which exists because the
+    PyTorch VBLL arm has to reproduce this exact feature from another library.
+    """
     def single_forward(x):
-        # equimo models typically return (class_token, patch_tokens)
-        # or just features depending on architecture
+        # equimo returns (pooled, patch_tokens) for these models.
         out = model(x, key=key)
         if isinstance(out, tuple):
-            return out[0]  # CLS token
+            return out[0]
         return out
 
     return vmap(single_forward)(images)
