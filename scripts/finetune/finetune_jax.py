@@ -493,12 +493,18 @@ def main(args, on_dump=None) -> None:
     check_img_size(args)
     check_arm_flags(args)
     if args.uid is None:
-        # fig1_curves.UID_RE parses a uid as {model}_{dataset}_seed{seed}. A
-        # uid of just {model}_{arm}_seed{seed} (e.g. dinov3_large_ce_seed137)
-        # parses CLEANLY under that pattern with dataset="ce" -- a silent
-        # mislabel, not a parse failure. Folding {dataset} in ahead of {arm}
-        # keeps that field correct; {arm} still rides along in the uid string
-        # (and, independently, in every dump's own meta["arm"]).
+        # fig1_curves.UID_RE is {model}_(?P<dataset>.+)_seed{seed}, and that
+        # dataset group is GREEDY -- so this parses as dataset="imagenet1k_ce",
+        # not "imagenet1k". This comment used to claim that folding {dataset}
+        # in ahead of {arm} kept the field correct. It does not; it only keeps
+        # the dataset at the FRONT of it.
+        #
+        # Left as is because it is harmless for this campaign -- imagenet1k is
+        # the only dataset, and the arm is independently in group_id and in
+        # every dump's meta["arm"] -- and because scripts/finetune/
+        # finetune_vbll.py must produce the same shape to stay groupable. Worth
+        # revisiting if a fine-tuning figure ever keys on the parsed dataset.
+        # Tuning trials never reach here: finetune_worker passes uid=trialNNNNN.
         args.uid = f"{args.model}_{args.dataset}_{args.arm}_seed{args.seed}"
 
     # Heavy, GPU-oriented imports stay inside main(): this module is imported
