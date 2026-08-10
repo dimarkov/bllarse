@@ -101,6 +101,21 @@ MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 MICRO_BATCH: dict[str, int] = {
     "ce": 32,
     "ibprobit": 32,
+    # 64, and it is not a typo that this is twice the JAX arms'. Measured the
+    # same way -- a FULL step of scripts/finetune/finetune_vbll.py at a
+    # one-evaluation budget, not a synthetic forward -- on the same A100:
+    # 64 fits at 132.1 img/s, 32 at 130.0, 16 at 87.6.
+    #
+    # A different framework has a different activation profile, which is
+    # exactly why `micro_batch` raises rather than borrowing. PyTorch frees
+    # activations eagerly as the backward consumes them, where the JAX arms
+    # hold a jitted graph's live set plus an explicit grads_acc buffer; and
+    # VBLL's head is small next to IBProbit's CAVI state.
+    #
+    # 64 over 32 buys 1.5%, so this is not the throughput lever -- the plateau
+    # between them says the trunk's compute binds, not memory. It is taken
+    # because it is free, not because it is worth tuning.
+    "vbll": 64,
 }
 
 # Pinned, not searched -- the ONE head axis the probing campaign transfers as a

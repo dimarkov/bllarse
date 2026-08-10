@@ -58,23 +58,47 @@ def test_the_ladder_is_powers_of_two():
 def test_micro_batch_refuses_to_guess():
     # Hardware-specific and unrecoverable from a finished run's config, so an
     # unmeasured arm must fail loudly at submit time rather than OOM three
-    # hours into a trial or silently leave memory unused all campaign. `vbll`
-    # is the live case: a different framework with a different activation
-    # profile, so the JAX measurement must not be borrowed for it.
-    assert "vbll" not in fs.MICRO_BATCH
+    # hours into a trial or silently leave memory unused all campaign.
+    #
+    # Checked with an arm that does not exist rather than with `vbll`, which
+    # this used to use: vbll HAS been measured now, so pinning it as the live
+    # example made the test assert "vbll is unmeasured" -- a fact, not an
+    # invariant, and one that expired the moment the probe ran.
     with pytest.raises(KeyError, match="probe_micro_batch"):
-        fs.micro_batch("vbll")
+        fs.micro_batch("ivon")
 
 
 def test_the_pinned_micro_batch_matches_the_full_step_measurement():
-    # 32 on both arms, 64 OOMs on both, measured by running a FULL optimizer
-    # step (optimizer state + accumulation + apply_grads + jitted eval), not a
-    # bare micro-grad. Cross-checks against micro=16 having run on a 32 GB card:
-    # ~13.5 GB of fixed state plus activations that scale about linearly means
-    # 16 fits 32 GB and 32 fits 40 GB while 64 does not.
+    # Every value here came from running a FULL step -- optimizer state,
+    # accumulation, the update, then an eval chunk -- not a bare micro-grad.
+    # That distinction cost a campaign launch once: an isolated micro-grad
+    # measurement reported 64 for the JAX arms and the real loop OOMed at 32.
+    #
+    # JAX arms: 32, 64 OOMs. Cross-checks against micro=16 having run on a
+    # 32 GB card -- ~13.5 GB of fixed state plus activations scaling about
+    # linearly means 16 fits 32 GB and 32 fits 40 GB while 64 does not.
     assert fs.MICRO_BATCH["ce"] == 32
     assert fs.MICRO_BATCH["ibprobit"] == 32
+    # vbll: 64 on the same A100, measured the same way (132.1 img/s against
+    # 130.0 at 32 and 87.6 at 16). Twice the JAX value because PyTorch frees
+    # activations eagerly as the backward consumes them, where the JAX arms
+    # hold a jitted graph's live set plus an explicit grads_acc buffer.
+    assert fs.MICRO_BATCH["vbll"] == 64
     assert "A100" in fs.MICRO_BATCH_DEVICE
+
+
+@pytest.mark.parametrize("arm", sorted(fs.MICRO_BATCH))
+def test_every_pinned_micro_batch_divides_every_rung_of_the_ladder(arm):
+    """Otherwise accum_plan raises and the arm cannot run at that batch size.
+
+    Design A8: a power of two no larger than the ladder's gcd, so num_accum is
+    exact everywhere. 64 satisfies this as readily as 32 -- which is what made
+    the vbll measurement adoptable without touching the ladder.
+    """
+    micro = fs.MICRO_BATCH[arm]
+    assert micro & (micro - 1) == 0, f"{arm}: {micro} is not a power of two"
+    for batch in fs.BATCH_SIZES:
+        assert batch % micro == 0, f"{arm}: {micro} does not divide {batch}"
 
 
 @pytest.mark.parametrize("arm", ["ce", "ibprobit", "ibprobit_noeps"])
