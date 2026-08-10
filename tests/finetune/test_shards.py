@@ -71,6 +71,39 @@ def test_row_i_of_the_shard_is_row_i_of_the_split(tmp_path):
             reader.take([i])[0], decode_uint8(split, "image", 8, i))
 
 
+def test_the_threaded_reader_agrees_with_the_memmap_byte_for_byte(tmp_path):
+    """The pread path is a SPEED change and must be nothing else.
+
+    `take` fetches rows with concurrent os.pread rather than one numpy
+    fancy-index, because the fancy-index serialises a GPFS round trip per row
+    (~82 img/s measured, against a 220 img/s step). Every row lands at the
+    position its index occupied, and threads must not shuffle that.
+    """
+    _build(tmp_path, n=64)
+    threaded = shards.open_shard(tmp_path, "fake", "train", 8, read_workers=8)
+    serial = shards.open_shard(tmp_path, "fake", "train", 8, read_workers=1)
+    assert threaded._pool is not None and serial._pool is None
+
+    order = [63, 0, 17, 17, 5, 42, 1]
+    np.testing.assert_array_equal(threaded.take(order), serial.take(order))
+    np.testing.assert_array_equal(
+        threaded.take(range(64)), np.asarray(serial._images[np.arange(64)]))
+    threaded.close()
+
+
+def test_a_truncated_shard_raises_rather_than_returning_short_rows(tmp_path):
+    # open_shard's rows_complete check cannot see a file replaced AFTER it
+    # opened. A short pread silently left as zeros would be a black image.
+    _build(tmp_path)
+    reader = shards.open_shard(tmp_path, "fake", "train", 8, read_workers=4)
+    images_path, _, _ = shards.shard_paths(tmp_path, "fake", "train", 8)
+    with open(images_path, "r+b") as fh:
+        fh.truncate(8 * 8 * 8 * 3)
+    with pytest.raises(OSError, match="short read"):
+        reader.take([20])
+    reader.close()
+
+
 def test_take_returns_rows_in_the_order_requested(tmp_path):
     # Not sorted, not deduplicated -- the caller passes a permutation slice and
     # the labels are indexed with the same array.

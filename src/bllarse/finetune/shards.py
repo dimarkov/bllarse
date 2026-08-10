@@ -25,6 +25,7 @@ trial of every arm.
 """
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -39,6 +40,20 @@ from bllarse.finetune.imagenet import decode_uint8
 # silently reading a differently-shaped array as images produces a run that
 # trains on garbage and reports plausible-looking losses.
 SHARD_FORMAT = 1
+
+# Threads issuing row reads inside one `take`.
+#
+# A shard row is 150,528 contiguous bytes and a micro-batch gathers 32 of them
+# from random offsets in a 193 GB file, so the gather is LATENCY-bound, not
+# bandwidth-bound: ~10 ms of GPFS round trip per row, serialised, is ~320 ms a
+# micro-batch, which is the ~82 img/s the first campaign workers measured
+# against a step that benchmarks at 220.
+#
+# Sixteen because the job asks for 18 CPUs and the reads are pure wait -- the
+# smoke job reported 2.0% CPU utilisation across 36 cores while the GPU idled.
+# This is a concurrency knob for a filesystem, not a compute one, so it is not
+# bounded by cores in the way a decode pool would be.
+DEFAULT_READ_WORKERS = 16
 
 
 def shard_paths(root, dataset: str, split: str, img_size: int):
@@ -124,24 +139,79 @@ def build_shard(hf_split, *, img_key: str, label_key: str, img_size: int,
 class ShardReader:
     """Random-access reader over a built shard.
 
-    `take` is a single numpy fancy-index into the memmap, which is one gather
-    that releases the GIL for its duration -- the whole point, against a
-    per-image Python decode loop that does not.
+    Rows are fetched with concurrent `os.pread`, not a numpy fancy-index into
+    the memmap. The fancy-index was the obvious implementation and it is the
+    slow one: numpy walks the requested rows in order, each miss traps into a
+    GPFS read, and those round trips serialise. Measured in the campaign as
+    ~82 img/s against a training step that benchmarks at 220 -- so the GPU sat
+    idle roughly 60% of the time, and the smoke job reported 2.0% CPU
+    utilisation across 36 allocated cores while it did.
+
+    `os.pread` is what makes the threading worth anything: it releases the GIL
+    for the whole syscall, so N threads genuinely overlap N round trips. A
+    threaded fancy-index would not -- the copy happens with the GIL held.
+
+    The pool and the descriptor live as long as the reader. One pool per
+    `take` would put pool construction on the per-micro-batch path, which is
+    part of what made the JPEG loader slow in the first place.
     """
 
-    def __init__(self, images, labels):
+    def __init__(self, images, labels, *, path=None,
+                 read_workers: int = DEFAULT_READ_WORKERS):
         self._images = images
         self.labels = labels
+        self._row_shape = tuple(images.shape[1:])
+        self._row_bytes = int(np.prod(self._row_shape))
+        # `path is None` keeps the memmap path available for callers that
+        # construct a reader directly (and for a filesystem where threading
+        # buys nothing). open_shard always passes it.
+        self._fd = os.open(os.fspath(path), os.O_RDONLY) if path is not None else None
+        self._pool = (
+            ThreadPoolExecutor(max_workers=read_workers,
+                               thread_name_prefix="shard-read")
+            if self._fd is not None and read_workers > 1 else None
+        )
 
     def __len__(self):
         return len(self._images)
 
+    def _read_row(self, out, position, row) -> None:
+        offset = int(row) * self._row_bytes
+        buf = os.pread(self._fd, self._row_bytes, offset)
+        if len(buf) != self._row_bytes:
+            # Short reads are legal for pread at EOF. Here that can only mean
+            # the file is smaller than the meta claims, which open_shard has
+            # already checked -- so it means the shard changed underneath us.
+            raise OSError(
+                f"short read at row {row}: {len(buf)} of {self._row_bytes} "
+                f"bytes. The shard has been truncated or replaced while open."
+            )
+        out[position] = np.frombuffer(buf, dtype=np.uint8).reshape(self._row_shape)
+
     def take(self, indices) -> np.ndarray:
         """(len(indices), H, W, 3) uint8, in the order requested."""
-        return np.asarray(self._images[np.asarray(indices)])
+        idx = np.asarray(indices)
+        if self._pool is None:
+            return np.asarray(self._images[idx])
+        out = np.empty((len(idx), *self._row_shape), dtype=np.uint8)
+        # Consumed rather than left lazy: pool.map returns a generator, and an
+        # exception in a worker only surfaces when its result is read.
+        for _ in self._pool.map(
+                lambda pair: self._read_row(out, *pair), enumerate(idx)):
+            pass
+        return out
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
 
 
-def open_shard(root, dataset: str, split: str, img_size: int) -> ShardReader:
+def open_shard(root, dataset: str, split: str, img_size: int,
+               read_workers: int = DEFAULT_READ_WORKERS) -> ShardReader:
     """Open a built shard, or raise saying exactly what is missing.
 
     Refuses an INCOMPLETE shard. A partially built 193 GB file is mostly
@@ -169,4 +239,5 @@ def open_shard(root, dataset: str, split: str, img_size: int) -> ShardReader:
         )
     images = np.memmap(images_path, dtype=np.uint8, mode="r", shape=shape)
     labels = np.load(labels_path)
-    return ShardReader(images, labels)
+    return ShardReader(images, labels, path=images_path,
+                       read_workers=read_workers)
