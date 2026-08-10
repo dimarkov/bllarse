@@ -24,7 +24,22 @@ dependencies = [
     # cross-machine throughput comparison. Campaign results have to be
     # attributable to the campaign, not to which day an environment was
     # created.
-    "jax[cuda]==0.11.0",
+    #
+    # 0.10.2 rather than the newest, because 0.11.0 does not run the
+    # fine-tuning step on Raven's A100 nodes. It dies in
+    # `jit(ce_micro_grad)/transpose(jvp(vmap(eqx.nn.Conv)))/conv_general_dilated`
+    # with CUDA_ERROR_ILLEGAL_ADDRESS before reaching a single evaluation. Two
+    # tempting explanations were tested and refuted: disabling command buffers
+    # (`--xla_gpu_enable_command_buffer=`) changes nothing, and a compilation
+    # cache populated by an older jax is not to blame either -- a fresh cache
+    # fails identically. A version bisect over the real trial (not
+    # scripts/finetune/bench_step.py, which 0.11.0 PASSES and which is
+    # therefore not a reproducer) puts the break at exactly 0.11.0: 0.9.2,
+    # 0.10.0, 0.10.1 and 0.10.2 all complete.
+    #
+    # Revisit after a driver or jax point release, with one short smoke
+    # (BLLARSE_FT_MAX_SAMPLES=131072) rather than by pointing an array at it.
+    "jax[cuda]==0.10.2",
     "optax>=0.2.4",
     "tfp-nightly[jax]>=0.25",
     "dotenv<1.0.0",
