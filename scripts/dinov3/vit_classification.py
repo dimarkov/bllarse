@@ -81,103 +81,19 @@ from calibration import evaluate_classification
 # from the paper. `channels_first` is True for every entry and stays only
 # because the feature-extraction call sites read it; they are the ones that
 # would need touching to drop it.
-EQUIMO_MODELS = {
-    # DINOv3 models (ViT with LayerNorm only) — expect CHW input
-    "dinov3_small": {"img_size": 224, "embed_dim": 384, "channels_first": True},
-    "dinov3_big": {"img_size": 224, "embed_dim": 768, "channels_first": True},
-    "dinov3_large": {"img_size": 224, "embed_dim": 1024, "channels_first": True},
-    "dinov3_huge": {"img_size": 224, "embed_dim": 1280, "channels_first": True},
-    "dinov3_max": {"img_size": 224, "embed_dim": 4096, "channels_first": True},
-}
+# EQUIMO_MODELS, DINOV3_DATASET_IMG_SIZES, get_img_size, DATASET_CONFIGS and
+# IMAGENET_MEAN/STD now live in bllarse.finetune.registry, which imports no jax.
+# The VBLL fine-tuning arm runs in a PyTorch environment with no jax in it (the
+# two CUDA stacks cannot share a process), and it needs these same constants.
+# Re-exported here so every existing `from vit_classification import ...` keeps
+# working against a single definition.
+from bllarse.finetune.registry import (  # noqa: E402,F401
+    DATASET_CONFIGS,
+    DINOV3_DATASET_IMG_SIZES,
+    EQUIMO_MODELS,
+    get_img_size,
+)
 
-# Dataset-specific input sizes for DINOv3 models (patch_size=16, so size must be divisible by 16).
-DINOV3_DATASET_IMG_SIZES = {
-    "cifar10":       224,
-    "cifar100":      224,
-    "svhn":          224,
-    "oxford_pets":   512,
-    "food101":       512,
-    "flowers102":    512,
-    "stanford_cars": 512,
-    "dtd":           512,
-    "imagenet1k":    512,
-}
-
-
-def get_img_size(model_name: str, dataset_name: str) -> int:
-    """Return the appropriate input image size for a model/dataset pair."""
-    if "dinov3" in model_name:
-        default = EQUIMO_MODELS[model_name]["img_size"]  # 224
-        return DINOV3_DATASET_IMG_SIZES.get(dataset_name, default)
-    return EQUIMO_MODELS[model_name]["img_size"]
-
-# Dataset configurations
-DATASET_CONFIGS = {
-    "cifar10": {
-        "hf_path": "cifar10",
-        "num_classes": 10,
-        "label_key": "label",
-        "img_key": "img",
-        "test_split": "test",
-    },
-    "cifar100": {
-        "hf_path": "cifar100",
-        "num_classes": 100,
-        "label_key": "fine_label",
-        "img_key": "img",
-        "test_split": "test",
-    },
-    "svhn": {
-        "hf_path": "ufldl-stanford/svhn",
-        "hf_config": "cropped_digits",
-        "num_classes": 10,
-        "label_key": "label",
-        "img_key": "image",
-        "test_split": "test",
-    },
-    "oxford_pets": {
-        "hf_path": "timm/oxford-iiit-pet",
-        "num_classes": 37,
-        "label_key": "label",
-        "img_key": "image",
-        "test_split": "test",
-    },
-    "food101": {
-        "hf_path": "ethz/food101",
-        "num_classes": 101,
-        "label_key": "label",
-        "img_key": "image",
-        "test_split": "validation",
-    },
-    "flowers102": {
-        "hf_path": "nelorth/oxford-flowers",
-        "num_classes": 102,
-        "label_key": "label",
-        "img_key": "image",
-        "test_split": "test",
-    },
-    "stanford_cars": {
-        "hf_path": "tanganke/stanford_cars",
-        "num_classes": 196,
-        "label_key": "label",
-        "img_key": "image",
-        "test_split": "test",
-    },
-    "dtd": {
-        "hf_path": "tanganke/dtd",
-        "num_classes": 47,
-        "label_key": "label",
-        "img_key": "image",
-        "test_split": "test",
-    },
-    "imagenet1k": {
-        "hf_path": "ILSVRC/imagenet-1k",
-        "num_classes": 1000,
-        "label_key": "label",
-        "img_key": "image",
-        "test_split": "validation",
-    },
-}
 
 
 def get_pretrained_backbone(model_name: str, key):
@@ -212,8 +128,10 @@ NORM_STATS = {
                  np.array([0.24703233, 0.24348505, 0.26158768])),
 }
 
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
-IMAGENET_STD = np.array([0.229, 0.224, 0.225])
+from bllarse.finetune.registry import (  # noqa: E402,F401
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+)
 
 
 def _load_and_process(dataset_split, img_key, img_size, idx):
