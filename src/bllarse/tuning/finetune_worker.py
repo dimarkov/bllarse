@@ -43,12 +43,14 @@ SCRIPTS = {
 PRUNER_STARTUP_TRIALS = 5
 PRUNER_WARMUP_EVALS = 10
 
-# Consecutive evaluations with no 0.1% relative improvement in val_nll.
+# Consecutive evaluations with no relative improvement in val_nll (the
+# threshold is objective.DEFAULT_MIN_RELATIVE_IMPROVEMENT, now 1e-4).
 #
-# 20 evaluations = 327,680 samples (0.256 epochs); with WARMUP_EVALS the
-# earliest possible stop is eval 30, so a doomed config costs ~1.5 h instead of
-# ~6.3 h. What it is aimed at is trunk learning rates high enough to cause
-# catastrophic forgetting, which plateau or diverge well inside the first epoch.
+# 20 evaluations = 327,680 samples (0.256 epochs). The earliest possible stop is
+# eval 21: stalls accumulate from evaluation 1 and WARMUP_EVALS gates only the
+# FIRING, not the counting -- so a doomed config costs ~1 h instead of ~6.3 h.
+# What it aims at is trunk learning rates high enough to cause catastrophic
+# forgetting, which plateau or diverge well inside the first epoch.
 #
 # This is NOT redundant with MedianPruner and the two are not interchangeable:
 # the pruner kills trials that are LOSING against their cohort, patience stops
@@ -59,9 +61,15 @@ PRUNER_WARMUP_EVALS = 10
 # needed the argmin at dump <= 19 on a bounded 40-point geometric grid). This
 # one runs on 122 uniformly sample-spaced evaluations, so a count is a
 # well-defined amount of training. Read `patience_stopped_at_eval` and
-# `truncated` off the journal after the first worker batch: many stops at eval
-# 30 means 20 is too tight, `truncated` everywhere means the 2M budget binds
+# `truncated` off the journal after each worker batch: many stops at eval 21
+# means 20 is too tight, `truncated` everywhere means the 2M budget binds
 # instead, and the two call for opposite corrections.
+#
+# That reading has already been done once and changed a constant. On the first
+# 67 completed trials patience fired on 57 of them, at a median evaluation 88
+# of 122 with the argmin 20 earlier -- while trials patience did NOT stop put
+# their argmin at 91-100% of the budget. The threshold, not this count, was
+# what was too tight; see DEFAULT_MIN_RELATIVE_IMPROVEMENT.
 PATIENCE = 20
 WARMUP_EVALS = 10
 

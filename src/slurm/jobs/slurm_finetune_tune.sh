@@ -26,7 +26,7 @@
 set -euo pipefail
 
 for var in BLLARSE_FT_ARM BLLARSE_FT_TRIALS BLLARSE_FT_STORAGE BLLARSE_FT_VENV \
-           BLLARSE_FT_SHARDS BLLARSE_FT_DATASET; do
+           BLLARSE_FT_SHARDS; do
   if [[ -z "${!var:-}" ]]; then
     echo "[ft-tune] ERROR: $var is not set." >&2
     exit 2
@@ -42,7 +42,10 @@ done
 # open_shard's own refusal of an INCOMPLETE shard covers the other half (a
 # partial 193 GB file is mostly zeros, and zeros train as valid black images);
 # this only has to catch the path being wrong or unmounted.
-shard_meta="$(readlink -f "$BLLARSE_FT_SHARDS")/${BLLARSE_FT_DATASET}_train_${BLLARSE_FT_IMG_SIZE:-224}.json"
+# Defaulted, not required: the dataset and image size are pinned in
+# finetune_worker.trial_config, and a second place to set them is a second
+# place for them to disagree.
+shard_meta="$(readlink -f "$BLLARSE_FT_SHARDS")/${BLLARSE_FT_DATASET:-imagenet1k}_train_${BLLARSE_FT_IMG_SIZE:-224}.json"
 if [[ ! -f "$shard_meta" ]]; then
   echo "[ft-tune] ERROR: no training shard at $shard_meta." >&2
   echo "[ft-tune] Build it once with scripts/finetune/build_shards.py, or" >&2
@@ -121,8 +124,9 @@ echo "[ft-tune] worker=${SLURM_ARRAY_TASK_ID:-0} arm=${BLLARSE_FT_ARM}" \
 # The count means something here in a way it did not on the probing side.
 # Evaluations are uniformly spaced in SAMPLES (protocol.EVAL_QUANTUM = 16,384),
 # so 20 of them is always 327,680 samples, and there are 122 per trial at every
-# rung of the batch ladder. With WARMUP_EVALS=10 the earliest possible stop is
-# eval 30, so a doomed config costs ~1.5 h instead of ~6.3 h.
+# rung of the batch ladder. The earliest possible stop is eval 21: stalls
+# accumulate from evaluation 1 and WARMUP_EVALS=10 gates only the FIRING, not
+# the counting. So a doomed config costs ~1 h instead of ~6.3 h.
 #
 # The probing campaign's `--patience 20` counted points on a GEOMETRIC grid
 # bounded at 40 and could therefore only fire when a curve turned in its first
@@ -131,7 +135,7 @@ echo "[ft-tune] worker=${SLURM_ARRAY_TASK_ID:-0} arm=${BLLARSE_FT_ARM}" \
 #
 # 20 is a starting value, not a derived one. Read what actually happened off
 # the trials' own `patience_stopped_at_eval` and `truncated` attributes: many
-# stops at eval 30 means 20 is too tight, `truncated` nearly everywhere means
+# stops at eval 21 means 20 is too tight, `truncated` nearly everywhere means
 # the 2M sample budget binds instead, and those call for opposite corrections.
 worker_args=(
   --arm "$BLLARSE_FT_ARM"

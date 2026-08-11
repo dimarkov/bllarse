@@ -486,6 +486,66 @@ def test_patience_counts_evaluations_at_any_scale(tmp_path, monkeypatch):
         )
 
 
+def _evals_before_patience(curve, min_relative_improvement, patience=20,
+                           warmup_evals=10):
+    """How many evaluations of `curve` (val_nll values) run before patience.
+
+    Drives `_patience_on_dump` directly rather than going through a fake
+    training script: the question is about a THRESHOLD on val_nll, and the
+    script double is driven by a sharpness profile whose relationship to
+    val_nll is monotone but not linear -- fine for "does a plateau get cut",
+    useless for "is 3e-4 per evaluation above the threshold".
+    """
+    hook = objective._patience_on_dump(
+        None, patience=patience, warmup_evals=warmup_evals,
+        min_relative_improvement=min_relative_improvement)
+    for index, value in enumerate(curve, start=1):
+        try:
+            hook(index, index, index * 16_384, {"val_nll": value})
+        except objective.EarlyConvergence:
+            return index - 1
+    return len(curve)
+
+
+def test_slow_but_real_improvement_survives_patience():
+    """The threshold has to sit BELOW the effect the campaign measures.
+
+    Patience needs `patience` CONSECUTIVE stalls, so on a curve falling at rate
+    r the best refreshes every ceil(theta * best / r) evaluations and patience
+    fires only when r < theta * best / patience -- a factor of `patience`
+    smaller than theta * best. At val_nll ~= 0.44 with patience 20 that
+    critical rate is 2.2e-5 per evaluation at theta = 1e-3.
+
+    So a curve improving at 1e-5 per evaluation is still learning, and would
+    give up ~5e-4 over the remaining 50 evaluations. The arms are separated by
+    0.0026, which makes that a fifth of the effect -- discarded from whichever
+    arm happens to sit on the wrong side.
+    """
+    assert objective.DEFAULT_MIN_RELATIVE_IMPROVEMENT == 1e-4
+    curve = [0.44 - 1e-5 * i for i in range(60)]
+
+    assert _evals_before_patience(curve, 1e-4) == len(curve), (
+        "a curve still improving at 1e-5 per evaluation was cut short")
+    # The old value, shown failing on the same curve -- the regression this
+    # change exists to prevent, not a hypothetical.
+    assert _evals_before_patience(curve, 1e-3) < len(curve)
+
+
+def test_a_genuine_plateau_is_still_cut():
+    """The loosened threshold must not disable patience in practice.
+
+    1e-4 still has to catch the fourth-decimal drift the constant exists to
+    ignore, or every trial runs the full budget and the economy is gone.
+    """
+    drift = [0.44 - 1e-7 * i for i in range(60)]
+    cut = _evals_before_patience(drift, 1e-4)
+    assert cut < len(drift), "patience never fired on a drifting curve"
+    # Stalls accumulate from evaluation 1 and `warmup_evals` gates only the
+    # FIRING, so with patience 20 the earliest possible stop is evaluation 21 --
+    # not 30, which several comments in this repo used to claim.
+    assert cut >= 20
+
+
 def test_patience_is_disabled_unless_a_threshold_is_given(tmp_path, monkeypatch):
     """Defaults to None. Unset, the callback must be the caller's own hook
     untouched, so a run trains to its full budget -- the behaviour any figure

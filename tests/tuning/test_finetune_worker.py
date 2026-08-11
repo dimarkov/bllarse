@@ -191,7 +191,7 @@ def test_pruner_engages_far_earlier_than_the_probing_one():
 def test_patience_is_on_and_can_actually_fire():
     # The probing campaign's `--patience 20` needed the argmin at dump <= 19 on
     # a bounded 40-point geometric grid. Here there are 122 uniformly
-    # sample-spaced evaluations and the earliest stop is eval 30, so the
+    # sample-spaced evaluations and the earliest stop is eval 21, so the
     # mechanism has room to work.
     assert fw.PATIENCE == 20
     assert fw.WARMUP_EVALS + fw.PATIENCE < space.eval_count()

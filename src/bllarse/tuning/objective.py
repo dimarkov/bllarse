@@ -45,11 +45,40 @@ DEFAULT_WARMUP_EVALS = 10
 # val_nll ranges from ~0.003 (flowers102) to ~5.2 (stanford_cars, VBLL) across
 # this project's datasets, so a fixed absolute epsilon is wrong at one end or
 # the other. It also drifts downward in the fourth decimal place essentially
-# forever, so "any decrease counts" never plateaus. 0.1% relative improvement
-# is comfortably above that drift at every scale this project uses, while
-# still well under the gains a genuinely still-improving config produces
-# between early dumps.
-DEFAULT_MIN_RELATIVE_IMPROVEMENT = 1e-3
+# forever, so "any decrease counts" never plateaus. A RELATIVE threshold is the
+# only form that serves both ends of that range.
+#
+# 1e-4, lowered from 1e-3, because 1e-3 was calibrated against the probing
+# campaign and is too coarse for fine-tuning. Measured on the fine-tuning
+# studies: patience fired on 57 of 67 completed trials, cutting them at a
+# median evaluation 88 of 122 with their argmin 20 evaluations earlier -- i.e.
+# the instant the window elapsed. Trials that patience did NOT stop put their
+# argmin at 91-100% of the budget, so those curves were still improving where
+# the stopped ones were being called converged.
+#
+# The arithmetic that decides it. Patience needs `patience` CONSECUTIVE
+# evaluations with no improvement, so on a curve falling at rate r per
+# evaluation `best` refreshes every ceil(theta * best / r) of them and patience
+# can only fire when
+#
+#     r < theta * best / patience
+#
+# -- a factor of `patience` smaller than the naive theta * best. At val_nll
+# ~= 0.44 with patience 20 that critical rate is 2.2e-5 per evaluation at
+# theta = 1e-3, so a run improving just under it is cut having given up as much
+# as 1.1e-3 over the remaining 50 evaluations. THE ARMS ARE SEPARATED BY 0.0026
+# (ibprobit_noeps 0.4415 against ce 0.4441), so patience could silently discard
+# ~40% of the effect being measured, from whichever arm happened to sit on the
+# wrong side of it.
+#
+# At 1e-4 the critical rate is 2.2e-6 and the most that can be discarded is
+# ~1.1e-4, or 4% of the gap -- still above the fourth-decimal drift the
+# constant exists to ignore.
+#
+# Cost: fewer early stops, so completed trials run closer to the full budget.
+# Pruning is unaffected -- MedianPruner kills 73-89% of trials and that is
+# where the campaign's compute saving actually comes from.
+DEFAULT_MIN_RELATIVE_IMPROVEMENT = 1e-4
 
 
 class EarlyConvergence(Exception):
