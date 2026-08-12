@@ -37,10 +37,28 @@ set -euo pipefail
 
 : "${BLLARSE_FT_STORAGE:=/ptmp/${USER}/ft_studies}"
 : "${BLLARSE_FT_CAMPAIGN:=fixb512}"
+# 60, against the first campaign's 32 / 36 / 16. The reason to re-run at all is
+# that the arms came out 0.0026 apart while the spread across each arm's own
+# top six was 0.003-0.005 -- the ranking sat inside the search's own noise. A
+# deeper search is the only thing that resolves that.
 : "${BLLARSE_FT_TARGET_COMPLETE:=60}"
-: "${BLLARSE_FT_TRIALS:=12}"
+
+# The per-worker CAP, sized to fill a 24 h job rather than to express a depth.
+# Measured on the first campaign: ~85% of trials are pruned, a pruned trial
+# costs ~0.4 h (it dies a few evaluations past the pruner's 10-evaluation
+# warmup, and the compilation cache absorbs the ~19 min graph build), and a
+# completed one ~2.8 h at this batch. That averages ~0.8 h, so a 24 h worker
+# fits about 30. The previous campaign's 10 left workers exiting at ~9 h with
+# the allocation still open.
+: "${BLLARSE_FT_TRIALS:=30}"
 : "${BLLARSE_FT_WORKERS:=16}"
-: "${BLLARSE_FT_THROTTLE:=4}"
+
+# 6 per arm, 18 GPUs across the three. At ~85% pruning, 60 completions needs
+# ~400 trials and ~320 GPU-hours per arm, so this is ~2 days wall-clock. The
+# prune rate should FALL under the pinned batch and re-centred boxes, in which
+# case the target is reached earlier and the remaining array tasks exit at the
+# worker's pre-flight check without claiming a trial.
+: "${BLLARSE_FT_THROTTLE:=6}"
 # ibprobit -- the eps-SEARCHED arm -- is absent by default. The first campaign
 # answered its question: across the top six trials eps_init spanned 5.3e-5,
 # 1.0e-4, 8.4e-7, 3.0e-6, 4.0e-4 and 2.1e-2, five decades, with every score
