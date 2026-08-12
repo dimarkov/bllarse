@@ -23,6 +23,10 @@ from optuna.storages.journal import JournalFileBackend
 from bllarse.finetune import protocol
 from bllarse.tuning import finetune_space as space
 from bllarse.tuning import objective as objective_mod
+# Imported rather than reimplemented: both take a study and read its journal,
+# and nothing in either is specific to the probing search space. The probing
+# campaign is where the defect they fix was first diagnosed.
+from bllarse.tuning.worker import n_completed, stop_at_completed
 
 DIRECTION = "minimize"
 
@@ -351,9 +355,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--arm", required=True, choices=sorted(SCRIPTS))
     p.add_argument("--n-trials", type=int, required=True,
-                   help="Trials THIS worker runs. Size it against the FULL "
-                        "trial cost (~6.3 h), not the hoped-for average: a "
-                        "24 h job fits 3.")
+                   help="Trials THIS worker runs, PRUNED ONES INCLUDED. A cap "
+                        "on the job, not a search depth -- use "
+                        "--target-complete for that. Size it against the FULL "
+                        "trial cost (~3 h at the pinned batch), not the "
+                        "hoped-for average.")
+    p.add_argument(
+        "--target-complete", type=int, default=None,
+        help="Stop once the STUDY has at least this many COMPLETED trials, "
+             "counting every earlier submission's. Invariant to the prune "
+             "rate, which --n-trials is not.",
+    )
     p.add_argument("--storage-dir", required=True)
     p.add_argument("--dump-root",
                    default=os.environ.get("BLLARSE_EVAL_DUMP_ROOT", "eval_dumps"))
@@ -380,6 +392,18 @@ def main() -> None:
     study = open_study(args.arm, args.storage_dir, args.campaign)
     group_id = f"fttune_{study_name(args.arm, args.campaign)}"
 
+    # Checked BEFORE the first trial, so re-running a finished submission costs
+    # a queue slot rather than a 3 h trial. Makes the submit script idempotent:
+    # arms already at depth exit immediately, arms short of it top up.
+    if args.target_complete is not None:
+        already = n_completed(study)
+        if already >= args.target_complete:
+            print(f"[ft-tune] {study.study_name}: {already} completed "
+                  f">= target {args.target_complete}, nothing to do.")
+            return
+        print(f"[ft-tune] {study.study_name}: {already} completed, "
+              f"target {args.target_complete}, cap {args.n_trials} this worker.")
+
     def log_failed_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         if trial.state == optuna.trial.TrialState.FAIL:
             print(f"[ft-tune] WARNING: trial {trial.number} FAILED "
@@ -401,7 +425,10 @@ def main() -> None:
         # KeyboardInterrupt/SystemExit derive from BaseException so a job
         # timeout still tears the worker down instead of being swallowed.
         catch=(Exception,),
-        callbacks=[log_failed_trial],
+        callbacks=(
+            [log_failed_trial] if args.target_complete is None
+            else [log_failed_trial, stop_at_completed(args.target_complete)]
+        ),
     )
     print(summarize_study(study))
 

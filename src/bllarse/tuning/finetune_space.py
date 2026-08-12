@@ -65,6 +65,67 @@ ARMS = ("ce", "vbll", "ibprobit", "ibprobit_noeps")
 # not the ladder's to prejudge.
 BATCH_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384)
 
+# PINNED at 512 for the second campaign; the ladder above is kept because
+# `eval_count` still validates it and because the first campaign searched it.
+#
+# The first campaign (studies ft_*_shards2m) sampled the whole ladder and the
+# arms disagreed: vbll converged to 512 (all of its top 8), ibprobit_noeps to
+# 512 (27 of 36 completions), ce to a 1024/2048 plateau, and ibprobit did not
+# converge at all -- TPE drifted to 256 while the best scores sat at 1024.
+#
+# That drift is the reason this is now pinned rather than re-searched. At the
+# pruner's warmup evaluation the median val_nll is MONOTONE in batch (256
+# 0.5396, 512 0.5463, 1024 0.5697, 2048 0.5959, 4096 0.6299) because a smaller
+# batch takes more optimizer steps per sample and therefore leads early. By the
+# end the ordering reverses (1024 wins at 0.4427, 256 is 0.4481). MedianPruner
+# scores the early ranking and TPE consumes pruned trials, so the search was
+# being pulled toward a rung that loses.
+#
+# 512 over 1024 because the arms that have a MEASURED preference prefer it, and
+# because of the step count. At 2M samples a rung is 2e6/B optimizer steps:
+#
+#     256 -> 7812   512 -> 3906   1024 -> 1953   2048 -> 976
+#     4096 -> 488   8192 -> 244   16384 -> 122
+#
+# AdamW's default b2 = 0.999 has a 1/(1-b2) = 1000-step averaging horizon. At
+# 2048 the ENTIRE run is 976 steps -- shorter than one horizon, so the second
+# moment never reaches steady state and the run lives inside bias correction.
+# At 8192/16384 there are 244/122 steps, which is the likeliest explanation for
+# vbll returning 8.49 and 8.64 there rather than any vbll-specific fragility.
+# 512 gives 3906 steps, about four horizons, which is the regime the default
+# betas are meant for -- see BETAS below.
+#
+# What this costs: ce measured its optimum at 1024/2048 and has only one
+# completed trial at 512 (val_nll 0.5667, at lr 1.3e-4 -- four times its own
+# winning band, so that number is an lr artefact, not a verdict on the rung).
+# ce's lr band at 1024 was 4.6e-6 to 3.4e-5, so at 512 it wants roughly
+# 2e-6 to 2e-5, comfortably inside TRUNK_LR_BOX. The risk that 512 is simply
+# wrong for ce is real but small, and it is what the first campaign's ce trials
+# at 512 were never given an lr to test.
+#
+# Pinning also removes a confound from the arm comparison itself: at a fixed
+# SAMPLE budget the batch is the steps-per-sample knob, so the first campaign
+# compared ce at 2048 against vbll at 512 -- a factor of four in optimizer
+# effort. This is a protocol decision in favour of the most fragile arm and
+# belongs in the methods section as one.
+FIXED_BATCH_SIZE = 512
+
+# NOT searched, and deliberately left at the optax / torch defaults
+# (b1 = 0.9, b2 = 0.999) on every arm.
+#
+# Neither finetune_jax nor finetune_vbll exposes them as flags, so this records
+# a decision that is currently implicit in `optax.adamw(args.lr, ...)` and
+# `torch.optim.AdamW(...)`. The betas are a per-STEP timescale, so whether the
+# default is appropriate is a question about the step count and nothing else --
+# which is why it is settled by FIXED_BATCH_SIZE above rather than by a search.
+# At 512 the run is 3906 steps against b2's 1000-step horizon; at the rungs the
+# first campaign preferred for ce it was 976, and there the default is
+# genuinely wrong. Fixing the batch is what makes fixing the betas safe.
+#
+# Revisit only if FIXED_BATCH_SIZE rises above 1024 (1953 steps, ~2 horizons)
+# or MAX_SAMPLES falls.
+BETAS = (0.9, 0.999)
+
 # The GPU MICRO_BATCH was measured on. The constants below are valid for this
 # device and nothing else -- a smaller card OOMs on them, a larger one leaves
 # memory unused, and neither is visible from a finished run's config.
@@ -157,24 +218,65 @@ EPS_INIT_BOX = (1e-8, 1e-1)
 # and 32 are dropped because the PX operating point is ~128 iterations (where
 # it matches ~1000 plain ones), so rungs below it measure an unconverged head
 # rather than the method.
-IBPROBIT_UPDATE_ITERS = (128, 192, 256)
+#
+# Extended again for the second campaign, for the same reason it was shifted up
+# the first time: 256 was selected in 5 of the top 6 ibprobit trials, i.e. it
+# pinned to its ceiling exactly as probing's 192 did.
+#
+# This is the one widening here that is NOT free. CAVI iterations are compute
+# per optimizer step, so 512 doubles the head's share of a trial against 256.
+# Watch trial duration against the ~2.8 h median at 256 and drop the top rung
+# if it binds.
+#
+# It is worth the risk because the answer is genuinely unknown: the PX
+# operating point is ~128 iterations (it matches ~1000 plain ones), so a pin at
+# 256 is ALREADY above convergence and the extra iterations must be buying
+# something other than a better-fitted head -- most likely acting as a
+# regulariser through the number of assimilation passes. Rungs above 256
+# separate "the ladder is still too low" from "the pin is an artefact of where
+# it stopped".
+IBPROBIT_UPDATE_ITERS = (128, 192, 256, 384, 512)
 
 # Narrowed from probing's [1e-6, 1e-1] to bracket its measured optima
 # (2.4e-5 to 4.2e-3) by roughly a decade either side. q0 = alpha^2 / B, so this
 # is batch-dependent by construction and the box, not the point, is what the
 # probing campaign licenses.
-Q_INIT_BOX = (1e-5, 1e-2)
+# Floor dropped from 1e-5 to 1e-7 for the second campaign. The first campaign
+# drove this axis INTO its floor: rho(val_nll, q_init) = +0.31 on ibprobit and
+# +0.49 on ibprobit_noeps (smaller is better on both), and the top-6 q_init
+# values span 1.8e-5 to 1.3e-4 against a floor of 1e-5. Two decades of new room
+# downward, on an axis TPE explores in log space.
+Q_INIT_BOX = (1e-7, 1e-2)
 
 # Narrowed from probing's [1e-7, 1e-2]. vbll's regularization_weight is
 # kl_ratio * prior_scale / N, so N (1,020 to 75,750 in probing, 1.28M here) is
 # already divided out and the ratio is the N-normalised quantity -- the one
 # VBLL axis whose UNITS transfer even though its value does not. Probing's
 # optima spanned 2.4e-7 to 7.1e-5.
-KL_RATIO_BOX = (1e-7, 1e-4)
+#
+# Ceiling raised from 1e-4 to 1e-2 for the second campaign: the first one
+# CLIPPED here. rho(val_nll, kl_ratio) = -0.66 (larger is better) and the top-6
+# values are 5.2e-5 to 9.5e-5 -- the whole winning cluster is inside the last
+# half-decade below the old ceiling. Probing's optima (2.4e-7 to 7.1e-5) are
+# what set that ceiling, and this is the axis where the probing evidence
+# transferred worst.
+KL_RATIO_BOX = (1e-7, 1e-2)
 
 # Unchanged from probing. Its optima spanned 0.14 to 352 -- a 2500x range with
 # no pattern -- so there is nothing here to narrow with.
-PRIOR_SCALE_BOX = (1e-1, 1e3)
+#
+# Floor dropped from 1e-1 to 1e-3. Probing found no pattern, but fine-tuning
+# did: rho(val_nll, prior_scale) = +0.79, the strongest correlation on any axis
+# in any arm, and the top-6 sit at 0.72 to 2.6 -- heading for the floor. Two
+# decades of new room, matching the two added at KL_RATIO_BOX's ceiling.
+#
+# The two axes multiply (regularization_weight = kl_ratio * prior_scale / N),
+# so widening both in OPPOSITE directions leaves the product's reachable range
+# roughly where it was while letting TPE find the split. That the search wants
+# large kl_ratio AND small prior_scale is itself the finding: the product is
+# already near its optimum and the first campaign was spending trials sliding
+# along that diagonal into two walls.
+PRIOR_SCALE_BOX = (1e-3, 1e3)
 
 # Trunk learning rate and the head's MULTIPLE of it, not two independent rates.
 # full_finetune_comparison.py records why they are correlated: AdamW moves
@@ -182,8 +284,60 @@ PRIOR_SCALE_BOX = (1e-1, 1e3)
 # thousands of 1e-4 steps to overwrite -- its defaults are 1e-4 / 1e-2, a ratio
 # of 100. Two independent log-uniform axes spend trials sliding along that
 # diagonal. Same reparameterisation `space.py` applies for kl_ratio.
-TRUNK_LR_BOX = (1e-6, 1e-3)
+#
+# Ceiling narrowed from 1e-3 to 3e-4 for the second campaign. This is the axis
+# the first campaign converged HARDEST on: every arm, every top trial, 2e-5 to
+# 4e-5, out of a box three decades wide. It is also the axis with the WEAKEST
+# rank correlation to the score in all four arms (ce +0.20, ibprobit -0.13,
+# noeps -0.18, vbll -0.09) -- which is restriction of range, not unimportance:
+# TPE had already collapsed it, so among survivors there was little left to
+# correlate.
+#
+# Only half a decade comes off, and the cut is off the TOP, where the highest
+# observed survivor was 9e-5. Deliberately modest: three other axes in this
+# file were just found clipped, and a narrow lr box would be a fourth. The
+# floor is untouched -- ce at 512 is expected to want roughly half its 1024
+# value (2e-6 to 2e-5), near the bottom of the box, not the top.
+TRUNK_LR_BOX = (1e-6, 3e-4)
+
+# Weight decay is now PER ARM, because the first campaign found three different
+# behaviours on one axis. Best val_nll by wd decade, over all completed trials:
+#
+#             1e-5..1e-4   1e-4..1e-3   1e-3..1e-2   1e-2..1e-1
+#   ce           0.44408      0.44480      0.44887      0.45315   monotone
+#   ibprobit     0.44515      0.44273      0.44702      0.44555   flat
+#   noeps        0.44695      0.44150      0.44493      0.45155   flat-ish
+#   vbll         0.49682      0.48824      0.49117      (0 of 13) interior
+#
+# So a single shared box is wrong in two directions at once, and a single
+# PINNED value would be worse: vbll's interior optimum is worth 0.009 against
+# the neighbouring decade, which is three times the entire spread between the
+# JAX arms.
+#
+# Pinning was considered and rejected on a second ground as well. AdamW's decay
+# is decoupled, so per-step shrinkage is lr * wd and total shrinkage over a run
+# is N * lr * wd. Pinning wd while re-searching lr pins one FACTOR of the
+# regulariser, not the regulariser -- the effective decay would then move as a
+# side effect of the lr search. Searching the invariant N * lr * wd directly
+# was the alternative, and the data does not support it either: the top-5 of
+# that quantity spans 100x on ce, 500x on ibprobit and 30x on noeps. Only vbll
+# is tight (5x), which is not enough arms to reparameterise on.
+#
+# What the invariance DOES buy is the batch change: N * lr * wd is unchanged
+# when lr scales with B, so these boxes transfer from the first campaign's
+# rungs to FIXED_BATCH_SIZE without adjustment.
 TRUNK_WD_BOX = (1e-5, 1e-1)
+
+# ce presses the FLOOR: rho(val_nll, wd) = +0.44 over 33 completed trials, the
+# best decade is the lowest one, and the winner sits at 2.2e-5 against a floor
+# of 1e-5. A decade of new room downward, and the top two decades dropped --
+# nothing there survived well (0.44887 and 0.45315 against 0.44408).
+CE_WD_BOX = (1e-6, 1e-3)
+
+# vbll has a real interior optimum at 1e-4..1e-3 and nothing survived above
+# 1e-2 (0 of 13 sampled). Narrowed to bracket that by a decade either side
+# rather than pinned, since rho = -0.43 at n = 16 is suggestive, not settled.
+VBLL_WD_BOX = (1e-5, 1e-2)
 
 # Both IBProbit arms cap the trunk rate half a decade lower than CE and VBLL.
 #
@@ -199,7 +353,11 @@ TRUNK_WD_BOX = (1e-5, 1e-1)
 # the conjugate update, and the asymmetry is reported rather than hidden. The
 # lower bound is unchanged, so the arm can still reach every trunk rate the
 # others can except the top half-decade.
-IBPROBIT_TRUNK_LR_BOX = (1e-6, 5e-4)
+#
+# Ceiling lowered from 5e-4 to 1e-4 alongside TRUNK_LR_BOX's 1e-3 -> 3e-4, so
+# the half-decade asymmetry this constant exists to express is preserved rather
+# than quietly closed by narrowing only the other box.
+IBPROBIT_TRUNK_LR_BOX = (1e-6, 1e-4)
 
 # The head rate is ALWAYS at least 5x the trunk rate. Because the RATIO is the
 # searched axis, this is a floor on the box rather than a rejected-sample
@@ -216,8 +374,14 @@ IBPROBIT_TRUNK_LR_BOX = (1e-6, 5e-4)
 #
 # 5 is a floor, not a target: the box still spans to 1e3, and
 # full_finetune_comparison's own default sits at 100.
+#
+# Ceiling raised from 1e3 to 1e4 for the second campaign: vbll clipped here.
+# rho(val_nll, head_lr_ratio) = -0.78 (larger is better, the second-strongest
+# correlation in the whole campaign) and its top-6 are 378 to 872 -- the
+# winning cluster is the top half-decade of the old box. ce is unaffected and
+# shares the box anyway: its winners are 20 to 104, nowhere near either bound.
 MIN_HEAD_LR_RATIO = 5.0
-HEAD_LR_RATIO_BOX = (MIN_HEAD_LR_RATIO, 1e3)
+HEAD_LR_RATIO_BOX = (MIN_HEAD_LR_RATIO, 1e4)
 
 
 def micro_batch(arm: str) -> int:
@@ -268,11 +432,19 @@ def _suggest_ibprobit(trial: Any, *, search_eps: bool) -> dict[str, Any]:
     closed-form-conjugate advantage Fig 7 exists to measure.
     """
     params: dict[str, Any] = {
-        "batch_size": trial.suggest_categorical("batch_size", list(BATCH_SIZES)),
+        # Constant, NOT suggest_categorical over a one-element list: a sampled
+        # axis with one value still becomes a dimension TPE models and reports.
+        # See FIXED_BATCH_SIZE. The value reaches the study record through the
+        # trial's `effective_batch` user attr either way.
+        "batch_size": FIXED_BATCH_SIZE,
         # IBPROBIT_TRUNK_LR_BOX, not TRUNK_LR_BOX: the closed-form head refits
         # from features the trunk has already moved past once the trunk is fast
         # enough. See the constant.
         "lr": trial.suggest_float("lr", *IBPROBIT_TRUNK_LR_BOX, log=True),
+        # Both ibprobit arms keep the wide shared box: wd measured FLAT on this
+        # head (rho +0.17 and +0.03, best-of-decade spread 0.004 with no
+        # ordering). "Does not matter" is a result here, so it is left free to
+        # be re-measured rather than narrowed on noise.
         "weight_decay": trial.suggest_float("weight_decay", *TRUNK_WD_BOX, log=True),
         "q_init": trial.suggest_float("q_init", *Q_INIT_BOX, log=True),
         "num_update_iters": trial.suggest_categorical(
@@ -287,7 +459,8 @@ def _suggest_ibprobit(trial: Any, *, search_eps: bool) -> dict[str, Any]:
 def suggest(trial: Any, arm: str) -> dict[str, Any]:
     """One TPE-sampled configuration for `arm`.
 
-    Axis counts: ce 4, vbll 6, ibprobit 6, ibprobit_noeps 5.
+    Axis counts: ce 3, vbll 5, ibprobit 5, ibprobit_noeps 4 -- one lower than
+    the first campaign on every arm, since batch_size is now pinned.
 
     `cov_rank` and `parameterization` are NOT searched, following space.py's
     existing rule: rank buys calibration with memory, and neither CE nor
@@ -301,9 +474,15 @@ def suggest(trial: Any, arm: str) -> dict[str, Any]:
         return _suggest_ibprobit(trial, search_eps=(arm == "ibprobit"))
 
     params: dict[str, Any] = {
-        "batch_size": trial.suggest_categorical("batch_size", list(BATCH_SIZES)),
+        # See FIXED_BATCH_SIZE, and _suggest_ibprobit on why it is a constant
+        # rather than a one-element categorical.
+        "batch_size": FIXED_BATCH_SIZE,
         "lr": trial.suggest_float("lr", *TRUNK_LR_BOX, log=True),
-        "weight_decay": trial.suggest_float("weight_decay", *TRUNK_WD_BOX, log=True),
+        # Per arm: ce presses the floor, vbll has an interior optimum. See
+        # CE_WD_BOX / VBLL_WD_BOX.
+        "weight_decay": trial.suggest_float(
+            "weight_decay", *(VBLL_WD_BOX if arm == "vbll" else CE_WD_BOX), log=True
+        ),
         "head_lr_ratio": trial.suggest_float(
             "head_lr_ratio", *HEAD_LR_RATIO_BOX, log=True
         ),

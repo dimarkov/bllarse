@@ -130,19 +130,63 @@ def test_both_ibprobit_arms_share_one_micro_batch(monkeypatch):
 
 
 @pytest.mark.parametrize("arm,expected", [
-    ("ce", {"batch_size", "lr", "weight_decay", "head_lr_ratio"}),
-    ("vbll", {"batch_size", "lr", "weight_decay", "head_lr_ratio",
-              "kl_ratio", "prior_scale"}),
-    ("ibprobit", {"batch_size", "lr", "weight_decay", "q_init",
-                  "num_update_iters", "eps_init"}),
-    ("ibprobit_noeps", {"batch_size", "lr", "weight_decay", "q_init",
-                        "num_update_iters"}),
+    ("ce", {"lr", "weight_decay", "head_lr_ratio"}),
+    ("vbll", {"lr", "weight_decay", "head_lr_ratio", "kl_ratio",
+              "prior_scale"}),
+    ("ibprobit", {"lr", "weight_decay", "q_init", "num_update_iters",
+                  "eps_init"}),
+    ("ibprobit_noeps", {"lr", "weight_decay", "q_init", "num_update_iters"}),
 ])
 def test_each_arm_searches_exactly_its_own_axes(arm, expected):
     trial = RecordingTrial()
     params = fs.suggest(trial, arm)
     assert set(trial.axes) == expected
-    assert set(params) == expected
+    # batch_size is emitted but not SEARCHED, so params carries exactly one
+    # key the axes do not.
+    assert set(params) == expected | {"batch_size"}
+
+
+@pytest.mark.parametrize("arm", fs.ARMS)
+def test_the_batch_is_pinned_rather_than_sampled(arm):
+    """A constant, not a one-element categorical.
+
+    The distinction is not cosmetic: a suggested axis with a single choice is
+    still a dimension TPE models and still appears in `trial.params` as though
+    it had been searched, which is exactly the misreading FIXED_BATCH_SIZE
+    exists to prevent for the second campaign's studies.
+    """
+    trial = RecordingTrial()
+    params = fs.suggest(trial, arm)
+    assert params["batch_size"] == fs.FIXED_BATCH_SIZE == 512
+    assert "batch_size" not in trial.axes
+
+
+def test_the_pinned_batch_is_a_rung_the_protocol_can_schedule():
+    # Not merely on the ladder: it has to divide the quantum, or every trial
+    # dies in protocol.eval_every_steps.
+    assert fs.FIXED_BATCH_SIZE in fs.BATCH_SIZES
+    assert protocol.EVAL_QUANTUM % fs.FIXED_BATCH_SIZE == 0
+
+
+@pytest.mark.parametrize("arm", fs.ARMS)
+def test_the_pinned_batch_divides_by_every_arms_micro_batch(arm):
+    # protocol.accum_plan raises otherwise, at the top of a ~3 h trial -- and
+    # with the batch pinned there is no longer another rung for TPE to escape
+    # to, so a mismatch would kill the whole campaign rather than one trial.
+    assert fs.FIXED_BATCH_SIZE % fs.micro_batch(arm) == 0
+
+
+def test_the_pinned_batch_leaves_the_default_betas_in_their_regime():
+    """Why fixing the batch is what makes fixing the betas safe.
+
+    b2 = 0.999 averages over 1/(1-b2) = 1000 steps. At 2M samples the run is
+    MAX_SAMPLES / batch steps, so the first campaign's ce optimum of 2048 gave
+    976 -- less than one horizon, i.e. the second moment never left bias
+    correction. This asserts the chosen rung clears the horizon severalfold.
+    """
+    steps = protocol.MAX_SAMPLES / fs.FIXED_BATCH_SIZE
+    horizon = 1.0 / (1.0 - fs.BETAS[1])
+    assert steps / horizon >= 3.0
 
 
 def test_neither_ibprobit_arm_gets_a_head_learning_rate():
@@ -200,7 +244,15 @@ def test_the_pinned_and_searched_eps_stay_distinguishable():
 def test_cavi_ladder_starts_at_the_px_operating_point():
     # 32 and 64 are dropped: PX matches ~1000 plain iterations at ~128, so
     # rungs below it measure an unconverged head rather than the method.
-    assert fs.IBPROBIT_UPDATE_ITERS == (128, 192, 256)
+    assert fs.IBPROBIT_UPDATE_ITERS[0] == 128
+
+
+def test_the_cavi_ladder_extends_past_where_it_last_pinned():
+    # 256 was selected in 5 of the first campaign's top 6 ibprobit trials --
+    # the same pinned-to-its-ceiling signal that moved this ladder up once
+    # already (probing pinned at 192 in 4 of 5 studies). A ladder whose top
+    # rung keeps winning has not been given room to lose.
+    assert max(fs.IBPROBIT_UPDATE_ITERS) > 256
 
 
 def test_learning_rate_is_searched_as_trunk_rate_and_ratio():
@@ -209,8 +261,8 @@ def test_learning_rate_is_searched_as_trunk_rate_and_ratio():
     # trials sliding along that diagonal.
     trial = RecordingTrial()
     fs.suggest(trial, "ce")
-    assert trial.axes["lr"] == ("float", 1e-6, 1e-3, True)
-    assert trial.axes["head_lr_ratio"] == ("float", 5.0, 1e3, True)
+    assert trial.axes["lr"] == ("float", *fs.TRUNK_LR_BOX, True)
+    assert trial.axes["head_lr_ratio"] == ("float", *fs.HEAD_LR_RATIO_BOX, True)
     assert "head_lr" not in trial.axes
 
 
@@ -259,7 +311,7 @@ def test_ibprobit_caps_the_trunk_rate_half_a_decade_below_the_others(arm):
     trial = RecordingTrial()
     fs.suggest(trial, arm)
     _kind, low, high, log = trial.axes["lr"]
-    assert (low, high, log) == (1e-6, 5e-4, True)
+    assert (low, high, log) == (*fs.IBPROBIT_TRUNK_LR_BOX, True)
 
 
 @pytest.mark.parametrize("arm", ["ce", "vbll"])
@@ -269,7 +321,7 @@ def test_the_optimiser_driven_arms_keep_the_full_trunk_range(arm):
     trial = RecordingTrial()
     fs.suggest(trial, arm)
     _kind, low, high, log = trial.axes["lr"]
-    assert (low, high, log) == (1e-6, 1e-3, True)
+    assert (low, high, log) == (*fs.TRUNK_LR_BOX, True)
 
 
 def test_only_the_top_of_the_trunk_range_differs_between_arms():

@@ -143,6 +143,16 @@ worker_args=(
   --storage-dir "$storage_dir"
   --patience "${BLLARSE_FT_PATIENCE:-20}"
 )
+# The depth the STUDY should reach, invariant to the prune rate. Without it the
+# first campaign searched the arms to depths nobody chose: the same 10 trials
+# per worker landed at 36 completions on ibprobit_noeps and 16 on vbll, because
+# MedianPruner killed 83% and 92% of them respectively -- and those two arms
+# were then compared against each other. --n-trials still caps the worker, so a
+# study that cannot reach the target terminates rather than holding a GPU to
+# the 24 h wall.
+if [[ -n "${BLLARSE_FT_TARGET_COMPLETE:-}" ]]; then
+  worker_args+=(--target-complete "$BLLARSE_FT_TARGET_COMPLETE")
+fi
 # Set whenever the search space changes: the worker opens studies with
 # load_if_exists, so an unsuffixed re-run RESUMES the old study and has TPE
 # model a space that no longer exists.

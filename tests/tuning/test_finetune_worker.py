@@ -195,3 +195,52 @@ def test_patience_is_on_and_can_actually_fire():
     # mechanism has room to work.
     assert fw.PATIENCE == 20
     assert fw.WARMUP_EVALS + fw.PATIENCE < space.eval_count()
+
+
+# --- Search depth, decoupled from the prune rate ----------------------------
+
+
+def test_the_worker_accepts_a_completed_trial_target():
+    """--n-trials cannot express "search every arm to the same depth".
+
+    It counts trials the worker STARTS, and MedianPruner killed 83%-92% of the
+    first campaign's. The same 10-per-worker request landed at 36 completed
+    trials on ibprobit_noeps and 16 on vbll -- arms that were then compared
+    against each other, at depths nobody chose.
+    """
+    args = fw.build_argparser().parse_args(
+        ["--arm", "ce", "--n-trials", "12", "--storage-dir", "/tmp/s",
+         "--target-complete", "60"]
+    )
+    assert args.target_complete == 60
+    assert args.n_trials == 12
+
+
+def test_the_target_is_optional_so_the_old_invocation_still_runs():
+    # Smoke runs and one-off re-runs have no depth to reach.
+    args = fw.build_argparser().parse_args(
+        ["--arm", "ce", "--n-trials", "1", "--storage-dir", "/tmp/s"]
+    )
+    assert args.target_complete is None
+
+
+def test_the_target_counts_the_study_not_the_worker():
+    """Four workers must cooperate through the shared journal.
+
+    A local counter would have each stop at target/4, so a fast worker idles
+    while a slow one is mid-trial. Reading the study means whoever finishes
+    checks the global total -- at the cost of a mild overshoot, which is why
+    the flag is a floor rather than an exact count.
+    """
+    import optuna
+
+    study = optuna.create_study(direction="minimize")
+    stop = fw.stop_at_completed(2)
+
+    study.optimize(lambda t: t.suggest_float("x", 0, 1), n_trials=1,
+                   callbacks=[stop])
+    assert fw.n_completed(study) == 1
+    # Still under target, so the worker was not stopped and can take more.
+    study.optimize(lambda t: t.suggest_float("x", 0, 1), n_trials=5,
+                   callbacks=[stop])
+    assert fw.n_completed(study) == 2
