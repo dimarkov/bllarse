@@ -80,12 +80,46 @@ if [[ -z "$BLLARSE_FT_VENV" ]]; then
   exit 2
 fi
 
+# The INTERPRETER, not the venv directory. slurm_finetune_tune.sh runs
+# "$BLLARSE_FT_VENV" -m bllarse.tuning.finetune_worker, so a directory here
+# fails with `Is a directory` -- one line of stderr, exit 126, after the job
+# has already been allocated a GPU. That cost a full submission: all 48 array
+# tasks across three arms started and died inside 3 seconds, and because the
+# arrays were then exhausted the whole campaign had to be resubmitted.
+#
+# Checked HERE rather than in the job script because the job script cannot
+# refuse before SLURM hands it a node, and one bad path multiplies by
+# BLLARSE_FT_WORKERS x the number of arms.
+check_interpreter() {
+  local path="$1" label="$2"
+  if [[ -d "$path" ]]; then
+    echo "ERROR: $label is a directory: $path" >&2
+    echo "       Pass the interpreter, e.g. ${path%/}/bin/python" >&2
+    exit 2
+  fi
+  if [[ ! -x "$path" ]]; then
+    echo "ERROR: $label is not executable: $path" >&2
+    exit 2
+  fi
+}
+
 # One venv per framework, and they cannot be merged: jax[cuda] and torch each
 # ship a full CUDA stack, and installing both into one environment is what
 # broke the vbll smoke runs. BLLARSE_FT_VENV names the JAX one; vbll overrides
 # it with BLLARSE_FT_VBLL_VENV, whose jax is CPU-only (bllarse.metrics imports
 # jax, and a CPU build coexists with torch's CUDA safely).
 : "${BLLARSE_FT_VBLL_VENV:=$BLLARSE_FT_VENV}"
+
+check_interpreter "$BLLARSE_FT_VENV" BLLARSE_FT_VENV
+check_interpreter "$BLLARSE_FT_VBLL_VENV" BLLARSE_FT_VBLL_VENV
+
+# Same class of failure, same reason to catch it here: the job script exits 2
+# on a missing shard, but only after taking a node.
+shard_meta="${BLLARSE_FT_SHARDS%/}/imagenet1k_train_224.json"
+if [[ ! -f "$shard_meta" ]]; then
+  echo "ERROR: no training shard at $shard_meta" >&2
+  exit 2
+fi
 
 for arm in $BLLARSE_FT_ARMS; do
   venv="$BLLARSE_FT_VENV"

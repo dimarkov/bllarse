@@ -116,3 +116,25 @@ def test_every_variable_the_job_requires_is_exported(var):
     # slurm_finetune_tune.sh exits 2 on any of these being unset, which would
     # burn a queue slot per worker to discover.
     assert f"{var}=" in TEXT
+
+
+def test_it_refuses_a_venv_directory_before_taking_a_node():
+    """`BLLARSE_FT_VENV` is the INTERPRETER, not the venv.
+
+    The job script runs "$BLLARSE_FT_VENV" -m bllarse.tuning.finetune_worker,
+    so a directory fails with `Is a directory` and exit 126 -- after SLURM has
+    allocated a GPU. One bad path multiplies by workers x arms: it took out all
+    48 tasks of a submission in under 3 seconds, and left the arrays exhausted
+    so the campaign had to be resubmitted from scratch.
+    """
+    assert "check_interpreter" in TEXT
+    assert 'check_interpreter "$BLLARSE_FT_VENV"' in TEXT
+    assert 'check_interpreter "$BLLARSE_FT_VBLL_VENV"' in TEXT
+    # Names the fix, not just the fault.
+    assert "bin/python" in TEXT
+
+
+def test_it_checks_the_shard_before_taking_a_node_too():
+    # Same class: slurm_finetune_tune.sh exits 2 on a missing shard, but only
+    # once it already holds a GPU.
+    assert "imagenet1k_train_224.json" in TEXT
