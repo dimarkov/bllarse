@@ -233,18 +233,17 @@ def trial_config(
         "bf16": bf16,
         **params,
     }
-    # NO betas here, deliberately -- the tuning campaign runs at the library
-    # defaults, and at its operating point (MAX_SAMPLES, FIXED_BATCH_SIZE)
-    # those ARE the rule's answer. `test_the_tuning_budget_is_the_beta
-    # _reference_point` is what keeps that true: move either constant and it
-    # fails, which is the signal to start passing --beta1/--beta2 here.
+    # `beta1` and `beta2` arrive through **params, not from a default here.
+    # space.suggest draws them in HORIZON units and converts at the trial's own
+    # step count, so trial_config never has to know the rule -- and must not
+    # re-derive them, since a trial's betas are a searched result rather than a
+    # function of the budget.
     #
-    # Deriving them at every rung was tried and reverted. protocol.betas_for
-    # rightly refuses the top of the ladder -- at batch 16,384 the whole budget
-    # is 122 optimizer steps and beta1's 10-step horizon cannot be held as a
-    # fraction of it, which is the breakdown the SDE rule's own authors predict
-    # at coarse discretisation. But that is a fact about those rungs, not a
-    # reason trial_config should be unable to build a config for them.
+    # Deriving them here was tried and reverted for a separate reason worth
+    # keeping: protocol.beta_from_horizons rightly refuses a horizon longer than
+    # the run, and at batch 16,384 the whole budget is a few dozen optimizer
+    # steps. That is a fact about those rungs, not a reason trial_config should
+    # be unable to build a config for them.
     if dump_root is not None:
         config["dump_root"] = str(dump_root)
     if train_shards:
@@ -287,7 +286,10 @@ def make_objective(
     """The optuna objective closure for one arm's study."""
 
     def run_trial(trial: optuna.Trial) -> float:
-        params = space.suggest(trial, arm)
+        # max_samples, not the default: the beta axes are drawn in horizon
+        # units and converted at this trial's step count, so a shortened smoke
+        # budget must convert against ITS budget rather than the campaign's.
+        params = space.suggest(trial, arm, max_samples=max_samples)
         config = trial_config(
             arm, params=params, max_samples=max_samples, dump_root=dump_root)
         trial.set_user_attr("max_samples", max_samples)

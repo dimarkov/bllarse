@@ -83,6 +83,12 @@ def test_it_carries_non_default_betas_through():
 
 # --- transfer -------------------------------------------------------------
 
+# The fixb512 campaign's operating point, written as a LITERAL. These tests are
+# about the rule, not about whatever the current tuning budget happens to be --
+# reading protocol.MAX_SAMPLES here would make them re-derive their own
+# expectations and assert nothing when it moves.
+TUNE_SAMPLES = 2_000_000
+
 TUNED = {
     "batch_size": 512,
     "lr": 1.17e-5,
@@ -95,13 +101,13 @@ FOUR_EPOCH_SAMPLES = 5_124_668
 def _to_final(params=None, **kwargs):
     return protocol.transfer(
         TUNED if params is None else params,
-        from_samples=protocol.MAX_SAMPLES, from_batch=512,
+        from_samples=TUNE_SAMPLES, from_batch=512,
         to_samples=FOUR_EPOCH_SAMPLES, to_batch=512, **kwargs)
 
 
 def test_the_duration_factor_is_the_inverse_root_of_the_data_ratio():
     out = _to_final()
-    expected = math.sqrt(protocol.MAX_SAMPLES / FOUR_EPOCH_SAMPLES)
+    expected = math.sqrt(TUNE_SAMPLES / FOUR_EPOCH_SAMPLES)
     assert expected == pytest.approx(0.6247, abs=1e-4)
     assert out["lr"] == pytest.approx(TUNED["lr"] * expected)
     assert out["weight_decay"] == pytest.approx(TUNED["weight_decay"] * expected)
@@ -115,7 +121,7 @@ def test_total_decoupled_shrinkage_is_invariant():
     the total over a run does not move.
     """
     out = _to_final()
-    before = _steps(protocol.MAX_SAMPLES, 512) * TUNED["lr"] * TUNED["weight_decay"]
+    before = _steps(TUNE_SAMPLES, 512) * TUNED["lr"] * TUNED["weight_decay"]
     after = _steps(FOUR_EPOCH_SAMPLES, 512) * out["lr"] * out["weight_decay"]
     assert after == pytest.approx(before, rel=1e-3)
 
@@ -155,8 +161,8 @@ def test_it_sets_the_betas_and_the_target_batch():
 def test_the_batch_rule_is_the_square_root_at_fixed_data():
     # m_D = 1, m_B = 4: lr and wd both take sqrt(4) = 2.
     out = protocol.transfer(
-        TUNED, from_samples=protocol.MAX_SAMPLES, from_batch=512,
-        to_samples=protocol.MAX_SAMPLES, to_batch=2048)
+        TUNED, from_samples=TUNE_SAMPLES, from_batch=512,
+        to_samples=TUNE_SAMPLES, to_batch=2048)
     assert out["lr"] == pytest.approx(TUNED["lr"] * 2.0)
     assert out["weight_decay"] == pytest.approx(TUNED["weight_decay"] * 2.0)
     assert out["batch_size"] == 2048
@@ -164,10 +170,10 @@ def test_the_batch_rule_is_the_square_root_at_fixed_data():
 
 def test_shrinkage_is_invariant_across_the_batch_axis_too():
     out = protocol.transfer(
-        TUNED, from_samples=protocol.MAX_SAMPLES, from_batch=512,
-        to_samples=protocol.MAX_SAMPLES, to_batch=2048)
-    before = _steps(protocol.MAX_SAMPLES, 512) * TUNED["lr"] * TUNED["weight_decay"]
-    after = _steps(protocol.MAX_SAMPLES, 2048) * out["lr"] * out["weight_decay"]
+        TUNED, from_samples=TUNE_SAMPLES, from_batch=512,
+        to_samples=TUNE_SAMPLES, to_batch=2048)
+    before = _steps(TUNE_SAMPLES, 512) * TUNED["lr"] * TUNED["weight_decay"]
+    after = _steps(TUNE_SAMPLES, 2048) * out["lr"] * out["weight_decay"]
     assert after == pytest.approx(before, rel=1e-3)
 
 
@@ -175,7 +181,7 @@ def test_a_round_trip_is_the_identity():
     forward = _to_final()
     back = protocol.transfer(
         forward, from_samples=FOUR_EPOCH_SAMPLES, from_batch=512,
-        to_samples=protocol.MAX_SAMPLES, to_batch=512)
+        to_samples=TUNE_SAMPLES, to_batch=512)
     assert back["lr"] == pytest.approx(TUNED["lr"])
     assert back["weight_decay"] == pytest.approx(TUNED["weight_decay"])
     assert back["beta1"] == pytest.approx(protocol.REFERENCE_BETAS[0])
@@ -201,15 +207,87 @@ def test_it_refuses_to_move_q_init_across_a_batch_change():
     assert _to_final(with_q)["q_init"] == 3.72e-5  # duration only: fine
     with pytest.raises(ValueError, match="q_init"):
         protocol.transfer(
-            with_q, from_samples=protocol.MAX_SAMPLES, from_batch=512,
-            to_samples=protocol.MAX_SAMPLES, to_batch=1024)
+            with_q, from_samples=TUNE_SAMPLES, from_batch=512,
+            to_samples=TUNE_SAMPLES, to_batch=1024)
 
 
 @pytest.mark.parametrize("kwargs", [
     {"from_samples": 0}, {"to_samples": 0}, {"from_batch": 0}, {"to_batch": 0},
 ])
 def test_it_rejects_a_degenerate_operating_point(kwargs):
-    base = dict(from_samples=protocol.MAX_SAMPLES, from_batch=512,
+    base = dict(from_samples=TUNE_SAMPLES, from_batch=512,
                 to_samples=FOUR_EPOCH_SAMPLES, to_batch=512)
     with pytest.raises(ValueError):
         protocol.transfer(TUNED, **{**base, **kwargs})
+
+
+# --- horizons: the searched coordinate --------------------------------------
+
+
+def test_the_horizon_coordinate_inverts():
+    for steps in (1953, 3906, 10_009):
+        for beta in (0.5, 0.9, 0.99, 0.999, 0.9999):
+            h = protocol.horizons(beta, steps)
+            assert protocol.beta_from_horizons(h, steps) == pytest.approx(beta)
+
+
+def test_the_reference_betas_are_390_and_3_9_horizons():
+    # The numbers the boxes in finetune_space are centred on.
+    assert protocol.horizons(0.9, 3906) == pytest.approx(390.6)
+    assert protocol.horizons(0.999, 3906) == pytest.approx(3.906)
+
+
+def test_a_searched_horizon_survives_the_transfer_unchanged():
+    """THE property that makes the beta axes worth searching.
+
+    A trial draws H at its own step count and records it; `transfer` moves the
+    resulting beta to the final budget. If H did not come out the other side
+    identical, the searched coordinate would not be the transferable one and
+    tuning the betas would buy nothing.
+    """
+    tune_steps = _steps(1_000_000, 512)
+    final_steps = _steps(FOUR_EPOCH_SAMPLES, 512)
+    for h1, h2 in ((39.0, 0.4), (390.6, 3.906), (780.0, 40.0)):
+        params = {
+            **TUNED,
+            "beta1": protocol.beta_from_horizons(h1, tune_steps),
+            "beta2": protocol.beta_from_horizons(h2, tune_steps),
+        }
+        out = protocol.transfer(
+            params, from_samples=1_000_000, from_batch=512,
+            to_samples=FOUR_EPOCH_SAMPLES, to_batch=512)
+        assert protocol.horizons(out["beta1"], final_steps) == pytest.approx(h1)
+        assert protocol.horizons(out["beta2"], final_steps) == pytest.approx(h2)
+
+
+def test_it_refuses_a_horizon_longer_than_the_run():
+    """The hard bound, and the reason the tuning budget has a floor.
+
+    beta >= 0 requires the averaging window to be at least one step, so an
+    N-step run cannot express more than N windows. The bound is asymmetric in
+    the direction that matters: longer memory is free at any budget, shorter
+    memory is what a short run cannot reach.
+    """
+    protocol.beta_from_horizons(1952, 1953)
+    with pytest.raises(ValueError, match="do not fit in a 1953-step run"):
+        protocol.beta_from_horizons(1953, 1953)
+    # Longer memory is unconstrained at the same budget.
+    assert protocol.beta_from_horizons(0.001, 1953) > 0.999999
+
+
+def test_the_tuning_budget_can_express_the_whole_beta1_box():
+    """The floor under protocol.MAX_SAMPLES, asserted rather than argued.
+
+    finetune_space.BETA1_HORIZONS_BOX tops out at 780, which needs a run longer
+    than 780 steps to represent at all. At 1M/512 = 1953 steps that leaves
+    beta1 >= 0.6; halving the budget again would put the box ceiling at
+    beta1 = 0.2, and halving once more would make it unrepresentable.
+    """
+    from bllarse.tuning import finetune_space as fs
+
+    steps = _steps(protocol.MAX_SAMPLES, fs.FIXED_BATCH_SIZE)
+    assert steps == 1953
+    for box in (fs.BETA1_HORIZONS_BOX, fs.BETA2_HORIZONS_BOX):
+        assert box[1] < steps, f"{box} is not representable in {steps} steps"
+    assert protocol.beta_from_horizons(
+        fs.BETA1_HORIZONS_BOX[1], steps) == pytest.approx(0.6, abs=0.01)

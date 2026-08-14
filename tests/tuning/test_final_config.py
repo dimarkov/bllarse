@@ -21,9 +21,12 @@ from bllarse.tuning import final_config as fc  # noqa: E402
 from bllarse.tuning import finetune_space as fs  # noqa: E402
 
 ROOT = math.sqrt(512)
-# The fixb512 campaign's ce winner, and the duration factor it takes.
+# The fixb512 campaign's ce winner, its budget, and the factor it takes. The
+# budget is a LITERAL: these trials were run at 2M and stay run at 2M whatever
+# protocol.MAX_SAMPLES becomes for the next campaign.
+TUNE_SAMPLES = 2_000_000
 CE_BEST = {"lr": 1.17e-5, "weight_decay": 8.13e-6, "head_lr_ratio": 31.7}
-DURATION_FACTOR = math.sqrt(protocol.MAX_SAMPLES / 5_124_668)
+DURATION_FACTOR = math.sqrt(TUNE_SAMPLES / 5_124_668)
 
 
 class FakeTrial:
@@ -75,6 +78,7 @@ def test_the_rename_is_not_spelled_twice():
 
 
 def _ce_config(**kwargs):
+    kwargs.setdefault("from_samples", TUNE_SAMPLES)
     return fc.final_config("ce", CE_BEST, effective_batch=512, **kwargs)
 
 
@@ -115,7 +119,7 @@ def test_total_decoupled_shrinkage_survives_the_assembly():
     # level that actually ships: trial_config sits between the two and could
     # overwrite either factor.
     config = _ce_config()
-    before = (protocol.steps_for_samples(protocol.MAX_SAMPLES, 512)
+    before = (protocol.steps_for_samples(TUNE_SAMPLES, 512)
               * CE_BEST["lr"] * CE_BEST["weight_decay"])
     after = (protocol.steps_for_samples(5_124_668, 512)
              * config["lr"] * config["weight_decay"])
@@ -147,10 +151,11 @@ def test_a_batch_change_is_refused_on_the_ibprobit_arms():
     params = {"lr": 2.62e-5, "weight_decay": 3.30e-5, "q_init": 3.72e-5,
               "num_update_iters": 512}
     # Duration-only is fine, which is the case that actually runs.
-    assert fc.final_config("ibprobit_noeps", params, effective_batch=512)
+    assert fc.final_config("ibprobit_noeps", params, effective_batch=512,
+                           from_samples=TUNE_SAMPLES)
     with pytest.raises(ValueError, match="q_init"):
         fc.final_config("ibprobit_noeps", params, effective_batch=512,
-                        to_batch=1024)
+                        from_samples=TUNE_SAMPLES, to_batch=1024)
 
 
 def test_a_batch_change_applies_the_square_root_rule_on_the_other_arms():
@@ -167,7 +172,7 @@ def test_it_reads_the_batch_off_the_user_attr_not_the_params():
     # batch_size is pinned and therefore no longer a param at all; the worker
     # has always written the effective batch as a user attr.
     study = FakeStudy(FakeTrial(CE_BEST, effective_batch=512,
-                                max_samples=protocol.MAX_SAMPLES))
+                                max_samples=TUNE_SAMPLES))
     assert fc.best_config(study, "ce")["lr"] == pytest.approx(
         1.17e-5 * DURATION_FACTOR)
 
@@ -191,7 +196,7 @@ def test_a_study_recording_the_new_coordinate_round_trips():
              "weight_decay_per_sqrt_batch": 8.13e-6 / ROOT,
              "head_lr_ratio": 31.7}
     study = FakeStudy(FakeTrial(tuned, effective_batch=512,
-                                max_samples=protocol.MAX_SAMPLES))
+                                max_samples=TUNE_SAMPLES))
     assert fc.best_config(study, "ce")["lr"] == pytest.approx(
         1.17e-5 * DURATION_FACTOR)
 
@@ -213,7 +218,8 @@ def test_the_emitted_flags_are_accepted_by_the_script_that_runs_them(arm):
     if arm.startswith("ibprobit"):
         params = {"lr": 2.62e-5, "weight_decay": 3.30e-5,
                   "q_init": 3.72e-5, "num_update_iters": 512}
-    config = fc.final_config(arm, params, effective_batch=512)
+    config = fc.final_config(arm, params, effective_batch=512,
+                             from_samples=TUNE_SAMPLES)
     argv = adapters.config_to_argv(config)
     args = fj.build_argparser().parse_args(argv)
 
@@ -233,8 +239,66 @@ def test_the_vbll_script_takes_the_same_two_beta_flags():
 
     params = {"lr": 1.47e-5, "weight_decay": 1.38e-3, "head_lr_ratio": 326.0,
               "kl_ratio": 3.06e-7, "prior_scale": 1.66e-3}
-    config = fc.final_config("vbll", params, effective_batch=512)
+    config = fc.final_config("vbll", params, effective_batch=512,
+                             from_samples=TUNE_SAMPLES)
     args = fv.build_argparser().parse_args(adapters.config_to_argv(config))
     assert args.beta1 == pytest.approx(config["beta1"])
     assert args.beta2 == pytest.approx(config["beta2"])
     assert args.lr == pytest.approx(1.47e-5 * DURATION_FACTOR)
+
+
+# --- Searched betas ---------------------------------------------------------
+
+
+def test_a_trial_that_TUNED_its_betas_transfers_them_not_the_defaults():
+    """The gap that let a real bug through.
+
+    Every other test here uses a fixb512 trial, which recorded no betas because
+    the axis did not exist yet -- so the fallback path was exercised everywhere
+    and the searched path nowhere. final_config's own consistency check was
+    comparing against the transfer of REFERENCE_BETAS rather than of the
+    trial's values, and rejected correct configs from any study that tuned
+    them.
+    """
+    tune_steps = protocol.steps_for_samples(TUNE_SAMPLES, 512)
+    final_steps = protocol.steps_for_samples(5_124_668, 512)
+    h1, h2 = 120.0, 12.0
+    params = {
+        **CE_BEST,
+        "beta1": protocol.beta_from_horizons(h1, tune_steps),
+        "beta2": protocol.beta_from_horizons(h2, tune_steps),
+    }
+    config = fc.final_config("ce", params, effective_batch=512,
+                             from_samples=TUNE_SAMPLES)
+    # The horizon survives; the beta does not, and must not.
+    assert protocol.horizons(config["beta1"], final_steps) == pytest.approx(h1)
+    assert protocol.horizons(config["beta2"], final_steps) == pytest.approx(h2)
+    assert config["beta1"] != pytest.approx(params["beta1"])
+    # ... and it is emphatically not the transfer of the library defaults.
+    assert config["beta1"] != pytest.approx(protocol.betas_for(final_steps)[0])
+
+
+def test_the_whole_search_space_survives_the_round_trip():
+    """suggest -> final_config, on every arm, with the real search space.
+
+    The end-to-end path: a drawn trial's horizons must equal the horizons its
+    final-run command implies. Nothing else in this file exercises suggest().
+    """
+    import optuna
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+    tune_steps = protocol.steps_for_samples(protocol.MAX_SAMPLES,
+                                            fs.FIXED_BATCH_SIZE)
+    final_steps = protocol.steps_for_samples(5_124_668, fs.FIXED_BATCH_SIZE)
+
+    for arm in fs.ARMS:
+        params = fs.suggest(study.ask(), arm)
+        config = fc.final_config(arm, params,
+                                 effective_batch=fs.FIXED_BATCH_SIZE)
+        for name in ("beta1", "beta2"):
+            assert protocol.horizons(config[name], final_steps) == pytest.approx(
+                protocol.horizons(params[name], tune_steps)), (arm, name)
+        # The learning rate takes the duration factor over the SAME budgets.
+        assert config["lr"] == pytest.approx(
+            params["lr"] * math.sqrt(protocol.MAX_SAMPLES / 5_124_668))

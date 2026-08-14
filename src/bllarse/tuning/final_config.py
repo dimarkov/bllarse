@@ -119,8 +119,9 @@ def final_config(
     to_samples = int(epochs * n_train)
     batch = effective_batch if to_batch is None else to_batch
 
+    absolute = absolute_params(params, effective_batch=effective_batch)
     transferred = protocol.transfer(
-        absolute_params(params, effective_batch=effective_batch),
+        absolute,
         from_samples=from_samples,
         from_batch=effective_batch,
         to_samples=to_samples,
@@ -142,21 +143,28 @@ def final_config(
     if model is not None:
         config["model"] = model
 
-    # The betas reach `config` through trial_config's `**params`, since
-    # `transfer` put them in `transferred`. Re-derived and compared rather than
-    # trusted: this is the one value the tuning campaign never sets, so nothing
-    # upstream would notice it going missing, and shipping the library defaults
-    # at the final duration is the exact defect this module exists to remove.
-    expected = protocol.betas_for(
-        protocol.steps_for_samples(to_samples, batch),
-        from_steps=protocol.steps_for_samples(from_samples, effective_batch),
-    )
-    got = (config.get("beta1"), config.get("beta2"))
-    if got != expected:
-        raise AssertionError(
-            f"betas {got} do not match the transfer rule's {expected} at "
-            f"{to_samples} samples, batch {batch}"
-        )
+    # Check the INVARIANT, not the formula. The betas reach `config` through
+    # trial_config's `**params`; what has to survive is the horizon
+    # (1-beta)*steps, which is the searched coordinate and the thing the rule
+    # actually holds fixed. Re-deriving the betas here instead would only
+    # restate protocol.transfer's arithmetic -- and did, wrongly: it compared
+    # against the transfer of REFERENCE_BETAS rather than of the trial's own
+    # searched values, so every study that tuned its betas failed this check
+    # while carrying entirely correct numbers.
+    tune_steps = protocol.steps_for_samples(from_samples, effective_batch)
+    final_steps = protocol.steps_for_samples(to_samples, batch)
+    for name, fallback in zip(("beta1", "beta2"), protocol.REFERENCE_BETAS):
+        # The fallback is for studies predating the searched axes, which ran at
+        # the library defaults and recorded no betas.
+        before = protocol.horizons(float(absolute.get(name, fallback)), tune_steps)
+        after = protocol.horizons(float(config[name]), final_steps)
+        if abs(after - before) > 1e-6 * max(1.0, abs(before)):
+            raise AssertionError(
+                f"{name} horizon not preserved across the transfer: "
+                f"{before:.6g} at {tune_steps} steps became {after:.6g} at "
+                f"{final_steps}. The searched coordinate is (1-beta)*steps and "
+                f"it must come out unchanged."
+            )
     return config
 
 

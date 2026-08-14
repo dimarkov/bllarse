@@ -36,15 +36,22 @@
 set -euo pipefail
 
 : "${BLLARSE_FT_STORAGE:=/ptmp/${USER}/ft_studies}"
-# Moved from fixb512 because the SEARCH SPACE changed again: lr and weight
-# decay are now drawn as `lr_per_sqrt_batch` and `weight_decay_per_sqrt_batch`,
-# the batch-invariant coordinates of the AdamW SDE transfer rule
-# (finetune_space._suggest_per_sqrt_batch). At the pinned batch that is an
-# exact relabelling of the same interval, so the two campaigns are directly
-# comparable -- but they cannot SHARE a study. Renaming a float axis is
+# Moved from fixb512 because the SEARCH SPACE changed, in three ways:
+#
+#   * lr and weight decay are drawn as `lr_per_sqrt_batch` and
+#     `weight_decay_per_sqrt_batch`, the batch-invariant coordinates. At the
+#     pinned batch that alone is an exact relabelling.
+#   * `beta1_horizons` and `beta2_horizons` are NEW axes. The betas were
+#     previously unsearchable -- a per-step timescale with no way to move it
+#     across budgets -- and protocol.horizons makes them transferable, hence
+#     worth tuning. This is what makes the campaign more than a relabelling.
+#   * protocol.MAX_SAMPLES is halved to 1,000,000, which pays for the two extra
+#     dimensions. Trials are ~1.4 h rather than ~2.8 h.
+#
+# They cannot SHARE a study with fixb512 in any case. Renaming a float axis is
 # optuna's quiet failure: `load_if_exists` would leave TPE modelling `lr` from
 # 500-odd prior trials while the objective samples a name none of them carry.
-: "${BLLARSE_FT_CAMPAIGN:=sdelr512}"
+: "${BLLARSE_FT_CAMPAIGN:=betas1m}"
 # 60, against the first campaign's 32 / 36 / 16. The reason to re-run at all is
 # that the arms came out 0.0026 apart while the spread across each arm's own
 # top six was 0.003-0.005 -- the ranking sat inside the search's own noise. A

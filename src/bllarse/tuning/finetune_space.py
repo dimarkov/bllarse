@@ -111,21 +111,62 @@ BATCH_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384)
 # belongs in the methods section as one.
 FIXED_BATCH_SIZE = 512
 
-# NOT searched, and deliberately left at the optax / torch defaults
-# (b1 = 0.9, b2 = 0.999) on every arm.
+# SEARCHED, per arm, as of this campaign. The two constants below are the
+# boxes; `BETAS` is retained only as the historical anchor.
 #
-# Neither finetune_jax nor finetune_vbll exposes them as flags, so this records
-# a decision that is currently implicit in `optax.adamw(args.lr, ...)` and
-# `torch.optim.AdamW(...)`. The betas are a per-STEP timescale, so whether the
-# default is appropriate is a question about the step count and nothing else --
-# which is why it is settled by FIXED_BATCH_SIZE above rather than by a search.
-# At 512 the run is 3906 steps against b2's 1000-step horizon; at the rungs the
-# first campaign preferred for ce it was 976, and there the default is
-# genuinely wrong. Fixing the batch is what makes fixing the betas safe.
+# The previous reasoning for pinning them was: the betas are a per-STEP
+# timescale, so whether the default is appropriate is a question about the step
+# count and nothing else -- which is settled by FIXED_BATCH_SIZE rather than by
+# a search. That was sound while there was no way to move a beta across step
+# counts. protocol.horizons is that way, so the axis stops being
+# settled-by-construction and becomes searchable-and-transferable.
 #
-# Revisit only if FIXED_BATCH_SIZE rises above 1024 (1953 steps, ~2 horizons)
-# or MAX_SAMPLES falls.
+# It is also what the rule's authors actually do. Mlodozeniec et al. jointly
+# optimise per-module learning rate, weight decay, AdamW b1/b2/eps and
+# initialisation scale at 50M/1.6B and transfer to 1.3B/26B -- 420x compute --
+# for a 27% speed-up. Tuning the betas and scaling them is the VALIDATED path;
+# pinning them was us being more conservative than the source.
+#
+# Per-arm optima are plausible on mechanism rather than merely in principle:
+#
+#   * ibprobit's trunk gradient is computed against a head re-assimilated in
+#     closed form every step, which is a genuinely non-stationary objective and
+#     argues for SHORTER memory (larger H).
+#   * vbll's KL term collapsed toward zero in the last campaign (the
+#     kl_ratio x prior_scale product fell five decades), leaving a loss close
+#     to CE through a SAMPLED head -- estimator noise, which argues for longer
+#     b2 averaging.
+#   * ce has neither.
+#
+# One shared box rather than three, because those are hypotheses about
+# DIRECTION and narrowing per arm before measuring would prejudge them.
 BETAS = (0.9, 0.999)
+
+# The searched coordinate is protocol.horizons(beta, steps) = (1-beta)*steps --
+# averaging windows per run -- NOT beta. Same reason lr is searched as
+# lr/sqrt(B): beta is per-step and therefore incomparable across budgets, while
+# H is exactly what the SDE rule holds invariant. A trial records H; the config
+# carries the beta that H implies at the trial's own step count.
+#
+# Boxes are stated in H and their beta ranges quoted at the tuning budget
+# (MAX_SAMPLES at FIXED_BATCH_SIZE = 1953 steps), because H is the searched
+# thing but beta is the readable one.
+#
+# b2: two decades centred on the reference H = 3.906. At 1953 steps that is
+# b2 in [0.9795, 0.99980] -- wider on both sides than the 0.95-0.9999 range
+# modern practice spans, so the box does not bind.
+BETA2_HORIZONS_BOX = (0.4, 40.0)
+
+# b1: the reference is H = 390.6, and this box is deliberately NOT symmetric
+# about it. At 1953 steps it spans b1 in [0.600, 0.980], and the ceiling is set
+# by protocol.beta_from_horizons' hard limit rather than by taste: H must stay
+# below the step count, and 780 already puts b1 at 0.6. Pushing further would
+# buy range that the FINAL budget can express (10,009 steps) but the tuning
+# budget cannot, which is the wrong way round -- the search has to be able to
+# visit whatever it transfers.
+#
+# This is the axis that sets the floor under MAX_SAMPLES; see the note there.
+BETA1_HORIZONS_BOX = (39.0, 780.0)
 
 # The GPU MICRO_BATCH was measured on. The constants below are valid for this
 # device and nothing else -- a smaller card OOMs on them, a larger one leaves
@@ -443,6 +484,21 @@ def _suggest_per_sqrt_batch(
     return scaled * root
 
 
+def _suggest_betas(trial: Any, steps: int) -> tuple[float, float]:
+    """Draw both AdamW betas in horizon units; return them as betas.
+
+    The trial records `beta1_horizons` / `beta2_horizons`, which transfer; the
+    caller gets the values the scripts' --beta1/--beta2 flags take, which do
+    not. `protocol.transfer` reproduces this exactly -- moving a config to a
+    new step count preserves H by construction -- so a searched beta and a
+    transferred one are the same quantity seen at two budgets.
+    """
+    h1 = trial.suggest_float("beta1_horizons", *BETA1_HORIZONS_BOX, log=True)
+    h2 = trial.suggest_float("beta2_horizons", *BETA2_HORIZONS_BOX, log=True)
+    return (protocol.beta_from_horizons(h1, steps),
+            protocol.beta_from_horizons(h2, steps))
+
+
 def micro_batch(arm: str) -> int:
     """The pinned per-forward batch for `arm`.
 
@@ -478,7 +534,9 @@ def eval_count(max_samples: int = protocol.MAX_SAMPLES) -> int:
     return counts.pop()
 
 
-def _suggest_ibprobit(trial: Any, *, search_eps: bool) -> dict[str, Any]:
+def _suggest_ibprobit(
+    trial: Any, *, search_eps: bool, steps: int
+) -> dict[str, Any]:
     """IBProbit's axes.
 
     NO head learning rate, on either ibprobit arm. `main` initialises the
@@ -512,12 +570,15 @@ def _suggest_ibprobit(trial: Any, *, search_eps: bool) -> dict[str, Any]:
             "num_update_iters", list(IBPROBIT_UPDATE_ITERS)
         ),
     }
+    params["beta1"], params["beta2"] = _suggest_betas(trial, steps)
     if search_eps:
         params["eps_init"] = trial.suggest_float("eps_init", *EPS_INIT_BOX, log=True)
     return params
 
 
-def suggest(trial: Any, arm: str) -> dict[str, Any]:
+def suggest(
+    trial: Any, arm: str, *, max_samples: int = protocol.MAX_SAMPLES
+) -> dict[str, Any]:
     """One TPE-sampled configuration for `arm`.
 
     Axis counts: ce 3, vbll 5, ibprobit 5, ibprobit_noeps 4 -- one lower than
@@ -538,8 +599,14 @@ def suggest(trial: Any, arm: str) -> dict[str, Any]:
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(ARMS)}")
 
+    # The betas are drawn in horizon units and converted at the trial's OWN
+    # step count, so a shortened smoke budget stays self-consistent instead of
+    # inheriting the campaign's betas at a budget they are wrong for.
+    steps = protocol.steps_for_samples(max_samples, FIXED_BATCH_SIZE)
+
     if arm.startswith("ibprobit"):
-        return _suggest_ibprobit(trial, search_eps=(arm == "ibprobit"))
+        return _suggest_ibprobit(
+            trial, search_eps=(arm == "ibprobit"), steps=steps)
 
     params: dict[str, Any] = {
         # See FIXED_BATCH_SIZE, and _suggest_ibprobit on why it is a constant
@@ -564,4 +631,5 @@ def suggest(trial: Any, arm: str) -> dict[str, Any]:
         # wishart_scale is absent by design -- pinned at WISHART_SCALE. Dropped
         # from the SEARCH rather than sampled-and-overridden, so the study's own
         # record of what it searched stays true.
+    params["beta1"], params["beta2"] = _suggest_betas(trial, steps)
     return params

@@ -38,7 +38,7 @@ def _params(arm):
 @pytest.mark.parametrize("arm", fw.SCRIPTS)
 def test_every_arm_carries_the_tuning_protocol(arm):
     config = fw.trial_config(arm, params=_params(arm))
-    assert config["max_samples"] == 2_000_000
+    assert config["max_samples"] == 1_000_000
     assert config["eval_quantum"] == 16_384
     assert config["img_size"] == 224
     assert config["model"] == "dinov3_large"
@@ -48,9 +48,9 @@ def test_every_arm_carries_the_tuning_protocol(arm):
 
 @pytest.mark.parametrize("arm", fw.SCRIPTS)
 def test_tuning_evaluates_val_only_and_dumps_only_the_argmin(arm):
-    # Forwarding the 30k test partition at all 122 evaluations would roughly
-    # double the campaign for a number nothing reads, and 122 trajectory dumps
-    # would be 4.9 GB per run.
+    # Forwarding the 30k test partition at all 61 evaluations would roughly
+    # double the campaign for a number nothing reads, and 61 trajectory dumps
+    # would be 2.4 GB per run.
     config = fw.trial_config(arm, params=_params(arm))
     assert config["eval_splits"] == "val"
     assert config["dump_every_k_evals"] == 0

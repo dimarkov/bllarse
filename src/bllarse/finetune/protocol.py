@@ -20,21 +20,44 @@ import numpy as np
 # 2,000,000 / 1,281,167 = 1.561 epochs, and 2e6 / EVAL_QUANTUM = 122
 # evaluations at every rung of the ladder.
 #
-# This was briefly halved to 1M, when the live JPEG path made a trial ~14 h of
-# training. Pre-decoded shards (bllarse.finetune.shards) removed that: the step
-# measures ~220 img/s on an A100 for dinov3_large, so 2M costs ~2.5 h of
-# training and the budget is affordable again.
+# 1,000,000 / 1,281,167 = 0.781 epochs, and 1e6 / EVAL_QUANTUM = 61
+# evaluations at every rung of the ladder.
 #
-# Restored rather than left at 1M because the shorter budget carried a
-# DIRECTIONAL bias, not just less data: truncating earlier favours configs that
-# move fast -- high trunk learning rates -- which is exactly the catastrophic
-# forgetting direction this campaign exists to characterise. Buying that bias
-# back is worth ~1.5 h a trial.
+# HALVED from 2,000,000, and the objection this reverses is worth stating
+# because it was correct at the time. 2M was chosen over 1M on the grounds that
+# the shorter budget carried a DIRECTIONAL bias rather than merely less data:
+# truncating earlier favours configs that move fast -- high trunk learning
+# rates -- which is exactly the catastrophic-forgetting direction the campaign
+# exists to characterise.
 #
-# `truncated` remains the diagnostic. If it is true almost everywhere then even
-# 2M is binding, ranking is happening on runs that were all still improving,
-# and the budget rather than the search is what limits the result.
-MAX_SAMPLES = 2_000_000
+# That argument assumed there was no way to correct for the budget. There is
+# now. The SDE duration rule says the optimal learning rate at a shorter run is
+# HIGHER, by sqrt(m_D), and `transfer` scales it back down on the way out. The
+# drift toward fast configs is no longer a bias to be avoided by spending more
+# compute; it is the rule's prediction, and it is corrected rather than dodged.
+#
+# What that buys is the beta axes. The betas were previously unsearchable --
+# they are a per-step timescale, so pinning the batch was the only thing that
+# made the defaults defensible -- and `horizons` makes them transferable, hence
+# searchable. Two more axes need more trials, and halving the budget pays for
+# them.
+#
+# 1M is a FLOOR, not a midpoint, and two independent constraints put it here:
+#
+#   * beta_from_horizons requires H < steps. At 1953 steps the reference
+#     H1 = 390.6 can still be explored ~2.5x upward before beta1 falls below
+#     0.5; at 500k (976 steps) that headroom collapses to 1.25x, in the one
+#     direction a non-stationary objective would want.
+#   * The pruner and the patience clock are calibrated in EVALUATIONS. 1M
+#     gives 61, so a 10-evaluation warmup and 20-evaluation patience still
+#     leave room to fire (earliest stop at 21 of 61). 500k gives 30, where a
+#     20-evaluation patience is barely functional.
+#
+# `truncated` remains the diagnostic, and matters MORE at this budget, not
+# less. If it is true almost everywhere then ranking is happening on runs that
+# were all still improving -- and the transfer rule maps optima, not rankings,
+# so it does not rescue a comparison made before the curves separated.
+MAX_SAMPLES = 1_000_000
 
 # Samples between consecutive val_nll evaluations, for every trial.
 #
@@ -212,10 +235,66 @@ REFERENCE_BATCH = 512
 # `betas_for` is what keeps that true anywhere else.
 REFERENCE_BETAS = (0.9, 0.999)
 
+# The step count REFERENCE_BETAS is anchored at: the ft_*_fixb512 campaign's
+# operating point, 2,000,000 samples at batch 512.
+#
+# A literal, NOT steps_for_samples(MAX_SAMPLES, REFERENCE_BATCH), which is what
+# it used to be. That derivation was a trap: MAX_SAMPLES is the current tuning
+# budget and moves when the campaign is re-costed, and re-deriving the anchor
+# from it would silently redefine what "the reference betas" means -- declaring
+# (0.9, 0.999) correct at whatever the new budget happens to be. The anchor is
+# a fact about a campaign that has already run, so it is frozen as one.
+REFERENCE_STEPS = 3906
+
 
 def reference_steps() -> int:
-    """Optimizer steps the reference betas were chosen for: 3906."""
-    return steps_for_samples(MAX_SAMPLES, REFERENCE_BATCH)
+    """Optimizer steps the reference betas are anchored at: 3906."""
+    return REFERENCE_STEPS
+
+
+def horizons(beta: float, steps: int) -> float:
+    """`(1 - beta) * steps`: averaging windows per run. THE searched coordinate.
+
+    beta is a per-step quantity and therefore not comparable across budgets;
+    this is its transfer-invariant form, the same role `lr / sqrt(batch)` plays
+    on the learning rate. A run of `steps` at `beta` averages over
+    1/(1-beta) steps, so H counts how many such windows fit in the run --
+    dimensionless, and unchanged by the SDE transfer rule, which scales
+    (1 - beta) by exactly the inverse of the change in step count.
+
+    At the reference: H = 390.6 for beta1, 3.906 for beta2.
+    """
+    if not 0.0 <= beta < 1.0:
+        raise ValueError(f"beta must be in [0, 1), got {beta}")
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1, got {steps}")
+    return (1.0 - beta) * steps
+
+
+def beta_from_horizons(h: float, steps: int) -> float:
+    """Invert `horizons`: the beta giving `h` averaging windows in `steps`.
+
+    Raises when H >= steps. That is not an edge case to round away, it is the
+    hard limit on what a short run can express: beta >= 0 requires the
+    averaging window to be at least one step, so a budget of N steps cannot
+    represent more than N windows. The bound is asymmetric in the direction
+    that matters -- LONGER memory (small H) is free at any budget, SHORTER
+    memory is what a short tuning run cannot reach, and shorter memory is what
+    a non-stationary objective like IBProbit's re-assimilated head would want.
+    """
+    if h <= 0.0:
+        raise ValueError(f"horizons must be > 0, got {h}")
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1, got {steps}")
+    if h >= steps:
+        raise ValueError(
+            f"{h:.4g} averaging windows do not fit in a {steps}-step run: "
+            f"beta would be {1.0 - h / steps:.4g}, not in [0, 1). A budget of "
+            f"N steps cannot express more than N windows -- see "
+            f"beta_from_horizons on why this bound is the real constraint on "
+            f"shortening the tuning budget."
+        )
+    return 1.0 - h / steps
 
 
 def betas_for(

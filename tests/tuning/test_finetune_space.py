@@ -19,13 +19,20 @@ from bllarse.tuning import finetune_space as fs
 SEARCHED = {
     "lr": "lr" + fs.PER_SQRT_BATCH_SUFFIX,
     "weight_decay": "weight_decay" + fs.PER_SQRT_BATCH_SUFFIX,
+    # Betas are searched in HORIZON units -- (1-beta)*steps -- for the same
+    # reason: beta is per-step and therefore incomparable across budgets.
+    "beta1": "beta1_horizons",
+    "beta2": "beta2_horizons",
 }
+# The subset whose rename also carries a sqrt(batch) rescaling. The beta axes
+# are renamed but not rescaled by the batch, so they must not go through it.
+PER_SQRT_BATCH = ("lr", "weight_decay")
 
 
 def searched_box(trial, name, batch=None):
     """`trial`'s recorded axis for `name`, in the box's own absolute units."""
     kind, low, high, log = trial.axes[SEARCHED.get(name, name)]
-    if name in SEARCHED:
+    if name in PER_SQRT_BATCH:
         root = math.sqrt(fs.FIXED_BATCH_SIZE if batch is None else batch)
         low, high = low * root, high * root
     return kind, low, high, log
@@ -61,10 +68,10 @@ def test_every_rung_divides_the_eval_quantum():
 
 
 def test_every_rung_gets_the_same_number_of_evaluations():
-    # 2,000,000 / 16,384. THE property the sample-spaced grid exists for: eval
+    # 1,000,000 / 16,384. THE property the sample-spaced grid exists for: eval
     # index i means i * 16,384 samples on every rung, so MedianPruner compares
     # trials at matching amounts of data rather than matching steps.
-    assert fs.eval_count() == 122
+    assert fs.eval_count() == 61
 
 
 def test_the_ladder_is_powers_of_two():
@@ -150,12 +157,13 @@ def test_both_ibprobit_arms_share_one_micro_batch(monkeypatch):
 
 
 @pytest.mark.parametrize("arm,expected", [
-    ("ce", {"lr", "weight_decay", "head_lr_ratio"}),
+    ("ce", {"lr", "weight_decay", "head_lr_ratio", "beta1", "beta2"}),
     ("vbll", {"lr", "weight_decay", "head_lr_ratio", "kl_ratio",
-              "prior_scale"}),
+              "prior_scale", "beta1", "beta2"}),
     ("ibprobit", {"lr", "weight_decay", "q_init", "num_update_iters",
-                  "eps_init"}),
-    ("ibprobit_noeps", {"lr", "weight_decay", "q_init", "num_update_iters"}),
+                  "eps_init", "beta1", "beta2"}),
+    ("ibprobit_noeps", {"lr", "weight_decay", "q_init", "num_update_iters",
+                        "beta1", "beta2"}),
 ])
 def test_each_arm_searches_exactly_its_own_axes(arm, expected):
     trial = RecordingTrial()
@@ -198,17 +206,31 @@ def test_the_pinned_batch_divides_by_every_arms_micro_batch(arm):
     assert fs.FIXED_BATCH_SIZE % fs.micro_batch(arm) == 0
 
 
-def test_the_pinned_batch_leaves_the_default_betas_in_their_regime():
-    """Why fixing the batch is what makes fixing the betas safe.
+def test_the_betas_are_searched_rather_than_left_at_the_defaults():
+    """The reasoning that used to live here is obsolete, deliberately.
 
-    b2 = 0.999 averages over 1/(1-b2) = 1000 steps. At 2M samples the run is
-    MAX_SAMPLES / batch steps, so the first campaign's ce optimum of 2048 gave
-    976 -- less than one horizon, i.e. the second moment never left bias
-    correction. This asserts the chosen rung clears the horizon severalfold.
+    This test previously asserted that the pinned batch left b2 = 0.999 in a
+    regime where its 1000-step horizon fits several times into the run -- the
+    argument for pinning the betas at all. That argument held only while there
+    was no way to move a beta across step counts. protocol.horizons is that
+    way, so the axis became searchable and the pin was removed.
+
+    What replaces it is the property that made the removal safe: the searched
+    coordinate is the transfer-invariant one, so a drawn beta means the same
+    thing at the tuning budget and at the final one.
     """
-    steps = protocol.MAX_SAMPLES / fs.FIXED_BATCH_SIZE
-    horizon = 1.0 / (1.0 - fs.BETAS[1])
-    assert steps / horizon >= 3.0
+    trial = RecordingTrial()
+    params = fs.suggest(trial, "ce")
+    assert "beta1_horizons" in trial.axes and "beta2_horizons" in trial.axes
+    assert "beta1" not in trial.axes and "beta2" not in trial.axes
+    steps = protocol.steps_for_samples(protocol.MAX_SAMPLES, fs.FIXED_BATCH_SIZE)
+    for name, box in (("beta1", fs.BETA1_HORIZONS_BOX),
+                      ("beta2", fs.BETA2_HORIZONS_BOX)):
+        # RecordingTrial returns the low end, so the drawn beta is the one the
+        # box floor implies -- and inverting it recovers the floor exactly.
+        assert params[name] == pytest.approx(
+            protocol.beta_from_horizons(box[0], steps))
+        assert protocol.horizons(params[name], steps) == pytest.approx(box[0])
 
 
 def test_neither_ibprobit_arm_gets_a_head_learning_rate():
@@ -374,7 +396,7 @@ def test_the_top_rung_evaluates_after_every_optimizer_step():
     # TPE is allowed to explore rather than have prejudged for it (design D5:
     # batch tolerance is a method property).
     assert protocol.eval_every_steps(16_384) == 1
-    assert protocol.steps_for_samples(protocol.MAX_SAMPLES, 16_384) == 122
+    assert protocol.steps_for_samples(protocol.MAX_SAMPLES, 16_384) == 61
 
 
 def test_the_pinned_micro_batch_divides_the_new_top_rungs(monkeypatch):
@@ -453,18 +475,20 @@ def test_the_coordinate_scales_the_absolute_rate_with_the_batch():
     assert tilde * math.sqrt(2048) == pytest.approx(1e-6 * 2.0)
 
 
-def test_the_tuning_budget_is_the_beta_reference_point():
-    """Why the campaign can leave AdamW's betas at the library defaults.
+def test_the_beta_anchor_does_not_move_with_the_tuning_budget():
+    """REFERENCE_STEPS is a literal, and this is why.
 
-    The betas are a per-STEP timescale, so (0.9, 0.999) is not a neutral choice
-    -- it is the correct one at 3906 steps and wrong elsewhere. The campaign
-    passes no --beta1/--beta2 because MAX_SAMPLES at FIXED_BATCH_SIZE lands
-    exactly on the reference. Move either constant and this fails, which is the
-    signal that finetune_worker.trial_config has to start emitting them.
+    It used to be derived as steps_for_samples(MAX_SAMPLES, REFERENCE_BATCH).
+    Halving the tuning budget would then have silently redefined "the reference
+    betas" to mean (0.9, 0.999) at 1953 steps instead of 3906 -- a different H
+    on both axes, and every transfer anchored to it would have moved with no
+    diff to show for it. The anchor is a fact about a campaign that already
+    ran, so it is frozen as one.
     """
-    steps = protocol.steps_for_samples(protocol.MAX_SAMPLES, fs.FIXED_BATCH_SIZE)
-    assert steps == protocol.reference_steps() == 3906
-    assert protocol.betas_for(steps) == protocol.REFERENCE_BETAS
+    assert protocol.REFERENCE_STEPS == protocol.reference_steps() == 3906
+    assert protocol.steps_for_samples(
+        protocol.MAX_SAMPLES, fs.FIXED_BATCH_SIZE) == 1953
+    assert protocol.betas_for(3906) == protocol.REFERENCE_BETAS
 
 
 def test_the_top_rungs_cannot_carry_a_transferred_beta():
@@ -477,10 +501,12 @@ def test_the_top_rungs_cannot_carry_a_transferred_beta():
     reason -- independent of the low-fidelity bias in FIXED_BATCH_SIZE -- that
     the top of the ladder is not simply a bigger version of the bottom.
     """
-    for rung in (8192, 16384):
+    # At 1M the budget is halved, so the breakdown reaches further down the
+    # ladder than it did at 2M -- 4096 is now inside it too.
+    for rung in (4096, 8192, 16384):
         steps = protocol.steps_for_samples(protocol.MAX_SAMPLES, rung)
         with pytest.raises(ValueError, match="beta1 transfers out of range"):
             protocol.betas_for(steps)
-    # ... while every rung the campaign can actually reach is fine.
-    for rung in (256, 512, 1024, 2048, 4096):
+    # ... while the pinned rung and everything below it is fine.
+    for rung in (256, 512, 1024, 2048):
         protocol.betas_for(protocol.steps_for_samples(protocol.MAX_SAMPLES, rung))

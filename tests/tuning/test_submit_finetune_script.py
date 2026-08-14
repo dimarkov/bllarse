@@ -86,7 +86,7 @@ def test_it_names_a_campaign_so_a_rerun_cannot_resume_the_old_study():
     # optuna's quiet failure rather than its loud one: the study loads, TPE
     # keeps modelling `lr` from trials that carry it, and every new trial looks
     # like it simply never set the axis.
-    assert campaign not in ("shards2m", "fixb512")
+    assert campaign not in ("shards2m", "fixb512", "sdelr512")
 
 
 def test_the_campaign_name_is_bumped_whenever_the_searched_names_change():
@@ -100,8 +100,9 @@ def test_the_campaign_name_is_bumped_whenever_the_searched_names_change():
     searched = set()
     for arm in fs.ARMS:
         searched |= set(_recorded_axes(arm))
-    assert {"lr_per_sqrt_batch", "weight_decay_per_sqrt_batch"} <= searched
-    assert _default("BLLARSE_FT_CAMPAIGN") == "sdelr512"
+    assert {"lr_per_sqrt_batch", "weight_decay_per_sqrt_batch",
+            "beta1_horizons", "beta2_horizons"} <= searched
+    assert _default("BLLARSE_FT_CAMPAIGN") == "betas1m"
 
 
 def test_the_default_arms_are_a_subset_of_the_search_space():
