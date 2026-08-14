@@ -59,13 +59,22 @@ set -euo pipefail
 : "${BLLARSE_FT_TARGET_COMPLETE:=60}"
 
 # The per-worker CAP, sized to fill a 24 h job rather than to express a depth.
-# Measured on the first campaign: ~85% of trials are pruned, a pruned trial
-# costs ~0.4 h (it dies a few evaluations past the pruner's 10-evaluation
-# warmup, and the compilation cache absorbs the ~19 min graph build), and a
-# completed one ~2.8 h at this batch. That averages ~0.8 h, so a 24 h worker
-# fits about 30. The previous campaign's 10 left workers exiting at ~9 h with
-# the allocation still open.
-: "${BLLARSE_FT_TRIALS:=30}"
+#
+# Re-derived for the halved budget. At protocol.MAX_SAMPLES = 1,000,000 a
+# completed trial costs ~1.4 h and a pruned one ~0.2 h (it dies a few
+# evaluations past the pruner's 10-evaluation warmup, and the compilation cache
+# absorbs the ~19 min graph build). At the measured ~85% prune rate that
+# averages ~0.38 h, so a 24 h worker fits about 60. The previous value of 30
+# was correct at 2M and is exactly half of what this budget supports.
+#
+# The cap has to clear the TARGET, not merely fill the wall. fixb512 measured
+# 16-25% of trials completing, so 90 completions needs ~360-560 trials per arm
+# against WORKERS x TRIALS = 960 here. At 30 it would have been 480 -- under
+# the requirement for two of the three arms, which is precisely how fixb512
+# exhausted its arrays at 53/55/32 against a target of 60. Overshoot is free:
+# the worker's --target-complete pre-flight exits without claiming a GPU once
+# the study is at depth.
+: "${BLLARSE_FT_TRIALS:=60}"
 : "${BLLARSE_FT_WORKERS:=16}"
 
 # 6 per arm, 18 GPUs across the three. At ~85% pruning, 60 completions needs
