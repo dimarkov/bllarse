@@ -5,10 +5,30 @@ hours into its first trial, or -- worse -- never reveal at all, by quietly
 searching a different space than the one recorded.
 """
 
+import math
+
 import pytest
 
 from bllarse.finetune import protocol
 from bllarse.tuning import finetune_space as fs
+
+# lr and weight decay are SEARCHED in batch-invariant units and RETURNED in
+# absolute ones, so a test asserting on the space has to know both names. The
+# boxes stay written in absolute units; `searched_box` converts back so every
+# assertion below still reads against the constant it is about.
+SEARCHED = {
+    "lr": "lr" + fs.PER_SQRT_BATCH_SUFFIX,
+    "weight_decay": "weight_decay" + fs.PER_SQRT_BATCH_SUFFIX,
+}
+
+
+def searched_box(trial, name, batch=None):
+    """`trial`'s recorded axis for `name`, in the box's own absolute units."""
+    kind, low, high, log = trial.axes[SEARCHED.get(name, name)]
+    if name in SEARCHED:
+        root = math.sqrt(fs.FIXED_BATCH_SIZE if batch is None else batch)
+        low, high = low * root, high * root
+    return kind, low, high, log
 
 
 class RecordingTrial:
@@ -140,7 +160,9 @@ def test_both_ibprobit_arms_share_one_micro_batch(monkeypatch):
 def test_each_arm_searches_exactly_its_own_axes(arm, expected):
     trial = RecordingTrial()
     params = fs.suggest(trial, arm)
-    assert set(trial.axes) == expected
+    # `expected` names the RETURNED keys, which are the training scripts'
+    # flags. Two of them are searched under a different name -- see SEARCHED.
+    assert set(trial.axes) == {SEARCHED.get(name, name) for name in expected}
     # batch_size is emitted but not SEARCHED, so params carries exactly one
     # key the axes do not.
     assert set(params) == expected | {"batch_size"}
@@ -261,7 +283,7 @@ def test_learning_rate_is_searched_as_trunk_rate_and_ratio():
     # trials sliding along that diagonal.
     trial = RecordingTrial()
     fs.suggest(trial, "ce")
-    assert trial.axes["lr"] == ("float", *fs.TRUNK_LR_BOX, True)
+    assert searched_box(trial, "lr") == ("float", *fs.TRUNK_LR_BOX, True)
     assert trial.axes["head_lr_ratio"] == ("float", *fs.HEAD_LR_RATIO_BOX, True)
     assert "head_lr" not in trial.axes
 
@@ -310,7 +332,7 @@ def test_ibprobit_caps_the_trunk_rate_half_a_decade_below_the_others(arm):
     """
     trial = RecordingTrial()
     fs.suggest(trial, arm)
-    _kind, low, high, log = trial.axes["lr"]
+    _kind, low, high, log = searched_box(trial, "lr")
     assert (low, high, log) == (*fs.IBPROBIT_TRUNK_LR_BOX, True)
 
 
@@ -320,7 +342,7 @@ def test_the_optimiser_driven_arms_keep_the_full_trunk_range(arm):
     # unevenly -- so it must NOT leak onto the arms that do not need it.
     trial = RecordingTrial()
     fs.suggest(trial, arm)
-    _kind, low, high, log = trial.axes["lr"]
+    _kind, low, high, log = searched_box(trial, "lr")
     assert (low, high, log) == (*fs.TRUNK_LR_BOX, True)
 
 
@@ -360,3 +382,105 @@ def test_the_pinned_micro_batch_divides_the_new_top_rungs(monkeypatch):
     for rung in (8192, 16384):
         assert rung % fs.micro_batch("ce") == 0
         protocol.accum_plan(rung, fs.micro_batch("ce"))
+
+
+# --- The batch-invariant search coordinate -----------------------------------
+
+
+def test_the_reference_batch_matches_the_pinned_one():
+    """protocol duplicates 512 rather than importing it -- finetune_space
+    imports protocol, so the dependency cannot run the other way. This is the
+    check that keeps the duplicate honest: if they diverge, every transferred
+    config is scaled from a batch the campaign never ran at."""
+    assert protocol.REFERENCE_BATCH == fs.FIXED_BATCH_SIZE == 512
+
+
+@pytest.mark.parametrize("arm", fs.ARMS)
+def test_lr_and_weight_decay_are_searched_in_batch_invariant_units(arm):
+    # The SEARCHED name carries the suffix; the RETURNED key is the flag the
+    # training scripts take. Anything reading a study's params has to know it.
+    trial = RecordingTrial()
+    params = fs.suggest(trial, arm)
+    for name in ("lr", "weight_decay"):
+        assert SEARCHED[name] in trial.axes
+        assert name not in trial.axes
+        assert name in params
+
+
+@pytest.mark.parametrize("arm", fs.ARMS)
+def test_the_returned_value_is_absolute_not_the_searched_coordinate(arm):
+    # RecordingTrial returns the low end, so the returned lr must be the box's
+    # floor -- not the floor divided by sqrt(512), which is what would ship if
+    # the multiply-back were dropped.
+    trial = RecordingTrial()
+    params = fs.suggest(trial, arm)
+    box = fs.IBPROBIT_TRUNK_LR_BOX if arm.startswith("ibprobit") else fs.TRUNK_LR_BOX
+    assert params["lr"] == pytest.approx(box[0])
+
+
+def test_at_the_pinned_batch_the_reparameterisation_is_an_exact_relabelling():
+    """Which is the point: it changes the recorded coordinate, not the search.
+
+    FIXED_BATCH_SIZE equals protocol.REFERENCE_BATCH, so the interval TPE draws
+    from is the old one divided by a constant -- the same log-uniform measure.
+    What it buys is a study whose params can be read at any batch, and the
+    precondition for un-pinning the batch at all.
+    """
+    trial = RecordingTrial()
+    fs.suggest(trial, "ce")
+    _kind, low, high, log = searched_box(trial, "lr")
+    assert (low, high, log) == (*fs.TRUNK_LR_BOX, True)
+    raw = trial.axes[SEARCHED["lr"]]
+    assert raw[1] == pytest.approx(fs.TRUNK_LR_BOX[0] / math.sqrt(512))
+
+
+def test_the_coordinate_scales_the_absolute_rate_with_the_batch():
+    """The invariance the rule actually asserts: one tilde, sqrt(B) absolute.
+
+    A fixed searched value must map to a 2x larger learning rate at 4x the
+    batch. This is what makes the axis transferable, and it is checked through
+    the helper rather than by arithmetic so a change to the exponent fails.
+    """
+    at_512 = fs._suggest_per_sqrt_batch(RecordingTrial(), "lr", (1e-6, 1e-3), 512)
+    at_2048 = fs._suggest_per_sqrt_batch(RecordingTrial(), "lr", (1e-6, 1e-3), 2048)
+    # Same box floor in absolute units either way -- the box IS absolute.
+    assert at_512 == pytest.approx(1e-6)
+    assert at_2048 == pytest.approx(1e-6)
+    # ... and a fixed SEARCHED value maps to sqrt(4) = 2x the rate.
+    trial_512 = RecordingTrial()
+    fs._suggest_per_sqrt_batch(trial_512, "lr", (1e-6, 1e-3), 512)
+    tilde = trial_512.axes[SEARCHED["lr"]][1]
+    assert tilde * math.sqrt(2048) == pytest.approx(1e-6 * 2.0)
+
+
+def test_the_tuning_budget_is_the_beta_reference_point():
+    """Why the campaign can leave AdamW's betas at the library defaults.
+
+    The betas are a per-STEP timescale, so (0.9, 0.999) is not a neutral choice
+    -- it is the correct one at 3906 steps and wrong elsewhere. The campaign
+    passes no --beta1/--beta2 because MAX_SAMPLES at FIXED_BATCH_SIZE lands
+    exactly on the reference. Move either constant and this fails, which is the
+    signal that finetune_worker.trial_config has to start emitting them.
+    """
+    steps = protocol.steps_for_samples(protocol.MAX_SAMPLES, fs.FIXED_BATCH_SIZE)
+    assert steps == protocol.reference_steps() == 3906
+    assert protocol.betas_for(steps) == protocol.REFERENCE_BETAS
+
+
+def test_the_top_rungs_cannot_carry_a_transferred_beta():
+    """A property of those rungs, recorded rather than worked around.
+
+    At batch 16,384 the 2M budget is 122 optimizer steps, so beta1's 10-step
+    averaging horizon is 8% of the whole run against 0.26% at the pinned rung.
+    Holding the fraction would need beta1 < 0. This is the breakdown the SDE
+    rule's own authors predict at coarse discretisation, and it is a further
+    reason -- independent of the low-fidelity bias in FIXED_BATCH_SIZE -- that
+    the top of the ladder is not simply a bigger version of the bottom.
+    """
+    for rung in (8192, 16384):
+        steps = protocol.steps_for_samples(protocol.MAX_SAMPLES, rung)
+        with pytest.raises(ValueError, match="beta1 transfers out of range"):
+            protocol.betas_for(steps)
+    # ... while every rung the campaign can actually reach is fine.
+    for rung in (256, 512, 1024, 2048, 4096):
+        protocol.betas_for(protocol.steps_for_samples(protocol.MAX_SAMPLES, rung))

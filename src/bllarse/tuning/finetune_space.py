@@ -11,6 +11,7 @@ experiment's optima is evidence; pinning a value to one of them is not, unless
 the optima agreed across datasets. Exactly one did.
 """
 
+import math
 from typing import Any
 
 from bllarse.finetune import protocol
@@ -384,6 +385,64 @@ MIN_HEAD_LR_RATIO = 5.0
 HEAD_LR_RATIO_BOX = (MIN_HEAD_LR_RATIO, 1e4)
 
 
+# The SEARCHED coordinate for lr and weight decay is the batch-invariant one:
+# lr / sqrt(B), not lr. Same for weight decay, which takes the same exponent
+# under the PyTorch AdamW convention (protocol.transfer documents why).
+#
+# The boxes above stay in ABSOLUTE units at protocol.REFERENCE_BATCH, and the
+# division happens here. That is deliberate: every box comment cites measured
+# optima in absolute lr, and rewriting them into lr/sqrt(B) units would make
+# the evidence unreadable while changing nothing about the search.
+#
+# At FIXED_BATCH_SIZE == protocol.REFERENCE_BATCH == 512 this is an EXACT
+# relabelling -- the same log-uniform draw over the same interval, under a
+# different parameter name. It buys two things anyway:
+#
+#   * The study records the transferable quantity. A finished trial can be
+#     read at any batch without knowing which one it ran at.
+#   * It is the precondition for un-pinning FIXED_BATCH_SIZE. The reason the
+#     batch is pinned is the low-fidelity bias documented there: at the
+#     pruner's warmup evaluation the median val_nll is monotone in batch,
+#     because a smaller batch takes more optimizer steps per sample and leads
+#     early. Under this coordinate that bias should not exist -- batch kappa*B
+#     takes kappa fewer steps at sqrt(kappa) larger lr, and the trajectory in
+#     normalised time is invariant -- so the pruner would be comparing
+#     batch-equivalent configs.
+#
+# That second claim is NOT yet established and the batch stays pinned until it
+# is. The test costs no GPU time: the first campaign (ft_*_shards2m) searched
+# the whole ladder and recorded lr, batch and every evaluation, so the question
+# "does the eval-10 median flatten in batch once conditioned on lr/sqrt(B)?" is
+# a re-analysis of journals that already exist. Note that our own first
+# campaign is not obviously consistent with the rule: within ce the best
+# observed lr ran 9.1e-6 at 1024, 3.1e-5 at 2048 and 8.7e-5 at 4096, i.e. ~3x
+# per doubling against the predicted sqrt(2) = 1.41x. That is one noisy draw
+# per rung out of a heavily pruned search rather than a refutation, but it is
+# the number the re-analysis has to explain before the pin comes off.
+#
+# Changing a parameter's NAME changes the search space, so this needs a new
+# BLLARSE_FT_CAMPAIGN. Optuna's failure here is the quiet one: `load_if_exists`
+# on the old study would leave TPE modelling `lr` from prior trials while the
+# objective samples `lr_per_sqrt_batch`, and every old trial would look like it
+# simply never set the new axis.
+PER_SQRT_BATCH_SUFFIX = "_per_sqrt_batch"
+
+
+def _suggest_per_sqrt_batch(
+    trial: Any, name: str, box: tuple[float, float], batch: int
+) -> float:
+    """Suggest `name` in batch-invariant units; return the absolute value.
+
+    The trial records `<name>_per_sqrt_batch`; the caller gets the quantity the
+    training script's flag actually takes.
+    """
+    root = math.sqrt(batch)
+    scaled = trial.suggest_float(
+        f"{name}{PER_SQRT_BATCH_SUFFIX}", box[0] / root, box[1] / root, log=True
+    )
+    return scaled * root
+
+
 def micro_batch(arm: str) -> int:
     """The pinned per-forward batch for `arm`.
 
@@ -440,12 +499,14 @@ def _suggest_ibprobit(trial: Any, *, search_eps: bool) -> dict[str, Any]:
         # IBPROBIT_TRUNK_LR_BOX, not TRUNK_LR_BOX: the closed-form head refits
         # from features the trunk has already moved past once the trunk is fast
         # enough. See the constant.
-        "lr": trial.suggest_float("lr", *IBPROBIT_TRUNK_LR_BOX, log=True),
+        "lr": _suggest_per_sqrt_batch(
+            trial, "lr", IBPROBIT_TRUNK_LR_BOX, FIXED_BATCH_SIZE),
         # Both ibprobit arms keep the wide shared box: wd measured FLAT on this
         # head (rho +0.17 and +0.03, best-of-decade spread 0.004 with no
         # ordering). "Does not matter" is a result here, so it is left free to
         # be re-measured rather than narrowed on noise.
-        "weight_decay": trial.suggest_float("weight_decay", *TRUNK_WD_BOX, log=True),
+        "weight_decay": _suggest_per_sqrt_batch(
+            trial, "weight_decay", TRUNK_WD_BOX, FIXED_BATCH_SIZE),
         "q_init": trial.suggest_float("q_init", *Q_INIT_BOX, log=True),
         "num_update_iters": trial.suggest_categorical(
             "num_update_iters", list(IBPROBIT_UPDATE_ITERS)
@@ -462,6 +523,13 @@ def suggest(trial: Any, arm: str) -> dict[str, Any]:
     Axis counts: ce 3, vbll 5, ibprobit 5, ibprobit_noeps 4 -- one lower than
     the first campaign on every arm, since batch_size is now pinned.
 
+    The RETURNED keys are what the training scripts' flags take (`lr`,
+    `weight_decay`, ...). The SEARCHED names differ for two of them: lr and
+    weight decay are drawn as `lr_per_sqrt_batch` and
+    `weight_decay_per_sqrt_batch`, the batch-invariant coordinates. See
+    `_suggest_per_sqrt_batch`. Anything reading a finished study's params has
+    to go through that rename.
+
     `cov_rank` and `parameterization` are NOT searched, following space.py's
     existing rule: rank buys calibration with memory, and neither CE nor
     IBProbit has an equivalent knob -- letting TPE spend it would let VBLL win
@@ -477,12 +545,13 @@ def suggest(trial: Any, arm: str) -> dict[str, Any]:
         # See FIXED_BATCH_SIZE, and _suggest_ibprobit on why it is a constant
         # rather than a one-element categorical.
         "batch_size": FIXED_BATCH_SIZE,
-        "lr": trial.suggest_float("lr", *TRUNK_LR_BOX, log=True),
+        "lr": _suggest_per_sqrt_batch(
+            trial, "lr", TRUNK_LR_BOX, FIXED_BATCH_SIZE),
         # Per arm: ce presses the floor, vbll has an interior optimum. See
         # CE_WD_BOX / VBLL_WD_BOX.
-        "weight_decay": trial.suggest_float(
-            "weight_decay", *(VBLL_WD_BOX if arm == "vbll" else CE_WD_BOX), log=True
-        ),
+        "weight_decay": _suggest_per_sqrt_batch(
+            trial, "weight_decay",
+            VBLL_WD_BOX if arm == "vbll" else CE_WD_BOX, FIXED_BATCH_SIZE),
         "head_lr_ratio": trial.suggest_float(
             "head_lr_ratio", *HEAD_LR_RATIO_BOX, log=True
         ),

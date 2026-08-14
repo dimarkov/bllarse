@@ -233,6 +233,18 @@ def trial_config(
         "bf16": bf16,
         **params,
     }
+    # NO betas here, deliberately -- the tuning campaign runs at the library
+    # defaults, and at its operating point (MAX_SAMPLES, FIXED_BATCH_SIZE)
+    # those ARE the rule's answer. `test_the_tuning_budget_is_the_beta
+    # _reference_point` is what keeps that true: move either constant and it
+    # fails, which is the signal to start passing --beta1/--beta2 here.
+    #
+    # Deriving them at every rung was tried and reverted. protocol.betas_for
+    # rightly refuses the top of the ladder -- at batch 16,384 the whole budget
+    # is 122 optimizer steps and beta1's 10-step horizon cannot be held as a
+    # fraction of it, which is the breakdown the SDE rule's own authors predict
+    # at coarse discretisation. But that is a fact about those rungs, not a
+    # reason trial_config should be unable to build a config for them.
     if dump_root is not None:
         config["dump_root"] = str(dump_root)
     if train_shards:

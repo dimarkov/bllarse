@@ -240,6 +240,23 @@ def build_argparser() -> argparse.ArgumentParser:
         "--weight-decay", type=float, default=1e-4,
         help="Trunk weight decay. Head weight decay is pinned to 0 on every arm.",
     )
+    # Exposed rather than left at optax's defaults because they are a per-STEP
+    # timescale, and this script is run at two different step counts: ~3906 for
+    # a tuning trial and ~10,009 for a 4-epoch final run. Holding
+    # (1 - beta) * steps invariant is what makes those two comparable -- see
+    # protocol.betas_for, which is what computes the value to pass here.
+    #
+    # The defaults ARE optax's, so an invocation that omits them is unchanged.
+    p.add_argument(
+        "--beta1", type=float, default=protocol.REFERENCE_BETAS[0],
+        help="AdamW beta1. Transfers with the run length; see "
+             "protocol.betas_for.",
+    )
+    p.add_argument(
+        "--beta2", type=float, default=protocol.REFERENCE_BETAS[1],
+        help="AdamW beta2. Transfers with the run length; see "
+             "protocol.betas_for.",
+    )
     p.add_argument("--label-smooth", type=float, default=0.0)
     p.add_argument("--num-update-iters", type=int, default=128,
                    help="CAVI iterations per macro batch (IBProbit arm).")
@@ -575,11 +592,18 @@ def main(args, on_dump=None) -> None:
         )
         optimizer = optax.multi_transform(
             {
-                "backbone": optax.adamw(args.lr, weight_decay=args.weight_decay),
+                "backbone": optax.adamw(
+                    args.lr, b1=args.beta1, b2=args.beta2,
+                    weight_decay=args.weight_decay),
                 # Head weight decay is 0 on every arm (design D6): VBLL's KL is
                 # its head regulariser and IBProbit runs no optimizer on the
                 # head at all, so a nonzero value here would be an asymmetry.
-                "head": optax.adamw(head_lr, weight_decay=0.0),
+                #
+                # The betas are NOT similarly split: they set the optimizer's
+                # averaging horizon in steps, and both groups take the same
+                # number of steps.
+                "head": optax.adamw(
+                    head_lr, b1=args.beta1, b2=args.beta2, weight_decay=0.0),
             },
             param_labels,
         )
@@ -598,7 +622,9 @@ def main(args, on_dump=None) -> None:
             warmup=args.warmup, eps_init=args.eps_init, rho=eps_rho,
         )
         head = None
-        optimizer = optax.adamw(args.lr, weight_decay=args.weight_decay)
+        optimizer = optax.adamw(
+            args.lr, b1=args.beta1, b2=args.beta2,
+            weight_decay=args.weight_decay)
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
 
     shard = None

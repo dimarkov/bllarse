@@ -26,6 +26,27 @@ def _default(name: str) -> str:
     return body[len(name) + 2:body.index("}")]
 
 
+class _Recorder:
+    """Minimal optuna Trial stand-in: records the names actually suggested."""
+
+    def __init__(self):
+        self.names: list[str] = []
+
+    def suggest_float(self, name, low, high, log=False):
+        self.names.append(name)
+        return low
+
+    def suggest_categorical(self, name, choices):
+        self.names.append(name)
+        return choices[0]
+
+
+def _recorded_axes(arm: str) -> list[str]:
+    trial = _Recorder()
+    fs.suggest(trial, arm)
+    return trial.names
+
+
 def test_it_is_executable():
     assert os.access(SCRIPT, os.X_OK)
 
@@ -58,7 +79,29 @@ def test_it_names_a_campaign_so_a_rerun_cannot_resume_the_old_study():
     assert campaign != ""
     # The DEFAULT, not the file: the header cites ft_*_shards2m by name as the
     # campaign whose findings set these boxes, and should keep doing so.
-    assert campaign != "shards2m"
+    #
+    # fixb512 joins it for the same reason one step later. lr and weight decay
+    # are now searched as `lr_per_sqrt_batch` and `weight_decay_per_sqrt_batch`
+    # -- the batch-invariant coordinates -- and a RENAMED float axis is
+    # optuna's quiet failure rather than its loud one: the study loads, TPE
+    # keeps modelling `lr` from trials that carry it, and every new trial looks
+    # like it simply never set the axis.
+    assert campaign not in ("shards2m", "fixb512")
+
+
+def test_the_campaign_name_is_bumped_whenever_the_searched_names_change():
+    """The guard above, tied to the thing that actually forces a rename.
+
+    Asserting a denylist of old names rots: the next search-space change adds a
+    third and nothing reminds anyone. This pins the CURRENT default against the
+    space it belongs to, so renaming an axis without renaming the campaign
+    fails here rather than three hours into the first trial.
+    """
+    searched = set()
+    for arm in fs.ARMS:
+        searched |= set(_recorded_axes(arm))
+    assert {"lr_per_sqrt_batch", "weight_decay_per_sqrt_batch"} <= searched
+    assert _default("BLLARSE_FT_CAMPAIGN") == "sdelr512"
 
 
 def test_the_default_arms_are_a_subset_of_the_search_space():

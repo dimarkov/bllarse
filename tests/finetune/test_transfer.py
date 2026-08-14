@@ -1,0 +1,215 @@
+"""The batch/duration hyperparameter transfer rule.
+
+Mlodozeniec et al. 2025 (arXiv:2512.22382, Table 1), which derives batch-size
+and training-duration transfer from a shared AdamW SDE limit. The rule is only
+useful if its two invariants actually hold, so those are what most of these
+assert -- an exponent typo would still produce plausible-looking numbers, but
+would break `steps * lr * wd` or the beta horizon fraction immediately.
+"""
+
+import math
+
+import pytest
+
+from bllarse.finetune import protocol
+
+
+def _steps(samples: int, batch: int) -> int:
+    return protocol.steps_for_samples(samples, batch)
+
+
+# --- betas_for ------------------------------------------------------------
+
+def test_the_reference_point_is_the_library_defaults():
+    # The whole rule is expressed relative to this point, so if it drifts every
+    # transferred config silently moves with it.
+    assert protocol.REFERENCE_BETAS == (0.9, 0.999)
+    assert protocol.reference_steps() == 3906
+    assert protocol.betas_for(protocol.reference_steps()) == protocol.REFERENCE_BETAS
+
+
+def test_the_beta_horizon_is_a_constant_fraction_of_the_run():
+    """The invariant the rule actually encodes: (1 - beta) * steps is fixed.
+
+    Stated as the horizon rather than the beta because that is the quantity
+    with meaning -- beta2's 1/(1-beta2) = 1000-step averaging window is 25.6%
+    of a 3906-step tuning run, and has to stay 25.6% of a longer one.
+    """
+    reference = protocol.reference_steps()
+    for steps in (1000, 3906, 10_009, 40_000):
+        b1, b2 = protocol.betas_for(steps)
+        assert (1.0 - b1) * steps == pytest.approx(0.1 * reference)
+        assert (1.0 - b2) * steps == pytest.approx(0.001 * reference)
+        # ... and therefore the horizon is the same fraction of the run.
+        assert (1.0 / (1.0 - b2)) / steps == pytest.approx(1000 / reference)
+
+
+def test_the_four_epoch_betas():
+    # The values the final campaign actually runs. 4 epochs of ImageNet-1k is
+    # 5,124,668 samples = 10,009 steps at batch 512, against tuning's 3906.
+    steps = _steps(5_124_668, 512)
+    assert steps == 10_009
+    b1, b2 = protocol.betas_for(steps)
+    assert b1 == pytest.approx(0.96097, abs=1e-5)
+    assert b2 == pytest.approx(0.99961, abs=1e-5)
+
+
+def test_a_longer_run_gets_a_longer_averaging_window():
+    _, b2_short = protocol.betas_for(2000)
+    _, b2_long = protocol.betas_for(20_000)
+    assert b2_long > b2_short
+
+
+def test_it_refuses_a_run_too_short_to_hold_the_beta1_horizon():
+    """Raises rather than clamping.
+
+    (1 - 0.9) * 3906 = 390.6, so under ~391 steps beta1 transfers to <= 0 --
+    which is AdamW with no first moment at all. Silently clamping would ship a
+    different optimizer with nothing in the config recording it.
+    """
+    protocol.betas_for(391)
+    with pytest.raises(ValueError, match="beta1 transfers out of range"):
+        protocol.betas_for(390)
+
+
+def test_it_carries_non_default_betas_through():
+    # A second transfer from an already-transferred config has to compose, or
+    # the rule only works once.
+    once = protocol.betas_for(10_009)
+    twice = protocol.betas_for(20_018, betas=once, from_steps=10_009)
+    direct = protocol.betas_for(20_018)
+    assert twice == pytest.approx(direct)
+
+
+# --- transfer -------------------------------------------------------------
+
+TUNED = {
+    "batch_size": 512,
+    "lr": 1.17e-5,
+    "weight_decay": 8.13e-6,
+    "head_lr_ratio": 31.7,
+}
+FOUR_EPOCH_SAMPLES = 5_124_668
+
+
+def _to_final(params=None, **kwargs):
+    return protocol.transfer(
+        TUNED if params is None else params,
+        from_samples=protocol.MAX_SAMPLES, from_batch=512,
+        to_samples=FOUR_EPOCH_SAMPLES, to_batch=512, **kwargs)
+
+
+def test_the_duration_factor_is_the_inverse_root_of_the_data_ratio():
+    out = _to_final()
+    expected = math.sqrt(protocol.MAX_SAMPLES / FOUR_EPOCH_SAMPLES)
+    assert expected == pytest.approx(0.6247, abs=1e-4)
+    assert out["lr"] == pytest.approx(TUNED["lr"] * expected)
+    assert out["weight_decay"] == pytest.approx(TUNED["weight_decay"] * expected)
+
+
+def test_total_decoupled_shrinkage_is_invariant():
+    """steps * lr * wd, the quantity finetune_space.TRUNK_WD_BOX derives by hand.
+
+    This is the check that catches a wrong exponent: AdamW's decay is decoupled
+    so per-step shrinkage is lr * wd, and the rule is only self-consistent if
+    the total over a run does not move.
+    """
+    out = _to_final()
+    before = _steps(protocol.MAX_SAMPLES, 512) * TUNED["lr"] * TUNED["weight_decay"]
+    after = _steps(FOUR_EPOCH_SAMPLES, 512) * out["lr"] * out["weight_decay"]
+    assert after == pytest.approx(before, rel=1e-3)
+
+
+def test_weight_decay_moves_with_the_learning_rate_not_against_it():
+    """The direction the paper's own table renders ambiguously.
+
+    Their Eq. 1 discretises a drift of (1/(eta*sigma))(g + lambda*sigma*Theta),
+    so invariance needs lambda/eta fixed -- the SAME exponent as the learning
+    rate, under the PyTorch AdamW convention that both optax and torch use.
+    Getting this backwards still passes a smoke test and quietly doubles the
+    effective regularisation across the transfer.
+    """
+    out = _to_final()
+    assert out["weight_decay"] / out["lr"] == pytest.approx(
+        TUNED["weight_decay"] / TUNED["lr"])
+
+
+def test_the_head_lr_ratio_is_invariant():
+    # Trunk and head take the same factor on every axis, so the ratio is the
+    # transfer-safe coordinate and must not be touched.
+    assert _to_final()["head_lr_ratio"] == TUNED["head_lr_ratio"]
+
+
+def test_an_absolute_head_lr_is_scaled_like_the_trunk():
+    out = _to_final({**TUNED, "head_lr": 3.7e-4})
+    assert out["head_lr"] / out["lr"] == pytest.approx(3.7e-4 / TUNED["lr"])
+
+
+def test_it_sets_the_betas_and_the_target_batch():
+    out = _to_final()
+    assert out["batch_size"] == 512
+    assert (out["beta1"], out["beta2"]) == protocol.betas_for(
+        _steps(FOUR_EPOCH_SAMPLES, 512))
+
+
+def test_the_batch_rule_is_the_square_root_at_fixed_data():
+    # m_D = 1, m_B = 4: lr and wd both take sqrt(4) = 2.
+    out = protocol.transfer(
+        TUNED, from_samples=protocol.MAX_SAMPLES, from_batch=512,
+        to_samples=protocol.MAX_SAMPLES, to_batch=2048)
+    assert out["lr"] == pytest.approx(TUNED["lr"] * 2.0)
+    assert out["weight_decay"] == pytest.approx(TUNED["weight_decay"] * 2.0)
+    assert out["batch_size"] == 2048
+
+
+def test_shrinkage_is_invariant_across_the_batch_axis_too():
+    out = protocol.transfer(
+        TUNED, from_samples=protocol.MAX_SAMPLES, from_batch=512,
+        to_samples=protocol.MAX_SAMPLES, to_batch=2048)
+    before = _steps(protocol.MAX_SAMPLES, 512) * TUNED["lr"] * TUNED["weight_decay"]
+    after = _steps(protocol.MAX_SAMPLES, 2048) * out["lr"] * out["weight_decay"]
+    assert after == pytest.approx(before, rel=1e-3)
+
+
+def test_a_round_trip_is_the_identity():
+    forward = _to_final()
+    back = protocol.transfer(
+        forward, from_samples=FOUR_EPOCH_SAMPLES, from_batch=512,
+        to_samples=protocol.MAX_SAMPLES, to_batch=512)
+    assert back["lr"] == pytest.approx(TUNED["lr"])
+    assert back["weight_decay"] == pytest.approx(TUNED["weight_decay"])
+    assert back["beta1"] == pytest.approx(protocol.REFERENCE_BETAS[0])
+    assert back["beta2"] == pytest.approx(protocol.REFERENCE_BETAS[1])
+
+
+def test_unrecognised_keys_pass_through_untouched():
+    out = _to_final({**TUNED, "kl_ratio": 3.06e-7, "prior_scale": 1.66e-3})
+    # Loss terms, not optimizer state. The SDE rule says nothing about them and
+    # inventing a factor would be worse than leaving them alone.
+    assert out["kl_ratio"] == 3.06e-7
+    assert out["prior_scale"] == 1.66e-3
+
+
+def test_it_refuses_to_move_q_init_across_a_batch_change():
+    """q0 = alpha^2 / B is IBProbit's OWN batch relation.
+
+    Two rules claim the same axis and there is no evidence for which wins, so a
+    batch change on a config carrying q_init raises. A duration-only transfer
+    is unaffected, which is the case that actually runs.
+    """
+    with_q = {**TUNED, "q_init": 3.72e-5}
+    assert _to_final(with_q)["q_init"] == 3.72e-5  # duration only: fine
+    with pytest.raises(ValueError, match="q_init"):
+        protocol.transfer(
+            with_q, from_samples=protocol.MAX_SAMPLES, from_batch=512,
+            to_samples=protocol.MAX_SAMPLES, to_batch=1024)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"from_samples": 0}, {"to_samples": 0}, {"from_batch": 0}, {"to_batch": 0},
+])
+def test_it_rejects_a_degenerate_operating_point(kwargs):
+    base = dict(from_samples=protocol.MAX_SAMPLES, from_batch=512,
+                to_samples=FOUR_EPOCH_SAMPLES, to_batch=512)
+    with pytest.raises(ValueError):
+        protocol.transfer(TUNED, **{**base, **kwargs})

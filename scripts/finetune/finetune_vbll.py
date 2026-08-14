@@ -301,6 +301,16 @@ def build_argparser() -> argparse.ArgumentParser:
                         "VBLL's KL is its head regulariser, and IBProbit runs "
                         "no optimizer on the head at all, so a nonzero value "
                         "here would be an asymmetry between arms.")
+    # See the same pair in finetune_jax.py: a per-STEP timescale, and this
+    # script runs at ~3906 steps when tuning and ~10,009 for a 4-epoch final
+    # run. protocol.betas_for holds (1 - beta) * steps invariant across that.
+    # The defaults are torch's, so an invocation that omits them is unchanged.
+    p.add_argument("--beta1", type=float, default=protocol.REFERENCE_BETAS[0],
+                   help="AdamW beta1. Transfers with the run length; see "
+                        "protocol.betas_for.")
+    p.add_argument("--beta2", type=float, default=protocol.REFERENCE_BETAS[1],
+                   help="AdamW beta2. Transfers with the run length; see "
+                        "protocol.betas_for.")
 
     p.add_argument("--kl-ratio", type=float, default=1e-6)
     p.add_argument("--prior-scale", type=float, default=1.0)
@@ -396,11 +406,13 @@ def main(args, on_dump=None) -> None:
     ).to(device)
 
     # Two param groups, two rates. weight_decay 0 on the head: see --weight-decay.
+    # betas are set on the optimizer rather than per group: they are an
+    # averaging horizon in STEPS, and both groups take the same steps.
     optimizer = torch.optim.AdamW([
         {"params": model.parameters(), "lr": args.lr,
          "weight_decay": args.weight_decay},
         {"params": head.parameters(), "lr": args.head_lr, "weight_decay": 0.0},
-    ])
+    ], betas=(args.beta1, args.beta2))
 
     from datasets import load_dataset
     ds = load_dataset(ds_config["hf_path"], name=ds_config.get("hf_config"))

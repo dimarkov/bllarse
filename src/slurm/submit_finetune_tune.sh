@@ -36,7 +36,15 @@
 set -euo pipefail
 
 : "${BLLARSE_FT_STORAGE:=/ptmp/${USER}/ft_studies}"
-: "${BLLARSE_FT_CAMPAIGN:=fixb512}"
+# Moved from fixb512 because the SEARCH SPACE changed again: lr and weight
+# decay are now drawn as `lr_per_sqrt_batch` and `weight_decay_per_sqrt_batch`,
+# the batch-invariant coordinates of the AdamW SDE transfer rule
+# (finetune_space._suggest_per_sqrt_batch). At the pinned batch that is an
+# exact relabelling of the same interval, so the two campaigns are directly
+# comparable -- but they cannot SHARE a study. Renaming a float axis is
+# optuna's quiet failure: `load_if_exists` would leave TPE modelling `lr` from
+# 500-odd prior trials while the objective samples a name none of them carry.
+: "${BLLARSE_FT_CAMPAIGN:=sdelr512}"
 # 60, against the first campaign's 32 / 36 / 16. The reason to re-run at all is
 # that the arms came out 0.0026 apart while the spread across each arm's own
 # top six was 0.003-0.005 -- the ranking sat inside the search's own noise. A
