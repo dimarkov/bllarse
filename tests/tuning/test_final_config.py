@@ -19,6 +19,7 @@ from bllarse.finetune import protocol  # noqa: E402
 from bllarse.tools import adapters  # noqa: E402
 from bllarse.tuning import final_config as fc  # noqa: E402
 from bllarse.tuning import finetune_space as fs  # noqa: E402
+from bllarse.tuning import finetune_worker  # noqa: E402
 
 ROOT = math.sqrt(512)
 # The fixb512 campaign's ce winner, its budget, and the factor it takes. The
@@ -302,3 +303,61 @@ def test_the_whole_search_space_survives_the_round_trip():
         # The learning rate takes the duration factor over the SAME budgets.
         assert config["lr"] == pytest.approx(
             params["lr"] * math.sqrt(protocol.MAX_SAMPLES / 5_124_668))
+
+
+# --- MLflow reaches both campaigns ------------------------------------------
+
+
+def test_the_final_run_logs_to_its_own_experiment():
+    """One integration, two campaigns -- which was the requirement.
+
+    Both the tuning trials and the reported 4-epoch runs reach MLflow through
+    the same --enable-mlflow flag on the same training scripts, because both
+    render a config dict into that script's argv. Only the experiment differs,
+    so a search trial and a reported run are never averaged together.
+    """
+    config = _ce_config()
+    assert config["enable_mlflow"] is True
+    assert config["mlflow_experiment"] == "bllarse-finetuning"
+    assert fc.MLFLOW_EXPERIMENT != finetune_worker.MLFLOW_EXPERIMENT
+
+
+def test_the_experiment_names_mirror_the_probing_conventions():
+    # bllarse-probing / bllarse-probing-tuning already exist on the server, so
+    # the four read as two campaigns x two phases rather than four names.
+    assert fc.MLFLOW_EXPERIMENT == "bllarse-finetuning"
+    assert finetune_worker.MLFLOW_EXPERIMENT == "bllarse-finetuning-tuning"
+
+
+@pytest.mark.parametrize("arm", ["ce", "ibprobit_noeps"])
+def test_the_mlflow_flags_are_accepted_by_the_script(arm):
+    import finetune_jax as fj
+
+    params = dict(CE_BEST)
+    if arm.startswith("ibprobit"):
+        params = {"lr": 2.62e-5, "weight_decay": 3.30e-5,
+                  "q_init": 3.72e-5, "num_update_iters": 512}
+    config = fc.final_config(arm, params, effective_batch=512,
+                             from_samples=TUNE_SAMPLES)
+    args = fj.build_argparser().parse_args(adapters.config_to_argv(config))
+    assert args.enable_mlflow is True
+    assert args.mlflow_experiment == "bllarse-finetuning"
+
+
+def test_the_vbll_script_takes_them_too():
+    import finetune_vbll as fv
+
+    params = {"lr": 1.47e-5, "weight_decay": 1.38e-3, "head_lr_ratio": 326.0,
+              "kl_ratio": 3.06e-7, "prior_scale": 1.66e-3}
+    config = fc.final_config("vbll", params, effective_batch=512,
+                             from_samples=TUNE_SAMPLES)
+    args = fv.build_argparser().parse_args(adapters.config_to_argv(config))
+    assert args.enable_mlflow is True
+    assert args.mlflow_experiment == "bllarse-finetuning"
+
+
+def test_tracking_can_be_turned_off_for_a_local_run():
+    # config_to_argv omits a False store_true flag entirely, so the script
+    # defaults to off and a laptop run never reaches for the server.
+    config = _ce_config(enable_mlflow=False)
+    assert "--enable-mlflow" not in adapters.config_to_argv(config)

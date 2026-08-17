@@ -153,8 +153,32 @@ def resolve_experiment_id(mlflow_module: Any, name: str) -> str:
         return client.get_experiment_by_name(name).experiment_id
 
 
+# Exception types that mean a run ended early BY DESIGN rather than broke.
+#
+# Without this distinction every pruned trial lands on the server as FAILED,
+# indistinguishable from a genuine harness fault. That is not hypothetical: the
+# `bllarse-probing-tuning` experiment holds 22,374 FAILED runs out of 24,492,
+# and essentially all of them are trials the MedianPruner killed on purpose.
+# The search's own record is therefore unreadable -- you cannot filter the
+# campaign that worked from the campaign that was misconfigured -- which is
+# exactly the state a three-day fine-tuning failure went unnoticed in.
+#
+# Matched by TYPE NAME, not by class, and that is a deliberate trade. The two
+# that matter are `optuna.TrialPruned` and `tuning.objective.EarlyConvergence`;
+# a class-based check would make this module import optuna, and this module is
+# imported by training scripts that run standalone on GPU nodes. A name match
+# costs precision no one here can spend and buys zero coupling.
+BY_DESIGN_EXCEPTIONS = frozenset({"TrialPruned", "EarlyConvergence"})
+
+
 @contextmanager
-def child_run(config: Mapping[str, Any], *, run_name: str, tags: Mapping[str, Any] | None = None):
+def child_run(
+    config: Mapping[str, Any],
+    *,
+    run_name: str,
+    tags: Mapping[str, Any] | None = None,
+    by_design_exceptions: frozenset[str] = BY_DESIGN_EXCEPTIONS,
+):
     """A per-config MLflow run, nested under the sweep parent. No-op when off.
 
     Nesting is done by setting `mlflow.parentRunId` explicitly rather than by
@@ -227,13 +251,23 @@ def child_run(config: Mapping[str, Any], *, run_name: str, tags: Mapping[str, An
         # the caller as itself. Nothing above this line can be an `except`
         # that wraps this `yield`.
         yield run
-    except BaseException:
-        # Teardown on the failure path: record the run as failed/errored
-        # (mirrors what `with start_run(...):` would have marked it), then
-        # re-raise the SAME exception object untouched. A teardown failure
-        # here must not replace or mask it.
+    except BaseException as body_exc:
+        # Teardown on the failure path. Re-raises the SAME exception object
+        # untouched either way; a teardown failure must not replace or mask it.
+        #
+        # The two branches differ only in what the SERVER is told. A pruned or
+        # patience-stopped trial is a normal outcome of the search, so marking
+        # it FAILED -- which is what `run_ctx.__exit__` does for any exception
+        # -- destroys the distinction between "the pruner did its job" and "the
+        # harness is broken". KILLED is MLflow's status for stopped-on-purpose,
+        # and `run_outcome` records which stopper fired.
+        outcome = type(body_exc).__name__
         try:
-            run_ctx.__exit__(*sys.exc_info())
+            if outcome in by_design_exceptions:
+                run.set_tags({"run_outcome": outcome})
+                mlflow.end_run(status="KILLED")
+            else:
+                run_ctx.__exit__(*sys.exc_info())
         except Exception as exc:  # pragma: no cover - network dependent
             print(
                 f"[bllarse] MLflow end_run failed ({type(exc).__name__}: {exc}); "
@@ -244,9 +278,11 @@ def child_run(config: Mapping[str, Any], *, run_name: str, tags: Mapping[str, An
         # Teardown on the success path: mark the run finished. A failure
         # here is a tracking-only problem and must not raise.
         try:
+            run.set_tags({"run_outcome": "completed"})
             run_ctx.__exit__(None, None, None)
         except Exception as exc:  # pragma: no cover - network dependent
             print(
                 f"[bllarse] MLflow end_run failed ({type(exc).__name__}: {exc}); "
                 "continuing untracked."
             )
+

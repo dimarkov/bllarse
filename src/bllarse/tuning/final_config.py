@@ -43,6 +43,13 @@ SEARCH_SUFFIX = space.PER_SQRT_BATCH_SUFFIX
 # one dump. The final run is what the figures are made from.
 FINAL_EVAL_SPLITS = "val+test"
 
+# The main campaign's experiment, distinct from the tuning one so a search
+# trial and a reported run are never averaged together by accident. The
+# integration itself is shared: both campaigns reach MLflow through the same
+# --enable-mlflow flag on the same training scripts, because both render a
+# config dict into that script's argv.
+MLFLOW_EXPERIMENT = "bllarse-finetuning"
+
 
 def absolute_params(
     params: Mapping[str, Any], *, effective_batch: int
@@ -91,6 +98,8 @@ def final_config(
     n_train: int = imagenet.IMAGENET_N_TRAIN,
     dump_root: Any = None,
     eval_splits: str = FINAL_EVAL_SPLITS,
+    enable_mlflow: bool = True,
+    mlflow_experiment: str = MLFLOW_EXPERIMENT,
     dump_every_k_evals: int | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
@@ -138,6 +147,10 @@ def final_config(
     config["max_samples"] = 0
     config["epochs"] = epochs
     config["eval_splits"] = eval_splits
+    # Overrides trial_config's tuning experiment: same flag, same scripts, but
+    # a reported 4-epoch run does not belong in the search's experiment.
+    config["enable_mlflow"] = enable_mlflow
+    config["mlflow_experiment"] = mlflow_experiment
     if dump_every_k_evals is not None:
         config["dump_every_k_evals"] = dump_every_k_evals
     if model is not None:

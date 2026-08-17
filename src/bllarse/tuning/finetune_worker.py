@@ -91,6 +91,7 @@ def abort_on_consecutive_failures(
 
     return callback
 
+
 SCRIPTS = {
     "ce": "scripts/finetune/finetune_jax.py",
     # Same script as ce: the JAX arms share the data stream, the pinned split
@@ -157,6 +158,17 @@ EVAL_SPLITS = "val"
 # dump, its buffered argmin, and never pays the 47,500-image OOD preload.
 DUMP_EVERY_K_EVALS = 0
 OOD_EVERY_K_DUMPS = 0
+
+# The tuning experiment. Mirrors the probing side's `bllarse-probing-tuning` /
+# `bllarse-probing` split, so the four experiments read as two campaigns x two
+# phases rather than four unrelated names.
+#
+# Fine-tuning logged nothing at all before this. Everything the campaign had
+# ever produced lived only as Optuna journals on /ptmp -- scratch, with a
+# retention policy -- and the consequence was concrete: a campaign burned 410
+# GPU-hours failing 2,851 of 2,860 trials for three days, and the only way to
+# see it was to ssh in and read slurm logs.
+MLFLOW_EXPERIMENT = "bllarse-finetuning-tuning"
 
 # Where the pre-decoded uint8 training shard lives (bllarse.finetune.shards).
 #
@@ -287,6 +299,14 @@ def trial_config(
         "max_samples": max_samples,
         "eval_quantum": protocol.EVAL_QUANTUM,
         "eval_splits": EVAL_SPLITS,
+        # Every trial is tracked, PRUNED ones included -- they are the shape of
+        # the search, not noise. What made the probing experiment unreadable was
+        # not that pruned trials were logged but that child_run marked them
+        # FAILED, indistinguishable from a harness fault; that is fixed at the
+        # source (mlflow_utils.BY_DESIGN_EXCEPTIONS), so they now land as KILLED
+        # with a `run_outcome` tag and filter cleanly.
+        "enable_mlflow": True,
+        "mlflow_experiment": MLFLOW_EXPERIMENT,
         "dump_every_k_evals": DUMP_EVERY_K_EVALS,
         "ood_every_k_dumps": OOD_EVERY_K_DUMPS,
         "val_fraction": VAL_FRACTION,

@@ -32,6 +32,7 @@ import optax  # noqa: E402
 from jax import random as jr  # noqa: E402
 
 from bllarse import evaldump, metrics  # noqa: E402
+from bllarse.mlflow_utils import child_run  # noqa: E402
 from bllarse.finetune import imagenet, jax_steps, protocol  # noqa: E402
 from bllarse.losses import CrossEntropy  # noqa: E402
 
@@ -257,6 +258,17 @@ def build_argparser() -> argparse.ArgumentParser:
         help="AdamW beta2. Transfers with the run length; see "
              "protocol.betas_for.",
     )
+    # MLflow, mirroring scripts/dinov3/probe.py's flags. Off unless asked, so a
+    # standalone invocation stays offline and a tracking outage can never take a
+    # GPU job down (child_run degrades to a no-op run object).
+    #
+    # These are on the SCRIPT, not on the tuning worker, and that is what makes
+    # the same integration serve both campaigns: the tuning trials reach here
+    # through finetune_worker.trial_config and the final 4-epoch runs through
+    # tuning.final_config, and both render a config dict into these flags.
+    p.add_argument("--enable-mlflow", action="store_true")
+    p.add_argument("--mlflow-experiment", default=None)
+    p.add_argument("--mlflow-tracking-uri", default=None)
     p.add_argument("--label-smooth", type=float, default=0.0)
     p.add_argument("--num-update-iters", type=int, default=128,
                    help="CAVI iterations per macro batch (IBProbit arm).")
@@ -496,7 +508,7 @@ def eval_logits_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
 
 
 
-def main(args, on_dump=None) -> None:
+def _train(args, on_dump=None, run=None) -> None:
     """Fine-tune one arm: gradient accumulation to the target batch, val_nll
     evaluated every `--eval-quantum` samples.
 
@@ -774,6 +786,11 @@ def main(args, on_dump=None) -> None:
             print(f"[finetune] eval {eval_index}/{plan['n_evals']} "
                   f"step {step}/{plan['steps']} " + " ".join(
                       f"{k}={v:.4f}" for k, v in sorted(scalars.items())))
+            # BEFORE on_dump, deliberately: on_dump is where the pruner and
+            # the patience clock raise, so logging after it would drop the very
+            # evaluation that ended the trial -- the one that explains why.
+            if run is not None:
+                run.log_metrics(dict(scalars), step=samples_seen)
             if on_dump is not None:
                 on_dump(eval_index, step, samples_seen, scalars)
             # gc.collect() only -- NOT jax.clear_caches() here. Dropping the
@@ -822,6 +839,36 @@ def main(args, on_dump=None) -> None:
     print(f"[finetune] done: {eval_index} evaluations under "
           f"{args.dump_root}/{args.group_id}/{args.uid}")
 
+
+
+def main(args, on_dump=None) -> None:
+    """Public entry point: the training run, wrapped in one MLflow run.
+
+    A thin wrapper so `_train` keeps its indentation and its `finally`. The
+    signature is unchanged -- `bllarse.tuning.objective.evaluate` calls
+    `module.main(args, on_dump=dump_cb)` -- so tuning is unaffected.
+
+    `vars(args)` is the config, which is what makes `enable_mlflow` and friends
+    reach `child_run` without a second plumbing path, and what gets logged as
+    the run's params. The run is a no-op object unless --enable-mlflow is set,
+    so a standalone invocation stays offline.
+
+    Exceptions raised out of `_train` -- optuna.TrialPruned from the pruner,
+    objective.EarlyConvergence from patience -- propagate untouched. child_run
+    marks those KILLED rather than FAILED; see BY_DESIGN_EXCEPTIONS.
+    """
+    with child_run(
+        vars(args),
+        run_name=args.uid or f"{args.group_id}",
+        tags={
+            "arm": getattr(args, "arm", "vbll"),
+            "group_id": args.group_id,
+            "uid": str(args.uid),
+            "model": args.model,
+            "dump_dir": str(Path(args.dump_root) / args.group_id / str(args.uid)),
+        },
+    ) as run:
+        _train(args, on_dump=on_dump, run=run)
 
 if __name__ == "__main__":
     from jax import config as jax_config

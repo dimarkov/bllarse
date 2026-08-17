@@ -425,3 +425,111 @@ def test_a_teardown_failure_while_a_body_exception_is_in_flight_does_not_mask_it
 
     assert excinfo.value is sentinel
     assert "continuing untracked" in capsys.readouterr().out
+
+
+# --- Pruned is not failed ---------------------------------------------------
+
+
+def _fake_mlflow(seen):
+    """A minimal mlflow that records how the run was ended."""
+
+    class FakeRun:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            seen["exit"] = exc[0].__name__ if exc[0] else None
+            return False
+
+    class FakeClient:
+        def get_experiment_by_name(self, name):
+            return SimpleNamespace(experiment_id="e1")
+
+    class FakeMlflow:
+        MlflowClient = FakeClient
+
+        def set_tracking_uri(self, uri):
+            pass
+
+        def start_run(self, experiment_id=None, run_name=None, tags=None):
+            return FakeRun()
+
+        def log_params(self, params):
+            pass
+
+        def log_metrics(self, metrics, step=None):
+            pass
+
+        def set_tags(self, tags):
+            seen.setdefault("tags", {}).update(tags)
+
+        def end_run(self, status=None):
+            seen["end_status"] = status
+
+    return FakeMlflow()
+
+
+class TrialPruned(Exception):
+    """Same NAME as optuna's, which is what child_run matches on."""
+
+
+class EarlyConvergence(Exception):
+    pass
+
+
+@pytest.mark.parametrize("exc_type", [TrialPruned, EarlyConvergence])
+def test_a_by_design_stop_is_KILLED_not_FAILED(monkeypatch, exc_type):
+    """The defect behind 22,374 unreadable runs.
+
+    A pruned trial raises through child_run's body, and `run_ctx.__exit__` marks
+    ANY exception FAILED. So on the probing experiment 22,374 of 24,492 runs are
+    FAILED and essentially all of them are trials the pruner killed on purpose
+    -- which makes a genuinely broken campaign indistinguishable from a healthy
+    one. That is the state a three-day fine-tuning failure went unnoticed in.
+    """
+    seen = {}
+    monkeypatch.setitem(sys.modules, "mlflow", _fake_mlflow(seen))
+    with pytest.raises(exc_type):
+        with mlflow_utils.child_run({"enable_mlflow": True}, run_name="u"):
+            raise exc_type("stopped by design")
+
+    assert seen["end_status"] == "KILLED"
+    assert seen["tags"]["run_outcome"] == exc_type.__name__
+    # __exit__ must NOT have been used -- it is what would mark this FAILED.
+    assert "exit" not in seen
+
+
+def test_a_real_fault_is_still_marked_failed(monkeypatch):
+    # The distinction is only worth anything if genuine faults still stand out.
+    seen = {}
+    monkeypatch.setitem(sys.modules, "mlflow", _fake_mlflow(seen))
+    with pytest.raises(RuntimeError):
+        with mlflow_utils.child_run({"enable_mlflow": True}, run_name="u"):
+            raise RuntimeError("the harness is broken")
+
+    assert seen["exit"] == "RuntimeError"
+    assert "end_status" not in seen
+
+
+def test_a_completed_run_is_tagged_as_such(monkeypatch):
+    seen = {}
+    monkeypatch.setitem(sys.modules, "mlflow", _fake_mlflow(seen))
+    with mlflow_utils.child_run({"enable_mlflow": True}, run_name="u"):
+        pass
+    assert seen["tags"]["run_outcome"] == "completed"
+    assert seen["exit"] is None
+
+
+def test_the_original_exception_reaches_the_caller_unchanged(monkeypatch):
+    """Non-negotiable: optuna has to SEE its own TrialPruned.
+
+    If classifying the exception swallowed or replaced it, every pruned trial
+    would be recorded as complete and the pruner would stop working.
+    """
+    seen = {}
+    monkeypatch.setitem(sys.modules, "mlflow", _fake_mlflow(seen))
+    sentinel = TrialPruned("the exact object")
+    with pytest.raises(TrialPruned) as caught:
+        with mlflow_utils.child_run({"enable_mlflow": True}, run_name="u"):
+            raise sentinel
+    assert caught.value is sentinel
