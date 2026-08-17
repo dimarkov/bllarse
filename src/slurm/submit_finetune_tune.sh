@@ -174,7 +174,7 @@ fi
 # ~3 minutes on a login node against a warm 156 GB cache. There is no skip flag,
 # on purpose: the campaign it protects costs three orders of magnitude more.
 hf_path="$(PYTHONPATH="${repo_root}/src" "$BLLARSE_FT_VENV" -c \
-  'from bllarse.finetune.registry import DATASETS; print(DATASETS["imagenet1k"]["hf_path"])' \
+  'from bllarse.finetune.registry import DATASET_CONFIGS as D; print(D["imagenet1k"]["hf_path"])' \
   2>/dev/null)" || hf_path=""
 if [[ -z "$hf_path" ]]; then
   echo "ERROR: could not read the imagenet1k hf_path from the registry via" >&2

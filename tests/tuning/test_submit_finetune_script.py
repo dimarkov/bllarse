@@ -222,6 +222,6 @@ def test_the_dataset_check_covers_every_interpreter_in_use():
 def test_the_dataset_check_reads_the_path_from_the_registry():
     # Hardcoding "ILSVRC/imagenet-1k" here would be a second place for the
     # dataset identity to live, and the two would drift.
-    assert "DATASETS[" in TEXT
+    assert "DATASET_CONFIGS" in TEXT
     assert "hf_path" in TEXT
     assert "ILSVRC/imagenet-1k" not in TEXT
