@@ -86,7 +86,7 @@ def test_it_names_a_campaign_so_a_rerun_cannot_resume_the_old_study():
     # optuna's quiet failure rather than its loud one: the study loads, TPE
     # keeps modelling `lr` from trials that carry it, and every new trial looks
     # like it simply never set the axis.
-    assert campaign not in ("shards2m", "fixb512", "sdelr512")
+    assert campaign not in ("shards2m", "fixb512", "sdelr512", "betas1m")
 
 
 def test_the_campaign_name_is_bumped_whenever_the_searched_names_change():
@@ -102,7 +102,7 @@ def test_the_campaign_name_is_bumped_whenever_the_searched_names_change():
         searched |= set(_recorded_axes(arm))
     assert {"lr_per_sqrt_batch", "weight_decay_per_sqrt_batch",
             "beta1_horizons", "beta2_horizons"} <= searched
-    assert _default("BLLARSE_FT_CAMPAIGN") == "betas1m"
+    assert _default("BLLARSE_FT_CAMPAIGN") == "betasearch1m"
 
 
 def test_the_default_arms_are_a_subset_of_the_search_space():
@@ -182,3 +182,46 @@ def test_it_checks_the_shard_before_taking_a_node_too():
     # Same class: slurm_finetune_tune.sh exits 2 on a missing shard, but only
     # once it already holds a GPU.
     assert "imagenet1k_train_224.json" in TEXT
+
+
+def test_it_resolves_the_dataset_cache_before_taking_a_node():
+    """The check whose absence cost the betas1m campaign.
+
+    BLLARSE_HF_HOME pointed at a cache with no PREPARED imagenet-1k, so all 18
+    workers called load_dataset at once, raced to build it into the same
+    directory and destroyed each other's `.incomplete` staging dir. 48 array
+    tasks, 410 GPU-hours, 9 usable trials out of 2,860.
+
+    The existing shard check could not catch it: the shard covers TRAINING, and
+    finetune_jax still calls load_dataset for the eval split and the label
+    metadata, so a valid shard says nothing about whether the dataset resolves.
+    """
+    assert "check_dataset" in TEXT
+    # OFFLINE is the load-bearing part. A cache that would have to DOWNLOAD is
+    # exactly the one that must not be handed to 18 concurrent workers.
+    assert "HF_DATASETS_OFFLINE=1" in TEXT
+    assert "HF_HUB_OFFLINE=1" in TEXT
+    # No escape hatch: the campaign it protects costs orders of magnitude more
+    # than the ~3 minutes it takes.
+    assert "SKIP_DATASET" not in TEXT
+
+
+def test_the_dataset_check_covers_every_interpreter_in_use():
+    """`datasets` can differ in version between the two venvs.
+
+    The prepared-dataset path is keyed by a builder revision hash, so one cache
+    can resolve for the JAX interpreter and trigger a rebuild for the torch one.
+    vbll runs its own venv and is the arm that took 0 completions out of 960, so
+    checking only BLLARSE_FT_VENV would have missed exactly the worst case.
+    """
+    block = TEXT[TEXT.index("declare -A _checked"):]
+    assert 'BLLARSE_FT_VBLL_VENV' in block
+    assert 'check_dataset "$interp"' in block
+
+
+def test_the_dataset_check_reads_the_path_from_the_registry():
+    # Hardcoding "ILSVRC/imagenet-1k" here would be a second place for the
+    # dataset identity to live, and the two would drift.
+    assert "DATASETS[" in TEXT
+    assert "hf_path" in TEXT
+    assert "ILSVRC/imagenet-1k" not in TEXT

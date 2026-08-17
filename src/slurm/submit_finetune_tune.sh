@@ -36,6 +36,13 @@
 set -euo pipefail
 
 : "${BLLARSE_FT_STORAGE:=/ptmp/${USER}/ft_studies}"
+# betas1m was PURGED, not superseded: its studies failed 2,851 of 2,860 trials
+# on the dataset-cache race that `check_dataset` below now catches, and the
+# journals, logs and dumps were deleted rather than kept as a harness-fault
+# record.
+# The name is not reused, so nothing in a log or a journal can be ambiguous
+# about which campaign it came from.
+#
 # Moved from fixb512 because the SEARCH SPACE changed, in three ways:
 #
 #   * lr and weight decay are drawn as `lr_per_sqrt_batch` and
@@ -51,7 +58,7 @@ set -euo pipefail
 # They cannot SHARE a study with fixb512 in any case. Renaming a float axis is
 # optuna's quiet failure: `load_if_exists` would leave TPE modelling `lr` from
 # 500-odd prior trials while the objective samples a name none of them carry.
-: "${BLLARSE_FT_CAMPAIGN:=betas1m}"
+: "${BLLARSE_FT_CAMPAIGN:=betasearch1m}"
 # 60, against the first campaign's 32 / 36 / 16. The reason to re-run at all is
 # that the arms came out 0.0026 apart while the spread across each arm's own
 # top six was 0.003-0.005 -- the ranking sat inside the search's own noise. A
@@ -144,6 +151,79 @@ if [[ ! -f "$shard_meta" ]]; then
   echo "ERROR: no training shard at $shard_meta" >&2
   exit 2
 fi
+
+# The dataset cache, resolved OFFLINE, once, before any node is taken.
+#
+# This is the check whose absence cost the betas1m campaign: BLLARSE_HF_HOME
+# pointed at a cache that had no PREPARED imagenet-1k, so all 18 workers called
+# load_dataset at the same moment, raced to download and build it into the same
+# directory, and destroyed each other's `.incomplete` staging dir. Every trial
+# failed for three days -- 48 array tasks, 410 GPU-hours, 9 usable trials out of
+# 2,860.
+#
+# The shard covers TRAINING only. finetune_jax still calls load_dataset for the
+# eval split and the label metadata, so a good shard says nothing about whether
+# the dataset resolves -- which is exactly why the existing shard check did not
+# catch this.
+#
+# OFFLINE deliberately. Requiring the cache to resolve with no network is not
+# excess strictness, it is the property that matters: a cache that would have to
+# DOWNLOAD is precisely the one that must not be handed to 18 concurrent
+# workers. Preparing it is a one-time serial job, and the error below says so.
+#
+# ~3 minutes on a login node against a warm 156 GB cache. There is no skip flag,
+# on purpose: the campaign it protects costs three orders of magnitude more.
+hf_path="$(PYTHONPATH="${repo_root}/src" "$BLLARSE_FT_VENV" -c \
+  'from bllarse.finetune.registry import DATASETS; print(DATASETS["imagenet1k"]["hf_path"])' \
+  2>/dev/null)" || hf_path=""
+if [[ -z "$hf_path" ]]; then
+  echo "ERROR: could not read the imagenet1k hf_path from the registry via" >&2
+  echo "       $BLLARSE_FT_VENV." >&2
+  exit 2
+fi
+
+# EVERY interpreter in use, not just the JAX one. `datasets` can differ in
+# version between the two venvs, and the prepared-dataset path is keyed by a
+# builder revision hash -- so the same cache can resolve for one interpreter and
+# trigger a rebuild for the other. That is not hypothetical: vbll runs its own
+# torch venv and it is the arm that took 0 completions out of 960.
+check_dataset() {
+  local interp="$1" label="$2"
+  echo "Resolving $hf_path offline via $label ..." >&2
+  if HF_HOME="${BLLARSE_HF_HOME:-$HOME/.cache/huggingface}" \
+     HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+     "$interp" -c "
+from datasets import load_dataset
+n = {k: len(v) for k, v in load_dataset('${hf_path}').items()}
+assert n.get('train', 0) > 1_000_000, n
+print('  OK', n)
+" >&2; then
+    return 0
+  fi
+  echo "ERROR: $hf_path does not resolve OFFLINE for $label from" >&2
+  echo "       HF_HOME=${BLLARSE_HF_HOME:-<unset>}." >&2
+  echo "       Submitting anyway would have every worker try to prepare it at" >&2
+  echo "       once. That is what killed the betas1m campaign: 48 array tasks," >&2
+  echo "       410 GPU-hours, 9 usable trials out of 2,860." >&2
+  echo "       Prepare it ONCE, serially, then re-run this script:" >&2
+  echo "         HF_HOME=<cache> $interp -c \\" >&2
+  echo "           \"from datasets import load_dataset; load_dataset('$hf_path')\"" >&2
+  echo "       ...or point BLLARSE_HF_HOME at a cache that already has it." >&2
+  exit 2
+}
+
+# An explicit `if`, not `[[ ... ]] && continue`: under `set -e` a false `&&`
+# compound as a loop body's last statement is an exit, and the guard would then
+# silently skip the rest of the arms.
+declare -A _checked=()
+for arm in $BLLARSE_FT_ARMS; do
+  interp="$BLLARSE_FT_VENV"
+  if [[ "$arm" == "vbll" ]]; then interp="$BLLARSE_FT_VBLL_VENV"; fi
+  if [[ -z "${_checked[$interp]:-}" ]]; then
+    _checked[$interp]=1
+    check_dataset "$interp" "${arm}'s interpreter"
+  fi
+done
 
 for arm in $BLLARSE_FT_ARMS; do
   venv="$BLLARSE_FT_VENV"

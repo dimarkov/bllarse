@@ -5,6 +5,8 @@ the one the design specifies, because a wrong value costs ~6.3 A100-hours per
 trial and is invisible in the result.
 """
 
+from pathlib import Path
+
 import pytest
 
 from bllarse.finetune import protocol
@@ -244,3 +246,100 @@ def test_the_target_counts_the_study_not_the_worker():
     study.optimize(lambda t: t.suggest_float("x", 0, 1), n_trials=5,
                    callbacks=[stop])
     assert fw.n_completed(study) == 2
+
+
+# --- Aborting a campaign that is failing every trial ------------------------
+
+
+def _study():
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    return optuna.create_study()
+
+
+def test_the_abort_guard_fires_after_the_configured_streak():
+    import optuna
+
+    guard = fw.abort_on_consecutive_failures(limit=3)
+    study = _study()
+
+    def failing(trial):
+        raise RuntimeError("harness fault")
+
+    with pytest.raises(RuntimeError, match="consecutive trials failed"):
+        study.optimize(failing, n_trials=20, catch=(Exception,), callbacks=[guard])
+    # Exactly the streak, not the whole budget: 3 of 20, which is the saving.
+    assert len(study.trials) == 3
+
+
+def test_the_abort_guard_escapes_optimizes_catch():
+    """A property of Optuna's internals, so it is pinned rather than assumed.
+
+    `catch=(Exception,)` wraps the OBJECTIVE inside _run_trial; callbacks are
+    invoked outside it. If that ever changed, the guard would be swallowed by
+    the very mechanism that lets failing trials accumulate -- silently, and the
+    only symptom would be another three-day campaign.
+    """
+    guard = fw.abort_on_consecutive_failures(limit=1)
+    study = _study()
+    with pytest.raises(RuntimeError):
+        study.optimize(lambda t: (_ for _ in ()).throw(ValueError("x")),
+                       n_trials=5, catch=(Exception,), callbacks=[guard])
+
+
+def test_a_successful_trial_resets_the_streak():
+    # Intermittent failures are normal -- a node OOM, a filesystem hiccup --
+    # and killing an array over them would be worse than the disease.
+    guard = fw.abort_on_consecutive_failures(limit=3)
+    study = _study()
+    state = {"n": 0}
+
+    def alternating(trial):
+        state["n"] += 1
+        if state["n"] % 2:
+            raise RuntimeError("transient")
+        return 1.0
+
+    study.optimize(alternating, n_trials=12, catch=(Exception,), callbacks=[guard])
+    assert len(study.trials) == 12  # never aborted
+
+
+def test_a_pruned_trial_also_resets_the_streak():
+    """PRUNED means the harness works and the pruner is doing its job.
+
+    Treating it as a failure would abort every well-behaved campaign here --
+    prune rates on these studies run 69% to 92%.
+    """
+    import optuna
+
+    guard = fw.abort_on_consecutive_failures(limit=2)
+    study = _study()
+    state = {"n": 0}
+
+    def mostly_pruned(trial):
+        state["n"] += 1
+        if state["n"] % 3 == 0:
+            raise RuntimeError("one bad trial")
+        raise optuna.TrialPruned()
+
+    study.optimize(mostly_pruned, n_trials=15, catch=(Exception,), callbacks=[guard])
+    assert len(study.trials) == 15
+
+
+def test_the_guard_is_installed_unconditionally():
+    """It must run with AND without --target-complete.
+
+    The callback list used to be an either/or on target_complete, so wiring the
+    guard into only one branch would leave the other able to burn a full budget.
+    """
+    src = Path(fw.__file__).read_text()
+    block = src[src.index("callbacks=("):src.index("callbacks=(") + 400]
+    assert "abort_on_consecutive_failures()" in block
+    # Present on the no-target branch too: the guard is outside the conditional.
+    assert block.index("abort_on_consecutive_failures()") < block.index("target_complete")
+
+
+def test_the_streak_limit_is_small_enough_to_be_worth_something():
+    # At ~1.4 h a completed trial and seconds for a launch fault, the guard only
+    # helps if it fires in minutes. 16 workers x limit is the wasted-trial bound.
+    assert 1 < fw.CONSECUTIVE_FAILURE_LIMIT <= 10

@@ -30,6 +30,67 @@ from bllarse.tuning.worker import n_completed, stop_at_completed
 
 DIRECTION = "minimize"
 
+# Abort the worker after this many CONSECUTIVE failed trials.
+#
+# The failure this bounds is a LAUNCH fault -- a bad HF_HOME, an unreadable
+# shard, a package missing from the venv -- which makes every trial fail in
+# seconds while nothing stops the worker from grinding through its whole
+# --n-trials budget. The betas1m campaign did exactly that: 950 of 954 trials
+# failed on ce, 935 of 946 on ibprobit_noeps and 960 of 960 on vbll, across 48
+# array tasks and 410 GPU-hours over three days, because 18 workers raced to
+# prepare the same uncached ImageNet-1k and tore down each other's `.incomplete`
+# staging directory.
+#
+# `summarize_study` already DETECTED that and printed "Every trial failing is a
+# harness fault, not a search outcome" on the first worker within minutes. The
+# gap was that nothing ACTED on it. This does.
+#
+# 5, not 1: a single trial can fail transiently -- a node OOM, a filesystem
+# hiccup -- and killing an array over one would be worse than the disease. Five
+# in a row with nothing succeeding in between is not transient. A completed
+# trial takes ~1.4 h and a launch fault takes seconds, so five of them cost
+# minutes rather than days.
+CONSECUTIVE_FAILURE_LIMIT = 5
+
+
+def abort_on_consecutive_failures(
+    limit: int = CONSECUTIVE_FAILURE_LIMIT,
+) -> Callable[[optuna.Study, optuna.trial.FrozenTrial], None]:
+    """Raise once `limit` trials have failed back to back.
+
+    RAISES rather than calling `study.stop()`, and the difference is the whole
+    point: stop() exits the worker 0, which SLURM records as success, so the
+    next array task starts and repeats the fault. An exception propagates out
+    of `study.optimize` and the task exits non-zero, so the failure is visible
+    in `sacct` and the array does not quietly launder it.
+
+    Not caught by optimize's `catch=(Exception,)`: that applies to the
+    objective, inside `_run_trial`. Callbacks are invoked outside it, so this
+    escapes. `test_the_abort_guard_escapes_optimizes_catch` pins that, since it
+    is a property of Optuna's internals rather than of this function.
+
+    The streak resets on any non-FAIL trial, PRUNED included. A pruned trial
+    means the harness works and the pruner is doing its job.
+    """
+    state = {"streak": 0}
+
+    def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.state == optuna.trial.TrialState.FAIL:
+            state["streak"] += 1
+        else:
+            state["streak"] = 0
+        if state["streak"] >= limit:
+            raise RuntimeError(
+                f"[ft-tune] ABORTING {study.study_name}: {state['streak']} "
+                f"consecutive trials failed. This is a harness fault, not a "
+                f"search outcome -- read the FIRST traceback in this log, not "
+                f"the last. Common causes: HF_HOME pointing at a cache without "
+                f"the prepared dataset, an unreadable training shard, or a "
+                f"package missing from the venv."
+            )
+
+    return callback
+
 SCRIPTS = {
     "ce": "scripts/finetune/finetune_jax.py",
     # Same script as ce: the JAX arms share the data stream, the pinned split
@@ -439,9 +500,13 @@ def main() -> None:
         # KeyboardInterrupt/SystemExit derive from BaseException so a job
         # timeout still tears the worker down instead of being swallowed.
         catch=(Exception,),
+        # abort_on_consecutive_failures is FIRST and unconditional: it has to
+        # run even when --target-complete is absent, and a study that is failing
+        # every trial must die before anything else gets a say.
         callbacks=(
-            [log_failed_trial] if args.target_complete is None
-            else [log_failed_trial, stop_at_completed(args.target_complete)]
+            [abort_on_consecutive_failures(), log_failed_trial]
+            + ([] if args.target_complete is None
+               else [stop_at_completed(args.target_complete)])
         ),
     )
     print(summarize_study(study))
