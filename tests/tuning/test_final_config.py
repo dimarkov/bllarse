@@ -361,3 +361,56 @@ def test_tracking_can_be_turned_off_for_a_local_run():
     # defaults to off and a laptop run never reaches for the server.
     config = _ce_config(enable_mlflow=False)
     assert "--enable-mlflow" not in adapters.config_to_argv(config)
+
+
+# --- The final campaign's per-seed identity ---------------------------------
+
+
+def test_it_emits_a_seed_so_the_five_runs_are_not_identical():
+    """Nothing upstream supplies one.
+
+    trial_config never sets a seed -- objective.evaluate passes it for tuning
+    trials -- and the final runs have no such wrapper. Without this every seed
+    of every arm ran at the scripts' default 137: five identical runs reported
+    as an error bar.
+    """
+    assert _ce_config(seed=141)["seed"] == 141
+    assert _ce_config()["seed"] == fs.REPORTED_SEEDS[0]
+    assert "--seed" in adapters.config_to_argv(_ce_config(seed=141))
+
+
+def test_it_emits_one_group_for_the_whole_final_campaign():
+    # The uid already carries model/dataset/arm/seed, so a single group puts
+    # every reported run in one dump directory -- which is what Fig 5 reads.
+    assert _ce_config()["group_id"] == fc.FINAL_GROUP_ID == "ftfinal"
+
+
+@pytest.mark.parametrize("arm,mod_name", [
+    ("ce", "finetune_jax"), ("ibprobit_noeps", "finetune_jax"),
+    ("vbll", "finetune_vbll"),
+])
+def test_every_arm_and_seed_gets_a_distinct_run_name(arm, mod_name):
+    """The property MLflow actually needs, checked through the real parsers.
+
+    Run names collided during tuning because trial numbers restart per study --
+    63 names were shared across arms, and matching on one grafted another arm's
+    curve onto VBLL. The final campaign's uid is keyed on arm and seed, so this
+    pins that it stays that way in BOTH frameworks.
+    """
+    import importlib
+    mod = importlib.import_module(mod_name)
+    params = {"ce": CE_BEST,
+              "ibprobit_noeps": {"lr": 2.6e-5, "weight_decay": 3.3e-5,
+                                 "q_init": 3.7e-5, "num_update_iters": 512},
+              "vbll": {"lr": 1.5e-5, "weight_decay": 1.4e-3,
+                       "head_lr_ratio": 326.0, "kl_ratio": 3e-7,
+                       "prior_scale": 1.7e-3}}[arm]
+    names = set()
+    for seed in fs.REPORTED_SEEDS[:5]:
+        config = fc.final_config(arm, params, effective_batch=512,
+                                 from_samples=TUNE_SAMPLES,
+                                 model="dinov3_huge", seed=seed)
+        args = mod.build_argparser().parse_args(adapters.config_to_argv(config))
+        names.add(mod.resolve_uid(args))
+    assert len(names) == 5, names
+    assert all("dinov3_huge" in n and "seed" in n for n in names)

@@ -50,6 +50,12 @@ FINAL_EVAL_SPLITS = "val+test"
 # config dict into that script's argv.
 MLFLOW_EXPERIMENT = "bllarse-finetuning"
 
+# One group for the whole final campaign, not one per arm. The uid already
+# carries model, dataset, arm and seed, so a single group puts every reported
+# run under one dump directory -- which is what Fig 5 reads, since it plots the
+# arms against each other rather than one at a time.
+FINAL_GROUP_ID = "ftfinal"
+
 
 def absolute_params(
     params: Mapping[str, Any], *, effective_batch: int
@@ -97,6 +103,8 @@ def final_config(
     to_batch: int | None = None,
     n_train: int = imagenet.IMAGENET_N_TRAIN,
     dump_root: Any = None,
+    seed: int = space.REPORTED_SEEDS[0],
+    group_id: str = FINAL_GROUP_ID,
     eval_splits: str = FINAL_EVAL_SPLITS,
     enable_mlflow: bool = True,
     mlflow_experiment: str = MLFLOW_EXPERIMENT,
@@ -147,6 +155,14 @@ def final_config(
     config["max_samples"] = 0
     config["epochs"] = epochs
     config["eval_splits"] = eval_splits
+    # The final campaign is 5 seeds per arm, and NOTHING upstream supplies one:
+    # trial_config never sets a seed because objective.evaluate passes it for
+    # tuning trials, and the final runs have no such wrapper. Without this every
+    # seed of every arm would run at the scripts' default 137 -- five identical
+    # runs reported as an error bar -- and would collide on one MLflow run name,
+    # because the uid the scripts derive is keyed on the seed.
+    config["seed"] = seed
+    config["group_id"] = group_id
     # Overrides trial_config's tuning experiment: same flag, same scripts, but
     # a reported 4-epoch run does not belong in the search's experiment.
     config["enable_mlflow"] = enable_mlflow

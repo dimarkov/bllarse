@@ -907,3 +907,47 @@ def test_the_shard_path_and_the_jpeg_path_yield_identical_micro_batches(tmp_path
     for (ji, jl), (si, sl) in zip(jpeg, sharded):
         np.testing.assert_array_equal(np.asarray(ji), np.asarray(si))
         np.testing.assert_array_equal(np.asarray(jl), np.asarray(sl))
+
+
+# --- The MLflow run is named before it opens --------------------------------
+
+
+def test_the_run_is_named_from_the_resolved_uid_not_from_None(monkeypatch):
+    """Ordering bug: the uid default used to be computed inside the training
+    body, which runs AFTER child_run has already created and named the run.
+
+    Tuning never exposed it -- finetune_worker passes uid=trialNNNNN -- but the
+    final campaign passes no uid, so every run would have been created with
+    uid=None before the real one was derived.
+    """
+    import contextlib
+    seen = {}
+
+    @contextlib.contextmanager
+    def fake_child_run(config, *, run_name, tags=None, **kw):
+        seen["run_name"] = run_name
+        seen["tags"] = dict(tags or {})
+        yield None
+
+    monkeypatch.setattr(fj, "child_run", fake_child_run)
+    monkeypatch.setattr(fj, "_train", lambda *a, **k: None)
+    args = fj.build_argparser().parse_args([
+        "--arm", "ce", "--batch-size", "512", "--micro-batch-size", "32",
+        "--model", "dinov3_huge", "--seed", "141",
+    ])
+    fj.main(args)
+    assert seen["run_name"] == "dinov3_huge_imagenet1k_ce_seed141"
+    assert seen["tags"]["uid"] == seen["run_name"]
+    assert seen["tags"]["arm"] == "ce"
+
+
+def test_resolve_uid_is_idempotent_and_respects_an_explicit_uid():
+    args = fj.build_argparser().parse_args(
+        ["--arm", "ce", "--batch-size", "512", "--micro-batch-size", "32",
+         "--seed", "137"])
+    first = fj.resolve_uid(args)
+    assert fj.resolve_uid(args) == first
+    args2 = fj.build_argparser().parse_args(
+        ["--arm", "ce", "--batch-size", "512", "--micro-batch-size", "32",
+         "--uid", "trial00007"])
+    assert fj.resolve_uid(args2) == "trial00007"

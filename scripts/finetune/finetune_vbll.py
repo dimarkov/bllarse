@@ -349,6 +349,29 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+def default_uid(args) -> str:
+    """The run's identity: model, dataset, arm and seed."""
+    return f"{args.model}_{args.dataset}_vbll_seed{args.seed}"
+
+
+def resolve_uid(args) -> str:
+    """Set `args.uid` from the run's identity if it was not passed explicitly.
+
+    Called from `main` BEFORE the MLflow run opens, not from `_train`. That
+    ordering is the whole point: `child_run` names the run from `args.uid`, and
+    when the default was computed inside `_train` the run had already been
+    created with uid=None. Tuning never showed it -- finetune_worker passes
+    uid=trialNNNNN -- but the final campaign passes no uid at all, so every seed
+    of every arm would have landed under one nameless run.
+
+    Idempotent, so `_train` may still be called directly (the contract tests do)
+    without the default being computed twice or differently.
+    """
+    if getattr(args, "uid", None) is None:
+        args.uid = default_uid(args)
+    return args.uid
+
+
 def _train(args, on_dump=None, run=None) -> None:
     check_required_flags(args)
 
@@ -373,7 +396,7 @@ def _train(args, on_dump=None, run=None) -> None:
         # parsed dataset would print "imagenet1k_vbll" as a dataset name.
         # Tuning trials never hit this path; finetune_worker passes
         # uid=f"trial{n:05d}".
-        args.uid = f"{args.model}_{args.dataset}_vbll_seed{args.seed}"
+        args.uid = default_uid(args)
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -571,13 +594,14 @@ def main(args, on_dump=None) -> None:
     objective.EarlyConvergence from patience -- propagate untouched. child_run
     marks those KILLED rather than FAILED; see BY_DESIGN_EXCEPTIONS.
     """
+    resolve_uid(args)
     with child_run(
         vars(args),
-        run_name=args.uid or f"{args.group_id}",
+        run_name=args.uid,
         tags={
             "arm": getattr(args, "arm", "vbll"),
             "group_id": args.group_id,
-            "uid": str(args.uid),
+            "uid": args.uid,
             "model": args.model,
             "dump_dir": str(Path(args.dump_root) / args.group_id / str(args.uid)),
         },
