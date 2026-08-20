@@ -137,3 +137,19 @@ def test_it_disables_cuda_graph_command_buffers_for_the_jax_arm():
     assert "env_args=(" in live_text
     env_args_block = live_text.split("env_args=(", 1)[1].split(")", 1)[0]
     assert "XLA_FLAGS=--xla_gpu_enable_command_buffer=" in env_args_block
+
+
+def test_it_forwards_an_optional_completed_trial_target():
+    """Sizes a top-up submission by where the study should END UP rather than
+    by how many trials it starts. Optional, and guarded by a non-empty test:
+    an unset variable must reproduce the previous behaviour exactly rather than
+    passing an empty string, which argparse would reject as an int and kill
+    every task at job start."""
+    text = SCRIPT.read_text()
+    assert 'if [[ -n "${BLLARSE_TUNE_TARGET_COMPLETE:-}" ]]; then' in text
+    assert "--target-complete" in text
+    # Not in the required-variable list, which exits 2.
+    required = text[text.index("for var in"):text.index("done", text.index("for var in"))]
+    assert "BLLARSE_TUNE_TARGET_COMPLETE" not in required
+    # Appended AFTER the array is constructed, or the += would be lost.
+    assert text.index("worker_args=(") < text.index("--target-complete")

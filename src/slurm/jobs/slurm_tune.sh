@@ -145,6 +145,37 @@ worker_args=(
   --patience "${BLLARSE_TUNE_PATIENCE:-40}"
   --cache-dir "$cache_dir"
 )
+# Optional. Stops every worker once the STUDY reaches this many COMPLETED
+# trials, counting what earlier submissions already left in the journal -- so a
+# top-up submission is sized by where the study should END UP rather than by
+# guessing how many of the trials it starts will survive the pruner. That guess
+# is what went wrong in the first campaign: at a fixed 16 trials per worker,
+# prune rates of 8%-72% turned the same request into 40 completed trials for
+# adamw_ce/food101 and 103 for ibprobit/cifar10.
+#
+# BLLARSE_TUNE_TRIALS remains the per-worker cap and still bounds the job.
+if [[ -n "${BLLARSE_TUNE_TARGET_COMPLETE:-}" ]]; then
+  worker_args+=(--target-complete "$BLLARSE_TUNE_TARGET_COMPLETE")
+fi
+
+# Optional. Scores trials on the lowest MEAN val_nll over a window of this
+# fraction of the evaluation grid, instead of on its single-point minimum.
+#
+# The minimum is the deepest dip of the trajectory. On a configuration that
+# never converges that measures the noise, not the level reached -- measured on
+# probing/oxford_pets/dinov3_huge, the tuned lr 0.0182 oscillates with a
+# late-phase sd 0.53x its own median and the search preferred it to lr 0.0024,
+# which is 13x more stable AND 0.032 better on test NLL. Only the arms with a
+# learning rate can exploit that; IBProbit's closed-form update has no dips to
+# mine, so the bias is not symmetric across the arms being compared.
+#
+# THIS CHANGES THE OBJECTIVE, so it demands a new BLLARSE_TUNE_CAMPAIGN -- see
+# the guard in submit_tune.sh. Mixing two objectives inside one study gives TPE
+# a value column where half the rows mean something different.
+if [[ -n "${BLLARSE_TUNE_SMOOTH_WINDOW:-}" ]]; then
+  worker_args+=(--smooth-window "$BLLARSE_TUNE_SMOOTH_WINDOW")
+fi
+
 # Optional, and unset reproduces the first campaign's unsuffixed study names.
 # Set it whenever the search space has changed: the worker opens studies with
 # load_if_exists, so an unsuffixed re-run resumes the old study instead of

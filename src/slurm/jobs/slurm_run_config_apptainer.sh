@@ -95,6 +95,21 @@ env_args=(
   # never pip-installed into the image. Harmless for the JAX arm, which simply
   # never imports it.
   --env "PYTHONPATH=${repo_root}/src:${repo_root}/scripts/vbll_pytorch/src${PYTHONPATH:+:${PYTHONPATH}}"
+  # Unconditional, not arm-gated: harmless on the torch/VBLL image, which never
+  # touches XLA for training. On the JAX arm it is load-bearing. Without it,
+  # runs die mid-training with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED:
+  # operation not permitted when stream is capturing` inside jit__ce_step,
+  # followed by `cuda_command_buffer.cc:862] CUDA error: Failed to destroy CUDA
+  # graph` and a fatal cublasLtMatmul INTERNAL error -- XLA's CUDA-graph
+  # command-buffer capture colliding with `XLA_PYTHON_CLIENT_ALLOCATOR=platform`
+  # from bllarse-jax.def's %environment.
+  #
+  # slurm_tune.sh carried this fix from 2026-08; THIS script did not, so every
+  # probing sweep since has been exposed to it. It surfaced again on 2026-08-20,
+  # killing 2 of 128 tasks in the win5 Fig1/Fig2 submission. Do NOT remove it
+  # "because it looks like a no-op flag" -- the empty value disables command
+  # buffers entirely, which is the point.
+  --env "XLA_FLAGS=--xla_gpu_enable_command_buffer="
 )
 [[ -n "${HF_TOKEN:-}" ]] && env_args+=(--env "HF_TOKEN=$HF_TOKEN")
 [[ -n "${HF_HOME:-}" ]] && env_args+=(--env "HF_HOME=$HF_HOME")

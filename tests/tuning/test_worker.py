@@ -394,3 +394,163 @@ def test_every_arm_has_a_training_script():
     gives a worker that accepts --arm and then dies inside its first trial."""
     from bllarse.tuning import objective
     assert set(worker.space.ARMS) == set(objective.SCRIPTS)
+
+
+def _toy_study(tmp_path, name="toy"):
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    return optuna.create_study(
+        study_name=name,
+        storage=JournalStorage(JournalFileBackend(str(tmp_path / f"{name}.log"))),
+        load_if_exists=True,
+    )
+
+
+def test_the_completed_count_ignores_pruned_and_failed_trials(tmp_path):
+    """The whole reason `--target-complete` exists. `--n-trials` counts trials
+    STARTED, and the pruner kills 8%-72% of them depending on the study, so the
+    same request produced 40 completed trials on adamw_ce/food101 and 103 on
+    ibprobit/cifar10. Only a count of what SURVIVED can express "search every
+    arm to the same depth"."""
+    study = _toy_study(tmp_path)
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 1.0)
+        if trial.number % 3 == 1:
+            raise optuna.TrialPruned()
+        if trial.number % 3 == 2:
+            raise RuntimeError("boom")
+        return x
+
+    study.optimize(objective, n_trials=9, catch=(Exception,))
+    assert len(study.trials) == 9
+    assert worker.n_completed(study) == 3
+
+
+def test_target_complete_stops_the_worker_and_counts_earlier_submissions(tmp_path):
+    """A top-up submission must be sized by where the study should END UP, not
+    by how many trials this particular job adds -- so the callback reads the
+    journal, which already holds every earlier submission's trials."""
+    study = _toy_study(tmp_path)
+    study.optimize(lambda t: t.suggest_float("x", 0.0, 1.0), n_trials=6)
+    assert worker.n_completed(study) == 6
+
+    # A generous per-worker cap: the target, not the cap, must end the run.
+    study.optimize(
+        lambda t: t.suggest_float("x", 0.0, 1.0),
+        n_trials=500,
+        callbacks=[worker.stop_at_completed(10)],
+    )
+    # Stopping is checked AFTER a trial completes, so the target is a floor.
+    # Exactly 10 for a single worker; four would overshoot by up to three.
+    assert worker.n_completed(study) == 10
+
+
+def test_target_complete_yields_to_the_per_worker_cap_when_unreachable(tmp_path):
+    """--n-trials still bounds the job. A study whose trials all get pruned
+    would otherwise sit on a GPU until the 24h wall, having produced nothing."""
+    study = _toy_study(tmp_path)
+
+    def always_pruned(trial):
+        trial.suggest_float("x", 0.0, 1.0)
+        raise optuna.TrialPruned()
+
+    study.optimize(
+        always_pruned, n_trials=5, callbacks=[worker.stop_at_completed(100)]
+    )
+    assert worker.n_completed(study) == 0
+    assert len(study.trials) == 5
+
+
+def test_the_worker_accepts_target_complete_on_the_command_line():
+    args = worker.build_argparser().parse_args(
+        ["--arm", "vbll", "--dataset", "dtd", "--n-trials", "40",
+         "--storage-dir", "/tmp/x", "--target-complete", "100"]
+    )
+    assert args.target_complete == 100
+    # Absent means the flag is off, NOT zero -- zero would stop every worker
+    # before its first trial.
+    assert worker.build_argparser().parse_args(
+        ["--arm", "vbll", "--dataset", "dtd", "--n-trials", "40",
+         "--storage-dir", "/tmp/x"]
+    ).target_complete is None
+
+
+def test_smoothed_scoring_reproduces_the_measured_ranking_inversion():
+    """Regression test for the defect, using the shape actually measured on
+    probing/oxford_pets/dinov3_huge: the tuned lr 0.0182 oscillates (late sd
+    0.53x its median, spikes to 3.2x) and dips below a stable config that is
+    0.032 BETTER on test NLL. The single-point minimum ranks the unstable run
+    ahead; the windowed mean must not."""
+    from bllarse.tuning.objective import best_window_mean
+
+    # Stable run: holds ~0.20. Unstable: sits at ~0.24 with periodic spikes to
+    # 0.79 and occasional dips to 0.187 -- the dips are what tuning selected on.
+    stable = [0.205, 0.200, 0.198, 0.202, 0.199] * 24
+    unstable = ([0.240, 0.187, 0.790, 0.250, 0.235] * 24)
+
+    assert min(unstable) < min(stable), "the measured inversion must be present"
+    assert best_window_mean(stable, 12) < best_window_mean(unstable, 12)
+
+
+def test_the_worker_accepts_smooth_fraction_and_records_the_window(tmp_path):
+    args = worker.build_argparser().parse_args(
+        ["--arm", "adamw_ce", "--dataset", "oxford_pets", "--n-trials", "1",
+         "--storage-dir", str(tmp_path), "--smooth-window", "5"]
+    )
+    assert args.smooth_window == 5
+    # Absent means the OLD objective, not a zero-width window.
+    assert worker.build_argparser().parse_args(
+        ["--arm", "adamw_ce", "--dataset", "oxford_pets", "--n-trials", "1",
+         "--storage-dir", str(tmp_path)]
+    ).smooth_window is None
+
+
+def test_the_objective_passes_the_SAME_window_whatever_the_batch_size(tmp_path):
+    """The window is a fixed evaluation COUNT, identical for every trial.
+
+    This test previously asserted the opposite -- that the window was derived
+    from each trial's own grid -- which encoded the defect. Sizing it off
+    `evals_planned` overran the trajectories patience actually produces (dtd:
+    a 375-evaluation window on a 79-evaluation run), turning the objective into
+    the mean of the whole run and costing dtd its best configuration.
+    """
+    from bllarse.tuning import objective as objective_mod
+
+    seen = {}
+
+    def fake_evaluate(arm, config, **kw):
+        seen[config["batch_size"]] = kw["smooth_window"]
+        return 0.5
+
+    budgets = {"oxford_pets": {"batch_size": 512, "steps": 30000, "epochs": 4286}}
+    for batch in (64, 512):
+        study = _toy_study(tmp_path, name=f"w{batch}")
+        objective = worker.make_objective(
+            "adamw_ce", "oxford_pets", budgets=budgets, dump_root=tmp_path,
+            group_id="g", smooth_window=objective_mod.DEFAULT_SMOOTH_WINDOW,
+        )
+        original = objective_mod.evaluate
+        objective_mod.evaluate = fake_evaluate
+        try:
+            study.enqueue_trial({"learning_rate": 1e-3, "weight_decay": 1e-3,
+                                 "batch_size": batch})
+            study.optimize(objective, n_trials=1)
+        finally:
+            objective_mod.evaluate = original
+
+    assert seen[64] == seen[512] == objective_mod.DEFAULT_SMOOTH_WINDOW
+
+def test_the_pruner_is_shown_the_windowed_statistic_when_smoothing_is_on():
+    """Pruner and objective must judge on the same quantity. Guarded as source
+    because the alternative is a live Optuna study plus a fake training loop,
+    and the property is a one-line coupling that regressed once already."""
+    import inspect
+
+    src = inspect.getsource(worker.make_objective)
+    assert "RunningWindow(window)" in src
+    assert "value if running is None else running.push(value)" in src
+    # The raw value must NOT be what gets reported when smoothing is active.
+    assert 'trial.report(float(scalars["val_nll"]), eval_index)' not in src

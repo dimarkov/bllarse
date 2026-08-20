@@ -138,17 +138,18 @@ def test_the_reported_campaign_actually_enables_dumps_and_ood():
     gave the reported campaign no trajectory (Fig 5) and no OOD (Fig 6) at all.
     """
     assert int(_default("BLLARSE_FT_DUMP_EVERY_K")) >= 1
-    assert int(_default("BLLARSE_FT_OOD_EVERY_K")) == 8
+    assert int(_default("BLLARSE_FT_OOD_EVERY_K")) >= 1
     assert "--ood-every-k-dumps" in JOB and "--dump-every-k-evals" in JOB
 
 
-def test_the_ood_stride_leaves_the_job_inside_the_wall():
-    """Arithmetic, not taste. One OOD pass is the whole suite preloaded.
+def test_the_trainer_pays_no_ood_forwards_at_all():
+    """What delegation is FOR, stated as the arithmetic it replaces.
 
-    At the default quantum a 4-epoch run has 78 evaluations; dumping every one
-    and striding OOD by 8 gives 9 passes. Measured eval throughput is ~0.87M
-    forwards/hour, and the job's wall is 24 h with ~17.9 h of training and
-    ~4.5 h of val+test already spent.
+    At the current stride a 4-epoch run has 78 evaluations and 39 OOD passes.
+    Inline, at the measured ~0.87M forwards/hour, that is ~4.4 h of the suite
+    on the TRAINING gpu -- on a job already near 23 h against a 24 h wall. The
+    trainer now writes a checkpoint instead, and the only cost it keeps is that
+    write.
     """
     from bllarse.finetune import imagenet as im
 
@@ -156,8 +157,36 @@ def test_the_ood_stride_leaves_the_job_inside_the_wall():
     final_steps = protocol.steps_for_samples(int(4 * 1_281_167), fs.FIXED_BATCH_SIZE)
     n_evals = final_steps // (q // fs.FIXED_BATCH_SIZE)
     n_ood = n_evals // int(_default("BLLARSE_FT_OOD_EVERY_K"))
-    hours = n_ood * sum(im.OOD_SIZES.values()) / 0.87e6
-    assert hours < 2.0, f"OOD would add {hours:.1f} h; the wall has ~1.6 h spare"
+    inline_hours = n_ood * sum(im.OOD_SIZES.values()) / 0.87e6
+    assert inline_hours > 2.0, (
+        "this stride would fit inline, so delegation is not carrying its weight"
+    )
+    # Delegated instead: the flag that moves it off the training gpu.
+    assert "--ood-checkpoint-root" in JOB
+    assert "BLLARSE_FT_CKPT_ROOT" in TEXT
+
+
+def test_the_checkpoint_write_the_trainer_keeps_is_negligible():
+    """The cost delegation ADDS, bounded rather than assumed away.
+
+    A dinov3_huge checkpoint is ~3.4 GB (840M fp32 params) and the stride
+    writes one per OOD pass. At GPFS write speeds that is minutes against a
+    ~22 h job -- but peak DISK is what needs bounding, and --ood-max-pending
+    does it: at most that many slots per run are ever resident.
+    """
+    q = int(_default("BLLARSE_FT_EVAL_QUANTUM"))
+    final_steps = protocol.steps_for_samples(int(4 * 1_281_167), fs.FIXED_BATCH_SIZE)
+    n_ood = (final_steps // (q // fs.FIXED_BATCH_SIZE)) // int(
+        _default("BLLARSE_FT_OOD_EVERY_K"))
+    gb_per_ckpt = 840e6 * 4 / 1e9
+    write_minutes = n_ood * gb_per_ckpt / 1.0 / 60      # ~1 GB/s
+    assert write_minutes < 15, f"{write_minutes:.0f} min of checkpoint writes"
+
+    max_pending = int(_default("BLLARSE_FT_OOD_MAX_PENDING"))
+    n_runs = len(_default("BLLARSE_FT_SEEDS").split()) * len(
+        _default("BLLARSE_FT_ARMS").split())
+    peak_gb = max_pending * gb_per_ckpt * n_runs
+    assert peak_gb < 200, f"peak checkpoint residency {peak_gb:.0f} GB"
 
 
 def test_the_ood_preload_fits_the_jobs_memory():
@@ -193,3 +222,80 @@ def test_sketch_is_in_the_suite_and_is_not_subset_masked():
     assert "imagenet_sketch" in im.OOD_KEYS
     assert "imagenet_sketch" not in im.OOD_SUBSET_KEYS
     assert im.OOD_SUBSET_KEYS == {"imagenet_r", "imagenet_a"}
+
+
+# --- The decoupled OOD worker ------------------------------------------------
+
+WORKER = Path("src/slurm/jobs/slurm_ood_worker.sh").read_text()
+
+
+def test_ood_is_delegated_to_workers_not_run_on_the_training_gpu():
+    """The whole point: OOD costs the trainer a checkpoint write, nothing more.
+
+    Inline it was ~1 h per run and pushed a dinov3_huge 4-epoch job past its
+    24 h wall.
+    """
+    assert "BLLARSE_FT_CKPT_ROOT" in TEXT
+    assert "--ood-checkpoint-root" in JOB
+    assert "--ood-max-pending" in JOB
+    assert "ood_worker.py" in WORKER
+
+
+def test_the_stride_is_finer_now_that_it_is_off_the_critical_path():
+    # 78 evaluations at the default quantum -> 39 OOD passes. Inline that would
+    # have been ~4.5 h per run on a job already near 23 h.
+    assert int(_default("BLLARSE_FT_OOD_EVERY_K")) == 2
+
+
+def test_one_worker_per_framework_because_the_venvs_cannot_be_merged():
+    """jax[cuda] and torch each ship a full CUDA stack.
+
+    Each worker polls the same root and consumes only slots whose metadata
+    names its own framework, so neither can eat the other's checkpoints.
+    """
+    assert "BLLARSE_OOD_FRAMEWORK" in WORKER
+    assert "--framework" in WORKER
+    assert "submit_workers jax" in TEXT
+    assert "submit_workers torch" in TEXT
+    assert 'BLLARSE_FT_VBLL_VENV" "$BLLARSE_OOD_WORKERS_TORCH' in TEXT
+
+
+def test_workers_are_submitted_before_the_training_arrays():
+    # So they are draining by the time the first checkpoint lands, rather than
+    # queueing behind 15 training jobs.
+    assert TEXT.index("submit_workers jax") < TEXT.index('exports="BLLARSE_FT_ARM=')
+
+
+def test_no_workers_are_submitted_when_ood_is_off():
+    # An idle gpu is worse than no gpu.
+    block = TEXT[TEXT.index("if (( BLLARSE_FT_OOD_EVERY_K"):]
+    assert "BLLARSE_FT_DUMP_EVERY_K > 0" in block.split("\n")[0]
+
+
+def test_the_torch_worker_is_skipped_when_vbll_is_not_in_the_arms():
+    assert "grep -qw vbll" in TEXT
+
+
+def test_the_launcher_gates_on_the_ood_cache_being_ready():
+    """Only ImageNet-A was ever cached.
+
+    15 trainers plus their workers racing to download the rest is the exact
+    shape of the betas1m loss, and the existing dataset pre-flight only covers
+    imagenet-1k.
+    """
+    assert "prepare_ood_cache.py" in TEXT
+    assert "--check-only" in TEXT
+    gate = TEXT[TEXT.index("OOD cache:"):]
+    assert gate.index("exit 2") < gate.index("submit_workers")
+
+
+def test_the_worker_gets_the_same_memory_as_a_trainer():
+    # It holds the 98,389-image suite as uint8 host arrays (~14.8 GB) for its
+    # whole lifetime, same as an inline trainer would have.
+    assert "--mem=125000" in WORKER
+    assert "gres=gpu:a100:1" in WORKER
+
+
+def test_the_worker_exits_rather_than_idling_forever():
+    assert "--idle-exit-seconds" in WORKER
+    assert "BLLARSE_OOD_IDLE_EXIT" in WORKER

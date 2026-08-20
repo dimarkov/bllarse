@@ -691,3 +691,205 @@ def test_evaluate_uses_the_supplied_script_table(tmp_path, monkeypatch):
             seeds=(200,), scripts={"ce": "scripts/finetune/finetune_jax.py"},
             score=lambda *a: 0.0,
         )
+
+
+def test_best_window_mean_needs_a_level_held_not_a_single_dip():
+    """The whole point. A lone spike down cannot carry a window, so a curve that
+    only ever touches a low value scores worse than one that holds it."""
+    from bllarse.tuning.objective import best_window_mean
+
+    dips = [0.5] * 20 + [0.10] + [0.5] * 20      # touches 0.10 once
+    holds = [0.30] * 41                           # never better than 0.30
+    assert best_window_mean(dips, 1) < best_window_mean(holds, 1)      # min: dips wins
+    assert best_window_mean(holds, 10) < best_window_mean(dips, 10)    # window: holds wins
+
+
+def test_best_window_mean_penalises_a_window_containing_a_nonfinite():
+    """A run that diverges inside a window has not held that level. Dropping the
+    point instead would let a config launder a NaN excursion via good
+    neighbours."""
+    import math
+
+    from bllarse.tuning.objective import best_window_mean
+
+    clean = [0.2] * 10
+    spoiled = [0.2] * 5 + [float("nan")] + [0.2] * 4
+    assert best_window_mean(clean, 10) == pytest.approx(0.2)
+    assert math.isinf(best_window_mean(spoiled, 10))
+    # ...but a window that clears the excursion is still scored.
+    assert best_window_mean([0.2] * 10 + [float("inf")], 5) == pytest.approx(0.2)
+
+
+def test_best_window_mean_clamps_a_window_longer_than_the_run():
+    from bllarse.tuning.objective import best_window_mean
+
+    assert best_window_mean([0.4, 0.2], 50) == pytest.approx(0.3)
+
+
+def test_the_smoothing_window_is_a_FIXED_COUNT_not_a_fraction_of_the_plan():
+    """Regression test for the defect that cost dtd its best configuration.
+
+    An earlier version sized the window at 10% of `evals_planned`. Patience
+    truncates runs far below their budget, so that window OVERRAN the data --
+    dtd's best config planned 3,750 evaluations, ran 79, and got a window of
+    375, which `best_window_mean` clamps to the trajectory length. The objective
+    silently became "mean of the whole run", charging a config for every point
+    after its minimum, and ranked the genuinely best config 88th of 100.
+    """
+    from bllarse.tuning.objective import DEFAULT_SMOOTH_WINDOW, best_window_mean
+
+    assert isinstance(DEFAULT_SMOOTH_WINDOW, int)
+    # Must fit inside the SHORTEST trajectory actually observed (71 on dtd),
+    # or it degenerates into the mean of the whole run for that trial.
+    assert 1 < DEFAULT_SMOOTH_WINDOW <= 20
+
+    # The shape that broke: a real minimum mid-run, followed by mild overfitting.
+    curve = [1.14, 0.48, 0.43, 0.411, 0.415, 0.427, 0.430, 0.428] * 10
+    whole_run = best_window_mean(curve, len(curve))
+    windowed = best_window_mean(curve, DEFAULT_SMOOTH_WINDOW)
+    assert windowed < whole_run, (
+        "a window spanning the whole trajectory cannot see the minimum at all"
+    )
+    assert windowed < 0.43, "the real minimum must still be visible"
+
+
+def test_smoothing_off_leaves_the_scoring_path_untouched():
+    """The fine-tuning campaign shares `evaluate` and was in flight when this
+    landed, so the default must not acquire a per-evaluation side effect."""
+    import inspect
+
+    from bllarse.tuning import objective
+
+    src = inspect.getsource(objective.evaluate)
+    assert "if smooth_window is not None:" in src
+    assert objective.evaluate.__kwdefaults__["smooth_window"] is None
+
+
+def test_running_window_matches_best_window_mean_on_complete_windows():
+    """The O(1) pruner view must agree with the O(n) objective wherever both
+    are defined -- once a full window exists, the running minimum IS the lowest
+    complete-window mean."""
+    import random
+
+    from bllarse.tuning.objective import RunningWindow, best_window_mean
+
+    rng = random.Random(20260812)
+    values = [rng.uniform(0.1, 0.9) for _ in range(200)]
+    w = 12
+    run = RunningWindow(w)
+    for v in values:
+        run.push(v)
+    assert run.best == pytest.approx(best_window_mean(values, w))
+
+
+def test_running_window_reports_a_prefix_mean_before_the_window_fills():
+    """The pruner needs a comparable number from the first evaluation. Trials
+    are only ever compared at equal eval index, so a deterministic function of
+    the prefix is sufficient."""
+    from bllarse.tuning.objective import RunningWindow
+
+    run = RunningWindow(10)
+    assert run.push(0.4) == pytest.approx(0.4)
+    assert run.push(0.2) == pytest.approx(0.3)   # mean, not min
+
+
+def test_running_window_does_not_latch_onto_a_lucky_first_evaluation():
+    """A running MINIMUM over prefixes would let evaluation 1 set a floor for
+    the whole run -- the dip-sensitivity this class removes, reintroduced at the
+    start of every trial. The prefix mean must rise when the run gets worse."""
+    from bllarse.tuning.objective import RunningWindow
+
+    run = RunningWindow(50)          # never fills, so this is the prefix regime
+    first = run.push(0.01)           # one lucky evaluation
+    later = [run.push(0.9) for _ in range(9)]
+    assert first == pytest.approx(0.01)
+    assert later[-1] > 0.5, "a lucky first point must not pin the report"
+
+
+def test_running_window_rejects_a_window_spanning_a_nonfinite():
+    """Same rule as best_window_mean: a run that diverged has not held that
+    level, so the window scores +inf rather than skipping the point."""
+    import math
+
+    from bllarse.tuning.objective import RunningWindow
+
+    run = RunningWindow(3)
+    run.push(0.2); run.push(0.2); run.push(0.2)
+    assert run.best == pytest.approx(0.2)
+    run.push(float("nan"))          # window now spans the nan
+    assert run.best == pytest.approx(0.2)   # the earlier clean window survives
+    clean = RunningWindow(3)
+    clean.push(float("nan")); clean.push(0.2); clean.push(0.2)
+    assert math.isinf(clean.best)   # never held a clean window
+
+
+def test_the_windowed_pruner_view_prefers_a_held_level_over_a_lone_dip():
+    """The defect this fixes. MedianPruner compares what trials REPORT. Under
+    the raw statistic a spiky config reports a low value the moment it dips and
+    survives, while a steady config reports its honest level and is killed --
+    the pruner selecting for exactly what the objective penalises. Measured on
+    the `smoothed` campaign: 11 of 21 winners came from the un-prunable first 20
+    trials, median winner position 7% against 42% previously."""
+    from bllarse.tuning.objective import RunningWindow
+
+    spiky = [0.5] * 8 + [0.10] + [0.5] * 8
+    steady = [0.30] * 17
+
+    raw_spiky, raw_steady = min(spiky), min(steady)
+    assert raw_spiky < raw_steady, "raw reporting favours the dip"
+
+    a, b = RunningWindow(8), RunningWindow(8)
+    for v in spiky:
+        a.push(v)
+    for v in steady:
+        b.push(v)
+    assert b.best < a.best, "windowed reporting must favour the held level"
+
+
+def test_jit_caches_are_cleared_after_every_run(tmp_path, monkeypatch):
+    """Both arms reach JAX -- VBLL trains in PyTorch but scores through
+    bllarse.metrics, whose fit_temperature is a jitted lax.scan. Trials vary
+    batch_size, so the compilation cache grows monotonically over a worker's
+    hundreds of trials until the CPU JIT cannot allocate. That killed all four
+    tune_vbll_flowers102 workers at ~177 trials, one trial short of target.
+
+    Asserted per SEED, not per trial: a two-seed trial would otherwise carry the
+    first seed's kernels into the second.
+    """
+    calls = []
+    monkeypatch.setattr(objective, "clear_jit_caches", lambda: calls.append(1))
+
+    class FakeModule:
+        @staticmethod
+        def build_argparser():
+            import argparse
+            p = argparse.ArgumentParser()
+            for f in ("--seed", "--uid", "--group-id", "--dump-root"):
+                p.add_argument(f, type=int if f == "--seed" else str)
+            return p
+
+        @staticmethod
+        def main(args, on_dump=None):
+            _write_curve(args.dump_root, args.group_id, args.uid, best_nll_at=2)
+
+    monkeypatch.setattr(
+        objective.adapters, "load_script_module", lambda path: FakeModule
+    )
+    objective.evaluate("adamw_ce", {}, dump_root=tmp_path, group_id="t", uid="t0")
+    assert len(calls) == len(objective.TUNING_SEEDS)
+
+
+def test_clearing_is_best_effort_and_never_fails_a_trial(monkeypatch):
+    """A jax that is missing or too old to expose clear_caches must not turn
+    cleanup into a trial failure."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def boom(name, *a, **k):
+        if name == "jax":
+            raise ImportError("no jax here")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", boom)
+    objective.clear_jit_caches()   # must not raise

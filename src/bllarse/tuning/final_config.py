@@ -139,6 +139,8 @@ def final_config(
     mlflow_experiment: str = MLFLOW_EXPERIMENT,
     dump_every_k_evals: int | None = None,
     ood_every_k_dumps: int | None = None,
+    ood_checkpoint_root: str | None = None,
+    ood_max_pending: int | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
     """The final campaign's config for `arm`, transferred from a tuned trial.
@@ -224,6 +226,12 @@ def final_config(
     # them explicitly or it silently produces no trajectory and no OOD at all.
     if ood_every_k_dumps is not None:
         config["ood_every_k_dumps"] = ood_every_k_dumps
+    # With a checkpoint root the trainer writes slots instead of forwarding the
+    # suite, and scripts/finetune/ood_worker.py scores them on another gpu.
+    if ood_checkpoint_root is not None:
+        config["ood_checkpoint_root"] = str(ood_checkpoint_root)
+    if ood_max_pending is not None:
+        config["ood_max_pending"] = ood_max_pending
     if model is not None:
         config["model"] = model
 

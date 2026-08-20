@@ -53,11 +53,22 @@ set -euo pipefail
 # Fig 5 is CURVES, so every evaluation is dumped. Fig 6 scores the same
 # trajectory under shift, and OOD rides a stride of that dump grid.
 : "${BLLARSE_FT_DUMP_EVERY_K:=1}"
-# Every 8th dump: 78 evaluations at the default quantum means 9 OOD passes.
-# One pass is 98,389 images (R 30,000 + A 7,500 + V2 10,000 + Sketch 50,889),
-# so 9 passes is ~0.89M forwards, about 1 h -- which is what keeps the job
-# inside the 24 h wall at roughly 23.4 h total.
-: "${BLLARSE_FT_OOD_EVERY_K:=8}"
+# Every 2nd dump, which the trainer could not have afforded. OOD now runs on
+# SEPARATE gpus (slurm_ood_worker.sh) reading checkpoint slots, so its cost is
+# the eval workers' wall clock rather than the trainers'. 78 evaluations at the
+# default quantum gives 39 OOD passes; inline that would have been ~4.5 h per
+# run on top of a job already near 23 h.
+: "${BLLARSE_FT_OOD_EVERY_K:=2}"
+
+# Where trainers drop checkpoints for the workers. A dinov3_huge checkpoint is
+# ~3.4 GB, and --ood-max-pending bounds how many can accumulate per run.
+: "${BLLARSE_FT_CKPT_ROOT:=/ptmp/${USER}/ft_ckpt}"
+: "${BLLARSE_FT_OOD_MAX_PENDING:=2}"
+# One worker per framework, plus however many parallel consumers each needs.
+# The JAX workers serve ce and ibprobit_noeps (10 runs), the torch worker vbll
+# (5), which is why they are sized separately.
+: "${BLLARSE_OOD_WORKERS_JAX:=2}"
+: "${BLLARSE_OOD_WORKERS_TORCH:=1}"
 : "${BLLARSE_FT_THROTTLE:=5}"
 : "${BLLARSE_FT_VENV:=}"
 : "${BLLARSE_FT_SHARDS:=/ptmp/${USER}/shards}"
@@ -160,10 +171,51 @@ export BLLARSE_FT_STORAGE BLLARSE_FT_CAMPAIGN
 echo "Studies:" >&2
 for arm in $BLLARSE_FT_ARMS; do check_study "$arm"; done
 
+# The OOD suite has to be CACHED before anything runs. Only ImageNet-A was,
+# once, and 15 trainers plus their workers racing to download the rest is the
+# exact shape of the betas1m loss. prepare_ood_cache.py --check-only resolves
+# offline and exits non-zero with what is missing.
+echo "OOD cache:" >&2
+if ! HF_HOME="${BLLARSE_HF_HOME:-$HOME/.cache/huggingface}" \
+     PYTHONPATH="${repo_root}/src" "$BLLARSE_FT_VENV" \
+     "${repo_root}/scripts/finetune/prepare_ood_cache.py" --check-only >&2; then
+  echo "ERROR: the OOD suite is not fully cached. Prepare it ONCE with" >&2
+  echo "       src/slurm/jobs/slurm_prepare_ood.sh, then re-run this." >&2
+  exit 2
+fi
+
 read -r -a _seeds <<< "$BLLARSE_FT_SEEDS"
 n_seeds=${#_seeds[@]}
 echo "Submitting ${n_seeds} seeds x $(wc -w <<< "$BLLARSE_FT_ARMS") arms" \
      "on ${BLLARSE_FT_MODEL} for ${BLLARSE_FT_EPOCHS} epochs" >&2
+
+# Workers FIRST, so they are already draining by the time the first checkpoint
+# lands. They exit on their own after BLLARSE_OOD_IDLE_EXIT with nothing to do,
+# so an over-provisioned worker costs idle time rather than a stuck allocation.
+submit_workers() {
+  local framework="$1" venv="$2" n="$3"
+  (( n > 0 )) || return 0
+  local wexports="BLLARSE_FT_VENV=${venv}"
+  wexports+=",BLLARSE_FT_CKPT_ROOT=${BLLARSE_FT_CKPT_ROOT}"
+  wexports+=",BLLARSE_OOD_FRAMEWORK=${framework}"
+  wexports+=",BLLARSE_EVAL_DUMP_ROOT=${BLLARSE_EVAL_DUMP_ROOT:-${repo_root}/eval_dumps}"
+  [[ -n "${BLLARSE_HF_HOME:-}" ]] && wexports+=",BLLARSE_HF_HOME=${BLLARSE_HF_HOME}"
+  [[ -n "${BLLARSE_FT_PYLIBS:-}" ]] && wexports+=",BLLARSE_FT_PYLIBS=${BLLARSE_FT_PYLIBS}"
+  local wcmd=(sbatch
+    --job-name "ftood_${framework}_${BLLARSE_FT_CAMPAIGN}"
+    --array "0-$((n - 1))"
+    --export "ALL,${wexports}"
+    "${repo_root}/src/slurm/jobs/slurm_ood_worker.sh")
+  if [[ -n "$BLLARSE_FT_DRY_RUN" ]]; then printf '%q ' "${wcmd[@]}"; echo
+  else "${wcmd[@]}"; fi
+}
+
+if (( BLLARSE_FT_OOD_EVERY_K > 0 )) && (( BLLARSE_FT_DUMP_EVERY_K > 0 )); then
+  submit_workers jax "$BLLARSE_FT_VENV" "$BLLARSE_OOD_WORKERS_JAX"
+  if grep -qw vbll <<< "$BLLARSE_FT_ARMS"; then
+    submit_workers torch "$BLLARSE_FT_VBLL_VENV" "$BLLARSE_OOD_WORKERS_TORCH"
+  fi
+fi
 
 for arm in $BLLARSE_FT_ARMS; do
   venv="$BLLARSE_FT_VENV"
@@ -186,6 +238,8 @@ for arm in $BLLARSE_FT_ARMS; do
     exports+=",BLLARSE_FT_PYLIBS=${BLLARSE_FT_PYLIBS}"
   exports+=",BLLARSE_FT_DUMP_EVERY_K=${BLLARSE_FT_DUMP_EVERY_K}"
   exports+=",BLLARSE_FT_OOD_EVERY_K=${BLLARSE_FT_OOD_EVERY_K}"
+  exports+=",BLLARSE_FT_CKPT_ROOT=${BLLARSE_FT_CKPT_ROOT}"
+  exports+=",BLLARSE_FT_OOD_MAX_PENDING=${BLLARSE_FT_OOD_MAX_PENDING}"
 
   cmd=(sbatch
        --job-name "ftfinal_${arm}_${BLLARSE_FT_CAMPAIGN}"

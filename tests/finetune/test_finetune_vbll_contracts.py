@@ -165,3 +165,42 @@ def test_every_hf_checkpoint_has_a_registry_entry():
 
     for name in fv.HF_CHECKPOINTS:
         assert name in EQUIMO_MODELS
+
+
+# --- OOD parity with the JAX arms -------------------------------------------
+
+
+def test_vbll_masks_r_and_a_exactly_as_the_jax_arms_do():
+    """Without this the arms are scored on different predictives.
+
+    R and A cover 200 classes, so the JAX arms mask the other 800 before
+    scoring. A VBLL arm scored on the full 1000-way predictive over the same
+    images would produce OOD numbers that are not comparable -- and nothing
+    downstream would show it, because both look like valid dumps.
+    """
+    import inspect
+
+    import numpy as np
+
+    from bllarse.finetune import imagenet as im
+
+    sig = inspect.signature(fv.evaluate_split)
+    assert "subset" in sig.parameters
+    assert sig.parameters["subset"].default is None
+    # The sentinel is shared, not re-spelled, so the two arms cannot drift.
+    assert im.MASK_NEG == -1e4
+    src = inspect.getsource(fv.evaluate_split)
+    assert "imagenet.MASK_NEG" in src
+    assert "np.where" in src
+
+
+def test_both_arms_load_the_same_ood_suite_from_one_place():
+    """The loader used to live in finetune_jax.
+
+    That left the torch arm with no way to reach it without importing jax, so
+    VBLL would silently have had no OOD at all.
+    """
+    from bllarse.finetune import imagenet as im
+
+    assert hasattr(im, "load_ood_sets")
+    assert hasattr(fv, "load_ood_sets")

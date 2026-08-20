@@ -238,7 +238,7 @@ def test_an_all_nonfinite_curve_raises_rather_than_scoring():
 
 
 def test_every_stage4_sweep_has_a_figure_group_that_reads_it():
-    """A sweep whose GROUP_ID no figure script knows about burns its GPU time
+    """A sweep whose GROUP_ID no script knows about burns its GPU time
     and then contributes nothing -- silently, because both figure scripts skip
     a missing directory with `if not os.path.isdir(directory): continue`.
 
@@ -250,16 +250,28 @@ def test_every_stage4_sweep_has_a_figure_group_that_reads_it():
     sys.path.insert(0, "bllarse_sweeps")
     sys.path.insert(0, "scripts/analysis")
 
-    for fig, sweeps in (
-        ("fig1_curves", ["probe_adamw_ce", "probe_vbll",
-                         "probe_ibprobit", "probe_ibprobit_noeps"]),
-        ("fig2_detection", ["probe_ood_adamw_ce", "probe_ood_vbll",
-                            "probe_ood_ibprobit", "probe_ood_ibprobit_noeps"]),
-    ):
-        groups = set(importlib.import_module(fig).GROUPS.values())
-        for sweep in sweeps:
-            gid = importlib.import_module(sweep).GROUP_ID
-            assert gid in groups, (
-                f"{sweep}.GROUP_ID={gid!r} is not in {fig}.GROUPS -- its runs "
-                f"would be written and then never read"
-            )
+    # Every consumer, not only the figure scripts. A sweep may legitimately be
+    # read by an ANALYSIS instead: the eps-tuned arms are ablations, deliberately
+    # dropped from the figures' GROUPS (42a15ee) and read by eps_ablation.py.
+    # Checking figures alone flagged that correct arrangement as a bug -- and,
+    # worse, made the guard look wrong so its real hit went unexamined:
+    # probe_ibprobit_fig2's 30 runs were read by nothing at all until
+    # eps_ablation grew a --figure fig2 mode.
+    eps = importlib.import_module("eps_ablation")
+    consumed = set()
+    for fig in ("fig1_curves", "fig2_detection"):
+        consumed |= set(importlib.import_module(fig).GROUPS.values())
+    for spec in eps.FIGURES.values():
+        consumed |= {spec["tuned"], spec["noeps"]}
+
+    sweeps = [
+        "probe_adamw_ce", "probe_vbll", "probe_ibprobit", "probe_ibprobit_noeps",
+        "probe_ood_adamw_ce", "probe_ood_vbll",
+        "probe_ood_ibprobit", "probe_ood_ibprobit_noeps",
+    ]
+    for sweep in sweeps:
+        gid = importlib.import_module(sweep).GROUP_ID
+        assert gid in consumed, (
+            f"{sweep}.GROUP_ID={gid!r} is read by no figure and no analysis -- "
+            f"its runs would be written and then never looked at"
+        )

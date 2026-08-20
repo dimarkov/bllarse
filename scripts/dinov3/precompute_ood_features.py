@@ -109,10 +109,26 @@ def prepare_imagenet_c(corruption, wnid_to_idx):
 def prepare_imagenet_sketch(wnid_to_idx):
     """ImageNet-Sketch: 1000 classes, so no subset mask.
 
-    Its ClassLabel names are the sorted WNIDs, the same canonical ordering
-    prepare_imagenet_c relies on, so the codes are already ImageNet indices.
+    `vaughankraska/imagenet_sketch`, NOT the canonical `songweig/imagenet_sketch`
+    or `nateraw/imagenet-sketch`: both of those are SCRIPT-based datasets, and
+    modern `datasets` refuses them outright ("Dataset scripts are no longer
+    supported"). This mirror is parquet.
+
+    Its ClassLabel names were checked against ILSVRC/imagenet-1k's and are
+    IDENTICAL IN ORDER, so its codes are already canonical ImageNet indices and
+    no WNID mapping is needed. That check matters: a mirror with the same 1000
+    names in a different order would relabel every image and produce a
+    plausible accuracy over scrambled classes.
+
+    The mirror splits the one 50,889-image set into train (40,000) and
+    validation (10,889); ImageNet-Sketch has no such split of its own, and OOD
+    evaluation wants all of it, so they are concatenated back.
     """
-    ds = load_dataset("songweig/imagenet_sketch", split="train")
+    from datasets import concatenate_datasets
+
+    parts = [load_dataset("vaughankraska/imagenet_sketch", split=name)
+             for name in ("train", "validation")]
+    ds = concatenate_datasets(parts)
     return RelabeledSplit(ds, np.asarray(ds["label"])), "image"
 
 

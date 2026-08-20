@@ -45,7 +45,7 @@ import numpy as np
 
 from bllarse import evaldump, metrics
 from bllarse.mlflow_utils import child_run
-from bllarse.finetune import imagenet, protocol
+from bllarse.finetune import checkpoint, imagenet, protocol
 from bllarse.finetune.registry import (
     DATASET_CONFIGS,
     EQUIMO_MODELS,
@@ -192,7 +192,8 @@ def stream_micro_batches(shard, micro, mean, std, total_micro, seed):
         epoch += 1
 
 
-def evaluate_split(model, head, images_uint8, labels, *, args, mean, std):
+def evaluate_split(model, head, images_uint8, labels, *, args, mean, std,
+                   subset=None):
     """Forward one preloaded eval set in chunks. Returns (logits, score, scalars).
 
     Deliberately does NOT write, mirroring finetune_jax.evaluate_split: the
@@ -222,8 +223,21 @@ def evaluate_split(model, head, images_uint8, labels, *, args, mean, std):
     model.train()
     head.train()
     logits = np.concatenate(logit_chunks, axis=0)
+    if subset is not None:
+        # R and A cover 200 classes, so the other 800 cannot occur. The JAX
+        # arms mask before scoring; without this the VBLL arm would be scored
+        # on the full 1000-way predictive over the same images and its OOD
+        # numbers would not be comparable with theirs.
+        keep = np.zeros(logits.shape[-1], dtype=bool)
+        keep[np.asarray(subset)] = True
+        logits = np.where(keep, logits, imagenet.MASK_NEG)
     return (logits, np.concatenate(score_chunks, axis=0),
             metrics.classification_metrics(logits, labels))
+
+
+def load_ood_sets(args, img_size):
+    """Same suite, same order, same masking as the JAX arms."""
+    return imagenet.load_ood_sets(img_size)
 
 
 def _write_best(args, best, last_eval_index):
@@ -291,6 +305,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--val-fraction", type=float, default=imagenet.DEFAULT_VAL_FRACTION)
     p.add_argument("--dump-every-k-evals", type=int, default=0)
     p.add_argument("--ood-every-k-dumps", type=int, default=0)
+    # See finetune_jax: the schedule is unchanged, but at those steps this run
+    # writes a checkpoint and ood_worker.py evaluates it on another gpu.
+    p.add_argument("--ood-checkpoint-root", default=None)
+    p.add_argument("--ood-max-pending", type=int, default=2)
 
     # Two rates, and the head's is NOT optional. A fresh VBLL head at the
     # trunk's rate would still be near its init after a whole epoch; see
@@ -347,6 +365,53 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cuda")
     p.add_argument("--bf16", action="store_true")
     return p
+
+
+def build_model(args, *, embed_dim, num_classes, device):
+    """(model, head) for the VBLL arm. The ONE place either is constructed.
+
+    Extracted so the OOD worker rebuilds exactly what training built, from the
+    args stored in the checkpoint. A worker with its own copy would drift
+    silently -- a different regularization_weight or cov_rank loads a
+    state_dict without complaint and scores a model that never existed.
+
+    Mirrors finetune_jax.build_model, which does the same job for the JAX arms.
+    """
+    from transformers import AutoModel
+
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[1] / "vbll_pytorch" / "src"))
+    from vbll_experiments.models import build_vbll_head
+
+    model = AutoModel.from_pretrained(HF_CHECKPOINTS[args.model]).to(device)
+    if model.config.hidden_size != embed_dim:
+        # The registry's embed_dim drives the head's input width, and a
+        # mismatch would surface as a shape error deep in vbll rather than
+        # here. It also means the two libraries disagree about which
+        # checkpoint this is.
+        raise SystemExit(
+            f"[vbll-ft] {args.model}: transformers reports hidden_size="
+            f"{model.config.hidden_size} but registry.EQUIMO_MODELS says "
+            f"{embed_dim}. The two libraries disagree about this checkpoint."
+        )
+    model.train()
+
+    head = build_vbll_head(
+        embed_dim, num_classes,
+        # eta / N, not 1 / N. eta = kl_ratio * prior_scale is the KL
+        # multiplier; shrinkage of the posterior mean goes as eta / prior_scale
+        # = kl_ratio, so searching the ratio keeps the two axes near-orthogonal.
+        # N is the FULL training set, matching the probing arm's len(train_f) --
+        # not the samples actually seen, which varies with the budget.
+        regularization_weight=(
+            args.kl_ratio * args.prior_scale / imagenet.IMAGENET_N_TRAIN),
+        prior_scale=args.prior_scale,
+        wishart_scale=args.wishart_scale,
+        parameterization=args.parameterization,
+        cov_rank=args.cov_rank,
+        vbll_type=args.vbll_type,
+    ).to(device)
+    return model, head
 
 
 def default_uid(args) -> str:
@@ -411,34 +476,9 @@ def _train(args, on_dump=None, run=None) -> None:
           f"eval every {plan['eval_every']} steps ({plan['eval_quantum']} "
           f"samples) = {plan['n_evals']} evals", flush=True)
 
-    model = AutoModel.from_pretrained(HF_CHECKPOINTS[args.model]).to(device)
-    if model.config.hidden_size != embed_dim:
-        # The registry's embed_dim drives the head's input width, and a
-        # mismatch would surface as a shape error deep in vbll rather than
-        # here. It also means the two libraries disagree about which
-        # checkpoint this is.
-        raise SystemExit(
-            f"[vbll-ft] {args.model}: transformers reports hidden_size="
-            f"{model.config.hidden_size} but registry.EQUIMO_MODELS says "
-            f"{embed_dim}. The two libraries disagree about this checkpoint."
-        )
+    model, head = build_model(
+        args, embed_dim=embed_dim, num_classes=num_classes, device=device)
     model.train()
-
-    head = build_vbll_head(
-        embed_dim, num_classes,
-        # eta / N, not 1 / N. eta = kl_ratio * prior_scale is the KL
-        # multiplier; shrinkage of the posterior mean goes as eta / prior_scale
-        # = kl_ratio, so searching the ratio keeps the two axes near-orthogonal.
-        # N is the FULL training set, matching the probing arm's len(train_f) --
-        # not the samples actually seen, which varies with the budget.
-        regularization_weight=(
-            args.kl_ratio * args.prior_scale / imagenet.IMAGENET_N_TRAIN),
-        prior_scale=args.prior_scale,
-        wishart_scale=args.wishart_scale,
-        parameterization=args.parameterization,
-        cov_rank=args.cov_rank,
-        vbll_type=args.vbll_type,
-    ).to(device)
 
     # Two param groups, two rates. weight_decay 0 on the head: see --weight-decay.
     # betas are set on the optimizer rather than per group: they are an
@@ -547,6 +587,35 @@ def _train(args, on_dump=None, run=None) -> None:
                         samples_seen=samples_seen,
                         score=score, score_kind="predictive_variance",
                     )
+
+            # Hand OOD to the worker: write a slot at the scheduled steps and
+            # move on. Slots rather than a rolling latest because
+            # curves._id_ood_pair pairs ID and OOD dumps by STEP.
+            if args.ood_checkpoint_root and args.dump_every_k_evals and (
+                    args.ood_every_k_dumps):
+                _di = eval_index // args.dump_every_k_evals
+                if eval_index >= plan["n_evals"] or (
+                        _di % args.ood_every_k_dumps == 0):
+                    _stem = checkpoint.write(
+                        args.ood_checkpoint_root,
+                        group_id=args.group_id, uid=args.uid, step=step,
+                        blob_suffix=".pt",
+                        write_blob=lambda path: torch.save(
+                            {"model": model.state_dict(),
+                             "head": head.state_dict()}, path),
+                        meta={
+                            "framework": "torch",
+                            "samples_seen": samples_seen,
+                            "eval_index": eval_index,
+                            "mlflow_run_id": getattr(run, "run_id", None),
+                            "args": vars(args),
+                        },
+                        max_pending=args.ood_max_pending,
+                    )
+                    print(f"[vbll-ft] ood checkpoint step {step}: "
+                          + ("written" if _stem else
+                             f"SKIPPED, {args.ood_max_pending} already pending"),
+                          flush=True)
 
             print(f"[vbll-ft] eval {eval_index}/{plan['n_evals']} "
                   f"step {step}/{plan['steps']} " + " ".join(

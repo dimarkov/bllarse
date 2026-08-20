@@ -114,6 +114,56 @@ OOD_PRELOAD_BYTES = sum(OOD_SIZES.values()) * 224 * 224 * 3
 # and are scored unmasked, so the suite reports both regimes.
 OOD_SUBSET_KEYS = frozenset({"imagenet_r", "imagenet_a"})
 
+# fp16-safe mask sentinel, shared by both arms so they cannot mask differently.
+#
+# evaldump.write_dump stores logits as float16 (max finite magnitude 65504) and
+# float16(-1e9) OVERFLOWS to -inf: entropy_ood_score and fit_temperature on such
+# a row silently return NaN while msp_ood_score still looks healthy, so a figure
+# would show a working MSP column beside a silently NaN entropy one. -1e4 is
+# ~340 sigma below any real logit and round-trips as a large finite number.
+MASK_NEG = -1e4
+
+
+def load_ood_sets(img_size: int):
+    """Preload every OOD set as uint8 host arrays, once.
+
+    Returns [(name, images_uint8, labels, subset_or_None)]. `subset` is that
+    set's class list, used to mask out-of-subset logits before scoring; V2 and
+    Sketch span all 1000 classes and get None.
+
+    Framework-agnostic and shared BY BOTH ARMS. It used to live in
+    finetune_jax, which meant the torch arm had no way to reach it without
+    importing jax -- and an arm that could not load the suite could not be
+    scored on it, so VBLL would silently have had no OOD at all.
+    """
+    import sys
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).resolve().parents[3]
+                           / "scripts" / "dinov3"))
+    from precompute_ood_features import build_ood_registry
+
+    wnid_to_idx = load_wnid_to_idx()
+    registry = build_ood_registry()
+    loaded = []
+    for name in OOD_KEYS:
+        split, img_key = registry[name](wnid_to_idx)
+        labels = np.asarray(split["label"])
+        expected = OOD_SIZES[name]
+        if len(labels) != expected:
+            # A short (or long) load means the HF split changed shape. Scoring
+            # it anyway produces a plausible AUROC over the wrong population,
+            # so this raises rather than warns -- before the expensive decode.
+            raise SystemExit(
+                f"[ood] {name} has {len(labels)} images, expected {expected}")
+        subset = np.unique(labels) if name in OOD_SUBSET_KEYS else None
+        images = load_images_uint8(split, img_key, img_size,
+                                   np.arange(len(labels)))
+        loaded.append((name, images, labels, subset))
+        print(f"[ood] preloaded {name}: {len(labels)} images"
+              + (f", {len(subset)}-class subset" if subset is not None else ""))
+    return loaded
+
 
 def pinned_eval_split(
     cache_dir, n: int = IMAGENET_N_VAL, val_fraction: float = DEFAULT_VAL_FRACTION

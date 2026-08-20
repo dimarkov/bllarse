@@ -84,7 +84,13 @@ final_args=(
 )
 [[ -n "${BLLARSE_EVAL_DUMP_ROOT:-}" ]] && final_args+=(--dump-root "$BLLARSE_EVAL_DUMP_ROOT")
 final_args+=(--dump-every-k-evals "${BLLARSE_FT_DUMP_EVERY_K:-1}")
-final_args+=(--ood-every-k-dumps "${BLLARSE_FT_OOD_EVERY_K:-8}")
+final_args+=(--ood-every-k-dumps "${BLLARSE_FT_OOD_EVERY_K:-2}")
+# Delegate: at those steps write a checkpoint instead of forwarding 98,389
+# images on the training gpu.
+if [[ -n "${BLLARSE_FT_CKPT_ROOT:-}" ]]; then
+  final_args+=(--ood-checkpoint-root "$BLLARSE_FT_CKPT_ROOT")
+  final_args+=(--ood-max-pending "${BLLARSE_FT_OOD_MAX_PENDING:-2}")
+fi
 
 # exec, so the training run replaces this shell and SLURM sees its exit code.
 exec srun "$BLLARSE_FT_VENV" scripts/finetune/final_config.py "${final_args[@]}"

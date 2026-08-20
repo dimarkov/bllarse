@@ -73,6 +73,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dump-every-k-evals", type=int, default=None,
                    help="Trajectory dumps for Fig 5. Omitted leaves "
                         "trial_config's value, which is 0 -- one dump per run.")
+    p.add_argument("--ood-checkpoint-root", default=None,
+                   help="Delegate OOD to the worker: write checkpoints at the "
+                        "scheduled steps instead of evaluating inline.")
+    p.add_argument("--ood-max-pending", type=int, default=None)
     p.add_argument("--ood-every-k-dumps", type=int, default=None,
                    help="OOD dumps, as a stride of the dump grid. Needs "
                         "--dump-every-k-evals nonzero; finetune_jax gates on "
@@ -104,6 +108,8 @@ def main() -> None:
             eval_splits=args.eval_splits,
             dump_every_k_evals=args.dump_every_k_evals,
             ood_every_k_dumps=args.ood_every_k_dumps,
+            ood_checkpoint_root=args.ood_checkpoint_root,
+            ood_max_pending=args.ood_max_pending,
         )
         script = finetune_worker.SCRIPTS[arm]
         argv = adapters.config_to_argv(config)
