@@ -468,6 +468,11 @@ HEAD_LR_RATIO_BOX = (MIN_HEAD_LR_RATIO, 1e4)
 # simply never set the new axis.
 PER_SQRT_BATCH_SUFFIX = "_per_sqrt_batch"
 
+# What `_suggest_betas` appends. Named for the same reason the other suffix is:
+# `final_config.absolute_params` has to undo this rename to recover a study's
+# betas, and two independent spellings would drift.
+HORIZONS_SUFFIX = "_horizons"
+
 
 def _suggest_per_sqrt_batch(
     trial: Any, name: str, box: tuple[float, float], batch: int
@@ -493,8 +498,8 @@ def _suggest_betas(trial: Any, steps: int) -> tuple[float, float]:
     new step count preserves H by construction -- so a searched beta and a
     transferred one are the same quantity seen at two budgets.
     """
-    h1 = trial.suggest_float("beta1_horizons", *BETA1_HORIZONS_BOX, log=True)
-    h2 = trial.suggest_float("beta2_horizons", *BETA2_HORIZONS_BOX, log=True)
+    h1 = trial.suggest_float(f"beta1{HORIZONS_SUFFIX}", *BETA1_HORIZONS_BOX, log=True)
+    h2 = trial.suggest_float(f"beta2{HORIZONS_SUFFIX}", *BETA2_HORIZONS_BOX, log=True)
     return (protocol.beta_from_horizons(h1, steps),
             protocol.beta_from_horizons(h2, steps))
 

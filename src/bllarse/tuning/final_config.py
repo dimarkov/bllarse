@@ -36,6 +36,7 @@ FINAL_EPOCHS = 4.0
 # Aliased rather than re-spelled: the rename is a property of the search space,
 # and two independent spellings of it would drift the moment one is edited.
 SEARCH_SUFFIX = space.PER_SQRT_BATCH_SUFFIX
+HORIZONS_SUFFIX = space.HORIZONS_SUFFIX
 
 # Reporting flags the final run needs and a tuning trial does not. Tuning
 # forwards `val` alone -- the objective is val_nll and forwarding the 30k test
@@ -58,13 +59,25 @@ FINAL_GROUP_ID = "ftfinal"
 
 
 def absolute_params(
-    params: Mapping[str, Any], *, effective_batch: int
+    params: Mapping[str, Any], *, effective_batch: int, steps: int | None = None
 ) -> dict[str, Any]:
-    """Undo the per-sqrt-batch reparameterisation.
+    """Undo BOTH search reparameterisations: per-sqrt-batch and horizons.
 
-    A study records `lr_per_sqrt_batch`; the training scripts take `--lr`. This
-    multiplies the searched coordinate back up by sqrt(effective_batch) and
-    strips the suffix.
+    A study records `lr_per_sqrt_batch` and `beta1_horizons`; the training
+    scripts take `--lr` and `--beta1`. This multiplies the first back up by
+    sqrt(effective_batch) and converts the second at `steps`, the step count the
+    trial actually ran.
+
+    Handling the horizons here is not cosmetic. `protocol.transfer` reads a
+    config's betas by KEY, so a study whose betas are recorded under
+    `*_horizons` looked to it like a study with no betas at all -- and it
+    silently fell back to REFERENCE_BETAS. Every arm then transferred to the
+    same (0.9, 0.999)-derived pair, discarding the entire beta search: the one
+    thing this campaign was re-run to measure.
+
+    `steps` is required once any horizon key is present, and refused otherwise
+    rather than defaulted -- a beta converted at the wrong step count is a
+    plausible number with no error attached to it.
 
     Tolerates studies that have NEITHER form of the rename, which is not
     defensive coding but a requirement: the campaigns that exist today
@@ -75,10 +88,25 @@ def absolute_params(
     if effective_batch < 1:
         raise ValueError(f"effective_batch must be >= 1, got {effective_batch}")
 
+    if any(k.endswith(HORIZONS_SUFFIX) for k in params) and steps is None:
+        raise ValueError(
+            "params carry a horizon coordinate but `steps` was not given; the "
+            "beta it implies is meaningless without the step count it was "
+            "searched at."
+        )
+
     root = math.sqrt(effective_batch)
     out: dict[str, Any] = {}
     for key, value in params.items():
-        if key.endswith(SEARCH_SUFFIX):
+        if key.endswith(HORIZONS_SUFFIX):
+            bare = key[: -len(HORIZONS_SUFFIX)]
+            if bare in params:
+                raise ValueError(
+                    f"study records both {key!r} and {bare!r}; the "
+                    f"reparameterisation is ambiguous."
+                )
+            out[bare] = protocol.beta_from_horizons(value, steps)
+        elif key.endswith(SEARCH_SUFFIX):
             bare = key[: -len(SEARCH_SUFFIX)]
             if bare in params:
                 raise ValueError(
@@ -136,7 +164,9 @@ def final_config(
     to_samples = int(epochs * n_train)
     batch = effective_batch if to_batch is None else to_batch
 
-    absolute = absolute_params(params, effective_batch=effective_batch)
+    absolute = absolute_params(
+        params, effective_batch=effective_batch,
+        steps=protocol.steps_for_samples(from_samples, effective_batch))
     transferred = protocol.transfer(
         absolute,
         from_samples=from_samples,

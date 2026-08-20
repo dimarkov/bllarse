@@ -414,3 +414,86 @@ def test_every_arm_and_seed_gets_a_distinct_run_name(arm, mod_name):
         names.add(mod.resolve_uid(args))
     assert len(names) == 5, names
     assert all("dinov3_huge" in n and "seed" in n for n in names)
+
+
+# --- The searched betas must survive to the final run -----------------------
+
+
+def _study_shaped(**over):
+    """A study's params as OPTUNA RECORDS THEM.
+
+    This is the shape every earlier test got wrong. `fs.suggest` RETURNS
+    `beta1`/`beta2`, but what a trial stores is `beta1_horizons` -- so tests
+    built from suggest()'s return value, or from hand-written `beta1` keys,
+    exercised a shape no real study has.
+    """
+    p = {"lr_per_sqrt_batch": 1.25e-06, "weight_decay_per_sqrt_batch": 2.2e-06,
+         "beta1_horizons": 72.59376434, "beta2_horizons": 32.37392373}
+    p.update(over)
+    return p
+
+
+def test_the_searched_betas_reach_the_final_run_not_the_library_defaults():
+    """The bug this exists to prevent, and it shipped once.
+
+    `protocol.transfer` reads betas by KEY. A study records them under
+    `*_horizons`, so transfer saw no betas at all and fell back to
+    REFERENCE_BETAS -- every arm landing on the same (0.9, 0.999)-derived pair
+    and the entire beta search, the reason the campaign was re-run, discarded.
+    """
+    cfg = fc.final_config("ibprobit_noeps", _study_shaped(), effective_batch=512,
+                          from_samples=1_000_000)
+    tune_steps = protocol.steps_for_samples(1_000_000, 512)
+    final_steps = protocol.steps_for_samples(5_124_668, 512)
+    # The horizon is the invariant, and it is what must survive.
+    assert protocol.horizons(cfg["beta1"], final_steps) == pytest.approx(72.59376434)
+    assert protocol.horizons(cfg["beta2"], final_steps) == pytest.approx(32.37392373)
+    # ... and the result is emphatically NOT the transfer of the defaults.
+    default = protocol.betas_for(final_steps, from_steps=tune_steps)
+    assert cfg["beta1"] != pytest.approx(default[0])
+    assert cfg["beta2"] != pytest.approx(default[1])
+
+
+def test_arms_with_different_searched_betas_get_different_final_betas():
+    # The symptom that exposed it: all three arms transferred to an identical
+    # pair, which no per-arm search could ever produce.
+    a = fc.final_config("ce", _study_shaped(beta1_horizons=40.8, beta2_horizons=0.92,
+                                            head_lr_ratio=30.8),
+                        effective_batch=512, from_samples=1_000_000)
+    b = fc.final_config("ibprobit_noeps", _study_shaped(),
+                        effective_batch=512, from_samples=1_000_000)
+    assert a["beta1"] != pytest.approx(b["beta1"])
+    assert a["beta2"] != pytest.approx(b["beta2"])
+
+
+def test_a_horizon_without_a_step_count_is_refused():
+    # A beta converted at the wrong step count is a plausible number with no
+    # error attached, so this raises rather than defaulting.
+    with pytest.raises(ValueError, match="step count"):
+        fc.absolute_params(_study_shaped(), effective_batch=512)
+
+
+def test_the_horizon_suffix_is_not_spelled_twice():
+    assert fc.HORIZONS_SUFFIX is fs.HORIZONS_SUFFIX
+
+
+def test_a_real_suggest_trial_round_trips_through_the_recorded_shape():
+    """End to end on the actual search space: suggest -> journal shape -> final.
+
+    Uses the RECORDING trial's params (what optuna stores), not suggest()'s
+    return value, which is the distinction the shipped bug lived in.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=3))
+    tune_steps = protocol.steps_for_samples(protocol.MAX_SAMPLES, fs.FIXED_BATCH_SIZE)
+    final_steps = protocol.steps_for_samples(5_124_668, fs.FIXED_BATCH_SIZE)
+    for arm in fs.ARMS:
+        t = study.ask()
+        returned = fs.suggest(t, arm)
+        recorded = t.params                      # what the journal holds
+        assert "beta1_horizons" in recorded and "beta1" not in recorded
+        cfg = fc.final_config(arm, recorded, effective_batch=fs.FIXED_BATCH_SIZE)
+        for b in ("beta1", "beta2"):
+            assert protocol.horizons(cfg[b], final_steps) == pytest.approx(
+                protocol.horizons(returned[b], tune_steps)), (arm, b)
