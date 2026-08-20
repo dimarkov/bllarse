@@ -58,6 +58,10 @@ class _NullRun:
     """
 
     active = False
+    # The OOD worker resumes the trainer's run by id, so it has to travel in
+    # the checkpoint. None here means "untracked": the worker then logs
+    # nothing rather than opening a stray run of its own.
+    run_id = None
 
     def log_params(self, params: Mapping[str, Any]) -> None:
         pass
@@ -78,8 +82,12 @@ def _clean_params(params: Mapping[str, Any]) -> Dict[str, str]:
 class _LiveRun:
     active = True
 
-    def __init__(self, mlflow_module: Any) -> None:
+    def __init__(self, mlflow_module: Any, run_id: str | None = None) -> None:
         self._mlflow = mlflow_module
+        # Exposed so a SECOND process can attach to this same run --
+        # start_run(run_id=...) from the OOD worker, so its metrics land on the
+        # training run rather than beside it.
+        self.run_id = run_id
         # Once the tracking backend starts rejecting calls it usually stays
         # broken for the rest of the run (a dead connection, a full disk on
         # the server, ...), and a training loop can call log_metrics on the
@@ -245,7 +253,8 @@ def child_run(
         yield _NullRun()
         return
 
-    run = _LiveRun(mlflow)
+    run = _LiveRun(mlflow, run_id=getattr(
+        getattr(run_ctx, "info", None), "run_id", None))
     try:
         # Body: an exception here (including optuna.TrialPruned) must reach
         # the caller as itself. Nothing above this line can be an `except`
@@ -286,3 +295,139 @@ def child_run(
                 "continuing untracked."
             )
 
+
+# --- Analysis artifacts ------------------------------------------------------
+#
+# The dumps stay the source of truth, but the JSON the analysis distils out of
+# them does not have to live only on the cluster that produced it. Publishing it
+# as an MLflow artifact is what lets plotting run anywhere: without this, every
+# figure needs Raven mounted, because the JSON is written next to the dumps and
+# nothing carries it off.
+#
+# Deliberately NOT the lossy path the training loop uses. `_LiveRun` swallows
+# failures because a tracking outage must never kill a GPU job; here a failure
+# means the artifact does not exist, and a caller that then plots from a stale
+# local copy would publish the wrong figure. So these raise.
+
+ANALYSIS_TAG = "bllarse.analysis"
+
+
+def _analysis_client(tracking_uri: Optional[str] = None):
+    load_mlflow_env_defaults()
+    import mlflow
+
+    uri = tracking_uri or os.environ.get("MLFLOW_TRACKING_URI")
+    if not uri:
+        raise RuntimeError(
+            "no MLflow tracking URI: set MLFLOW_TRACKING_URI (or pass one). "
+            "Publishing an analysis artifact is not optional bookkeeping -- "
+            "silently skipping it would leave the figures reading a stale file."
+        )
+    return mlflow, uri
+
+
+def publish_analysis(
+    path: Path | str,
+    name: str,
+    *,
+    experiment: str = "bllarse-probing",
+    tracking_uri: Optional[str] = None,
+    tags: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Publish an analysis JSON as an artifact. Returns the run id.
+
+    One run per `name`, REUSED across republishes rather than a new run each
+    time: the point is a stable address that `fetch_analysis` can resolve, and a
+    fresh run per invocation would turn "the fig1 JSON" into a guess about which
+    of forty runs was meant. MLflow has no upsert, so the run is found by tag.
+    """
+    # The local check comes FIRST, before anything touches the network: a
+    # mistyped --publish path is a local mistake and should say so without
+    # needing a reachable tracking server to find out.
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"nothing to publish at {path}")
+
+    mlflow, uri = _analysis_client(tracking_uri)
+    mlflow.set_tracking_uri(uri)
+    experiment_id = resolve_experiment_id(mlflow, experiment)
+    client = mlflow.MlflowClient()
+
+    existing = client.search_runs(
+        [experiment_id], filter_string=f"tags.`{ANALYSIS_TAG}` = '{name}'",
+        max_results=1, order_by=["attributes.start_time DESC"],
+    )
+    run_id = existing[0].info.run_id if existing else None
+    if run_id is None:
+        run_id = client.create_run(
+            experiment_id, run_name=name, tags={ANALYSIS_TAG: name}
+        ).info.run_id
+
+    client.log_artifact(run_id, str(path))
+    for key, value in (tags or {}).items():
+        client.set_tag(run_id, key, str(value)[:500])
+    # Terminated explicitly: created runs start RUNNING, and a run left RUNNING
+    # forever reads in the UI as a job that hung.
+    client.set_terminated(run_id, "FINISHED")
+    return run_id
+
+
+def fetch_analysis(
+    name: str,
+    *,
+    experiment: str = "bllarse-probing",
+    tracking_uri: Optional[str] = None,
+    dest_dir: Path | str | None = None,
+    artifact: str | None = None,
+) -> Path:
+    """Download a published analysis artifact. Returns the local path.
+
+    Raises when the artifact is absent rather than falling back to a local file:
+    a plot built from a stale JSON that the author believed came from the server
+    is exactly the failure this whole mechanism exists to prevent.
+    """
+    mlflow, uri = _analysis_client(tracking_uri)
+    mlflow.set_tracking_uri(uri)
+    client = mlflow.MlflowClient()
+
+    experiment_obj = client.get_experiment_by_name(experiment)
+    if experiment_obj is None:
+        raise FileNotFoundError(f"no MLflow experiment named {experiment!r}")
+
+    runs = client.search_runs(
+        [experiment_obj.experiment_id],
+        filter_string=f"tags.`{ANALYSIS_TAG}` = '{name}'",
+        max_results=1, order_by=["attributes.start_time DESC"],
+    )
+    if not runs:
+        raise FileNotFoundError(
+            f"no published analysis named {name!r} in experiment {experiment!r}. "
+            f"Run the analysis with --publish where the dumps are."
+        )
+    run_id = runs[0].info.run_id
+
+    if artifact is None:
+        files = [a.path for a in client.list_artifacts(run_id) if not a.is_dir]
+        if not files:
+            raise FileNotFoundError(
+                f"analysis run {name!r} ({run_id}) exists but holds no artifact"
+            )
+        artifact = files[0]
+
+    local = client.download_artifacts(
+        run_id, artifact, str(dest_dir) if dest_dir else None
+    )
+    return Path(local)
+
+
+def resolve_analysis_path(spec: str, *, dest_dir: Path | str | None = None,
+                          experiment: str = "bllarse-probing") -> Path:
+    """A local path, or `mlflow:<name>` downloaded to one.
+
+    Lets every plotting script take its input from either side of the cluster
+    boundary without each one growing its own copy of the branch.
+    """
+    if spec.startswith("mlflow:"):
+        return fetch_analysis(spec[len("mlflow:"):], experiment=experiment,
+                              dest_dir=dest_dir)
+    return Path(spec)

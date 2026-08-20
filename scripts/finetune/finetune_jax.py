@@ -33,7 +33,7 @@ from jax import random as jr  # noqa: E402
 
 from bllarse import evaldump, metrics  # noqa: E402
 from bllarse.mlflow_utils import child_run  # noqa: E402
-from bllarse.finetune import imagenet, jax_steps, protocol  # noqa: E402
+from bllarse.finetune import checkpoint, imagenet, jax_steps, protocol  # noqa: E402
 from bllarse.losses import CrossEntropy  # noqa: E402
 
 # Fine-tuning resolution. DINOV3_DATASET_IMG_SIZES maps imagenet1k -> 512, but
@@ -318,6 +318,20 @@ def build_argparser() -> argparse.ArgumentParser:
              "1000 classes a val dump is 40 MB, so 122 of them would be 4.9 GB "
              "per run.",
     )
+    # Hand OOD to a separate process on a separate gpu instead of evaluating
+    # it here. The schedule is unchanged -- --ood-every-k-dumps still decides
+    # WHICH steps -- but at those steps this run writes a checkpoint and moves
+    # on, and scripts/finetune/ood_worker.py does the 98,389-image evaluation.
+    # That takes ~1 h per run off the TRAINING gpu, which is what keeps a
+    # dinov3_huge 4-epoch job inside its 24 h wall, and it lets OOD run on a
+    # finer stride than the trainer could otherwise afford.
+    p.add_argument("--ood-checkpoint-root", default=None,
+                   help="Write checkpoints for the OOD worker instead of "
+                        "evaluating OOD inline.")
+    p.add_argument("--ood-max-pending", type=int, default=2,
+                   help="Skip a scheduled checkpoint when this many are already "
+                        "waiting. A lagging worker must not fill /ptmp; a "
+                        "dinov3_huge checkpoint is ~3.4 GB.")
     p.add_argument(
         "--ood-every-k-dumps", type=int, default=2,
         help="Write OOD dumps on every k-th scheduled dump. 0 disables OOD "
@@ -508,6 +522,34 @@ def eval_logits_ibprobit(backbone, loss_fn, images, labels, key, bf16=False):
 
 
 
+def build_model(args, *, embed_dim, num_classes, init_key, effective_batch):
+    """(loss_fn, head) for `args.arm`. The ONE place either is constructed.
+
+    Extracted so the OOD worker rebuilds exactly what training built. A worker
+    with its own copy of this would drift silently -- a different head init
+    scale or a different IBProbit prior deserialises without error and scores a
+    model that never existed.
+
+    `head` is None on the IBProbit arms: the head IS the loss_fn there,
+    assimilated in closed form rather than by an optimizer.
+    """
+    if args.arm == "ce":
+        return CrossEntropy(args.label_smooth, num_classes), eqx.nn.Linear(
+            embed_dim, num_classes, key=init_key)
+
+    from bllarse.losses import IBProbit
+    # B is the EFFECTIVE batch, not the micro batch: the head assimilates the
+    # whole accumulated batch in one CAVI update per step, so that is the B the
+    # q0 = alpha^2 / B steady-state relation is derived against.
+    eps_rho = max(0.0, 1.0 - effective_batch / imagenet.IMAGENET_N_TRAIN)
+    return IBProbit(
+        embed_dim, num_classes, key=init_key,
+        q_init=args.q_init, alpha=args.alpha, batch_size=effective_batch,
+        kappa=args.kappa, learn_q=not args.no_learn_q, px=args.px,
+        warmup=args.warmup, eps_init=args.eps_init, rho=eps_rho,
+    ), None
+
+
 def default_uid(args) -> str:
     """The run's identity: model, dataset, arm and seed."""
     return f"{args.model}_{args.dataset}_{args.arm}_seed{args.seed}"
@@ -615,11 +657,23 @@ def _train(args, on_dump=None, run=None) -> None:
     # grid -- so with --dump-every-k-evals 0 (tuning) nothing is scheduled and
     # the 47,500-image preload must never be paid.
     ood_enabled = bool(args.dump_every_k_evals and args.ood_every_k_dumps)
-    ood_sets = load_ood_sets(args, args.img_size) if ood_enabled else []
+    # Delegated: the schedule still fires, but this process neither preloads
+    # the suite (14.8 GB of host arrays) nor forwards it.
+    ood_delegated = bool(ood_enabled and args.ood_checkpoint_root)
+    # Travels in the checkpoint so the worker attaches to THIS run instead of
+    # opening a sibling. None when tracking is off, which the worker honours.
+    mlflow_run_id = getattr(run, "run_id", None) if run is not None else None
+    ood_sets = load_ood_sets(args, args.img_size) if (
+        ood_enabled and not ood_delegated) else []
+    if ood_delegated:
+        print(f"[finetune] OOD delegated to the worker via "
+              f"{args.ood_checkpoint_root} (every {args.ood_every_k_dumps} dumps)")
+
+    loss_fn, head = build_model(
+        args, embed_dim=embed_dim, num_classes=num_classes,
+        init_key=init_key, effective_batch=plan["effective_batch"])
 
     if args.arm == "ce":
-        loss_fn = CrossEntropy(args.label_smooth, num_classes)
-        head = eqx.nn.Linear(embed_dim, num_classes, key=init_key)
         head_lr = args.head_lr if args.head_lr is not None else DEFAULT_HEAD_LR
         param_labels = (
             jax.tree.map(lambda _: "backbone", eqx.filter(backbone, eqx.is_array)),
@@ -644,19 +698,6 @@ def _train(args, on_dump=None, run=None) -> None:
         )
         opt_state = optimizer.init(eqx.filter((backbone, head), eqx.is_array))
     else:
-        from bllarse.losses import IBProbit
-        # B is the EFFECTIVE batch, not the micro batch: the head assimilates the
-        # whole accumulated batch in one CAVI update per step, so that is the B the
-        # q0 = alpha^2 / B steady-state relation is derived against. Matches
-        # run_arm in full_finetune_comparison.py. --q-init overrides q0 when set.
-        eps_rho = max(0.0, 1.0 - plan["effective_batch"] / imagenet.IMAGENET_N_TRAIN)
-        loss_fn = IBProbit(
-            embed_dim, num_classes, key=init_key,
-            q_init=args.q_init, alpha=args.alpha, batch_size=plan["effective_batch"],
-            kappa=args.kappa, learn_q=not args.no_learn_q, px=args.px,
-            warmup=args.warmup, eps_init=args.eps_init, rho=eps_rho,
-        )
-        head = None
         optimizer = optax.adamw(
             args.lr, b1=args.beta1, b2=args.beta2,
             weight_decay=args.weight_decay)
@@ -793,7 +834,36 @@ def _train(args, on_dump=None, run=None) -> None:
                         logit_kind="softmax_logits", seed=args.seed,
                         samples_seen=samples_seen,
                     )
-                if ood_sets and (is_last_eval or dump_index % args.ood_every_k_dumps == 0):
+                # The `and` is load-bearing: --ood-every-k-dumps 0 disables OOD,
+                # and the old `if ood_sets and (...)` short-circuited before the
+                # modulo. Hoisting the condition out lost that guard and divided
+                # by zero on every tuning trial.
+                ood_due = bool(args.ood_every_k_dumps) and (
+                    is_last_eval or dump_index % args.ood_every_k_dumps == 0)
+                if ood_delegated and ood_due:
+                    stem = checkpoint.write(
+                        args.ood_checkpoint_root,
+                        group_id=args.group_id, uid=args.uid, step=step,
+                        blob_suffix=".eqx",
+                        write_blob=lambda path: eqx.tree_serialise_leaves(
+                            path, (backbone, head_or_loss)),
+                        meta={
+                            "framework": "jax",
+                            "samples_seen": samples_seen,
+                            "eval_index": eval_index,
+                            "is_last_eval": bool(is_last_eval),
+                            "mlflow_run_id": mlflow_run_id,
+                            "args": vars(args),
+                        },
+                        max_pending=args.ood_max_pending,
+                    )
+                    # Logged either way: a silently dropped OOD point is
+                    # indistinguishable from one the schedule never asked for.
+                    print(f"[finetune] ood checkpoint step {step}: "
+                          + ("written" if stem else
+                             f"SKIPPED, {args.ood_max_pending} already pending"),
+                          flush=True)
+                if ood_sets and ood_due:
                     for name, images_uint8, labels, subset in ood_sets:
                         logits, _ = evaluate_split(
                             args.arm, backbone, head_or_loss, images_uint8, labels,
