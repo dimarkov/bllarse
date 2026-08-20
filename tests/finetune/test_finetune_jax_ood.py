@@ -61,7 +61,7 @@ def test_ood_rides_a_stride_of_a_uniform_dump_grid():
 
 
 def test_tuning_disables_ood_entirely():
-    # OOD forwards 47,500 images; a tuning trial must never pay for it. With
+    # OOD forwards 98,389 images; a tuning trial must never pay for it. With
     # --dump-every-k-evals 0 nothing is dumped at all, so nothing is OOD-dumped
     # either -- and main() must not even preload the sets.
     args = _args(dump_every_k_evals=0)
@@ -154,16 +154,19 @@ def _default_sizes_and_labels():
     # larger label space) while imagenet_v2 spans a wider range -- so a
     # "subset always equals np.unique(labels)" mutant and a "subset is
     # ignored" mutant are both distinguishable.
-    sizes = {"imagenet_r": 4, "imagenet_a": 3, "imagenet_v2": 5}
+    sizes = {"imagenet_r": 4, "imagenet_a": 3, "imagenet_v2": 5,
+             "imagenet_sketch": 6}
     labels = {
         "imagenet_r": np.array([0, 1, 0, 1]),
         "imagenet_a": np.array([1, 0, 1]),
         "imagenet_v2": np.array([0, 1, 2, 3, 4]),
+        # 1000-class set like V2, so it must NOT be subset-masked either.
+        "imagenet_sketch": np.array([0, 1, 2, 3, 4, 5]),
     }
     return sizes, labels
 
 
-def test_load_ood_sets_returns_all_three_in_declared_order(monkeypatch):
+def test_load_ood_sets_returns_every_set_in_declared_order(monkeypatch):
     sizes, labels = _default_sizes_and_labels()
     img_size = _install_fake_ood_registry(monkeypatch, sizes, labels)
 
@@ -324,7 +327,7 @@ def _base_argv(*, dump_root, split_cache_dir, img_size, epochs, batch_size,
 def test_main_never_calls_load_ood_sets_when_disabled(tmp_path, monkeypatch):
     """The tuning-cost regression this task must close: --ood-every-k-dumps 0
     must mean load_ood_sets is never even CALLED, not just that it returns
-    an empty result -- a tuning trial must never pay the 47,500-image
+    an empty result -- a tuning trial must never pay the 98,389-image
     preload. A version that always calls load_ood_sets and only skips writing
     dumps would still pass every schedule-level test but blow the tuning
     trial's cost budget; only spying on the call itself catches that.
@@ -369,11 +372,13 @@ def test_main_writes_ood_dumps_only_on_ood_steps_not_every_dump_step(tmp_path, m
         monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
         train_n=8, eval_n=10,
     )
-    sizes = {"imagenet_r": 2, "imagenet_a": 2, "imagenet_v2": 2}
+    sizes = {"imagenet_r": 2, "imagenet_a": 2, "imagenet_v2": 2,
+             "imagenet_sketch": 2}
     labels = {
         "imagenet_r": np.array([0, 1]),
         "imagenet_a": np.array([1, 0]),
         "imagenet_v2": np.array([0, 2]),
+        "imagenet_sketch": np.array([0, 2]),
     }
     _install_fake_ood_registry(monkeypatch, sizes, labels)
 
@@ -409,7 +414,7 @@ def test_main_writes_ood_dumps_only_on_ood_steps_not_every_dump_step(tmp_path, m
     ood_splits_at_an_ood_step = {r.meta["split"] for r in records if r.meta["step"] == 2
                                  and r.meta["split"].startswith("ood_")}
     assert ood_splits_at_an_ood_step == {
-        "ood_imagenet_r", "ood_imagenet_a", "ood_imagenet_v2"}
+        f"ood_{name}" for name in imagenet.OOD_KEYS}
 
 
 def test_main_ood_dump_uses_the_ood_prefixed_split_name(tmp_path, monkeypatch):
@@ -420,11 +425,13 @@ def test_main_ood_dump_uses_the_ood_prefixed_split_name(tmp_path, monkeypatch):
         monkeypatch, embed_dim=embed_dim, num_classes=num_classes, img_size=img_size,
         train_n=4, eval_n=6,
     )
-    sizes = {"imagenet_r": 2, "imagenet_a": 2, "imagenet_v2": 2}
+    sizes = {"imagenet_r": 2, "imagenet_a": 2, "imagenet_v2": 2,
+             "imagenet_sketch": 2}
     labels = {
         "imagenet_r": np.array([0, 1]),
         "imagenet_a": np.array([1, 0]),
         "imagenet_v2": np.array([0, 2]),
+        "imagenet_sketch": np.array([0, 2]),
     }
     _install_fake_ood_registry(monkeypatch, sizes, labels)
 
@@ -462,11 +469,13 @@ def test_main_ood_dispatch_actually_masks_r_and_a_but_not_v2(tmp_path, monkeypat
     # imagenet_r/a only ever see classes {0, 1} out of 4 -- classes 2 and 3
     # must come back masked. imagenet_v2 sees all 4 classes and must not be
     # masked at all.
-    sizes = {"imagenet_r": 3, "imagenet_a": 3, "imagenet_v2": 3}
+    sizes = {"imagenet_r": 3, "imagenet_a": 3, "imagenet_v2": 3,
+             "imagenet_sketch": 3}
     labels = {
         "imagenet_r": np.array([0, 1, 0]),
         "imagenet_a": np.array([1, 0, 1]),
         "imagenet_v2": np.array([0, 1, 2]),
+        "imagenet_sketch": np.array([0, 1, 2]),
     }
     _install_fake_ood_registry(monkeypatch, sizes, labels)
 

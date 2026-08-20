@@ -35,8 +35,16 @@ def _fake_images(n, size):
     ]
 
 
-def test_ood_keys_are_r_a_v2_and_exclude_imagenet_c():
-    assert imagenet.OOD_KEYS == ("imagenet_r", "imagenet_a", "imagenet_v2")
+def test_the_ood_suite_is_natural_shift_and_excludes_imagenet_c():
+    """Sketch joined R/A/V2; ImageNet-C is still out, by decision.
+
+    All four are natural-image distribution shift, which is the axis Fig 6 is
+    about. ImageNet-C is synthetic corruption -- a different claim -- and the
+    only build available is severity 5 alone, so results-plan's
+    "severity-averaged" is not obtainable from it in any case.
+    """
+    assert imagenet.OOD_KEYS == ("imagenet_r", "imagenet_a", "imagenet_v2",
+                                 "imagenet_sketch")
     assert not any("imagenet_c" in key for key in imagenet.OOD_KEYS)
 
 
@@ -116,13 +124,15 @@ def test_normalize_chunk_applies_mean_and_std():
 
 
 def test_ood_sizes_and_keys_define_full_suite():
-    # Verify the OOD suite composition: R 30k + A 7.5k + V2 10k = 47,500 images total.
-    # OOD_SIZES must match OOD_KEYS and sum to 47,500.
+    # R 30k + A 7.5k + V2 10k + Sketch 50,889 = 98,389 images per OOD pass.
+    # Every set is loaded in FULL -- no subsampling -- which is what keeps
+    # sampling noise out of each point on the OOD trajectory.
     assert set(imagenet.OOD_SIZES.keys()) == set(imagenet.OOD_KEYS)
     assert imagenet.OOD_SIZES["imagenet_r"] == 30_000
     assert imagenet.OOD_SIZES["imagenet_a"] == 7_500
     assert imagenet.OOD_SIZES["imagenet_v2"] == 10_000
-    assert sum(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS) == 47_500
+    assert imagenet.OOD_SIZES["imagenet_sketch"] == 50_889
+    assert sum(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS) == 98_389
 
 
 def test_ood_subset_keys_excludes_v2():
@@ -149,7 +159,7 @@ def test_memory_budget_of_the_real_preload_peak_stays_under_slurm_mem():
     size = 224
     bytes_per_image = size * size * 3  # uint8, one image
     ood_n = sum(imagenet.OOD_SIZES[k] for k in imagenet.OOD_KEYS)
-    assert ood_n == 47_500
+    assert ood_n == 98_389
     val_test_n = imagenet.IMAGENET_N_VAL  # 50,000
 
     resident_gb = (val_test_n + ood_n) * bytes_per_image / 1024**3
@@ -157,12 +167,17 @@ def test_memory_budget_of_the_real_preload_peak_stays_under_slurm_mem():
     transient_double_copy_gb = largest_single_set_n * bytes_per_image / 1024**3
     peak_gb = resident_gb + transient_double_copy_gb
 
-    assert peak_gb < 40.0, (
-        f"real preload peak {peak_gb:.1f} GiB would OOM slurm_tune.sh's --mem=40G"
+    # The FINE-TUNING job asks for --mem=125000 (~116 GiB), not the probing
+    # job's 40G -- and it has to, because the suite grew to 98,389 images and
+    # the peak with the transient double copy is ~28 GiB. Checked against the
+    # budget the OOD preload actually runs under.
+    assert peak_gb < 100.0, (
+        f"real preload peak {peak_gb:.1f} GiB crowds slurm_finetune_final.sh's "
+        f"--mem=125000"
     )
     # Sanity: this is genuinely close to the limit (unlike the OOD-suite-only
     # figure, ~6.66 GiB, which left the real risk invisible), not slack.
-    assert peak_gb > 12.0
+    assert peak_gb > 20.0
     # And the float32 equivalent of just resting memory (no double-copy)
     # still does not fit, which is why the cache is uint8 at all.
-    assert resident_gb * 4 > 40.0
+    assert resident_gb * 4 > 80.0

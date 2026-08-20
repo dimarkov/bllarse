@@ -125,3 +125,71 @@ def test_it_supports_a_dry_run():
 
 def test_it_exports_all_not_only_the_named_variables():
     assert '--export "ALL,' in TEXT
+
+
+# --- OOD ---------------------------------------------------------------------
+
+
+def test_the_reported_campaign_actually_enables_dumps_and_ood():
+    """Both, because finetune_jax gates on both being nonzero.
+
+    trial_config sets each to 0 -- right for tuning, where a trial writes one
+    argmin dump and must never pay the OOD preload. Inheriting that silently
+    gave the reported campaign no trajectory (Fig 5) and no OOD (Fig 6) at all.
+    """
+    assert int(_default("BLLARSE_FT_DUMP_EVERY_K")) >= 1
+    assert int(_default("BLLARSE_FT_OOD_EVERY_K")) == 8
+    assert "--ood-every-k-dumps" in JOB and "--dump-every-k-evals" in JOB
+
+
+def test_the_ood_stride_leaves_the_job_inside_the_wall():
+    """Arithmetic, not taste. One OOD pass is the whole suite preloaded.
+
+    At the default quantum a 4-epoch run has 78 evaluations; dumping every one
+    and striding OOD by 8 gives 9 passes. Measured eval throughput is ~0.87M
+    forwards/hour, and the job's wall is 24 h with ~17.9 h of training and
+    ~4.5 h of val+test already spent.
+    """
+    from bllarse.finetune import imagenet as im
+
+    q = int(_default("BLLARSE_FT_EVAL_QUANTUM"))
+    final_steps = protocol.steps_for_samples(int(4 * 1_281_167), fs.FIXED_BATCH_SIZE)
+    n_evals = final_steps // (q // fs.FIXED_BATCH_SIZE)
+    n_ood = n_evals // int(_default("BLLARSE_FT_OOD_EVERY_K"))
+    hours = n_ood * sum(im.OOD_SIZES.values()) / 0.87e6
+    assert hours < 2.0, f"OOD would add {hours:.1f} h; the wall has ~1.6 h spare"
+
+
+def test_the_ood_preload_fits_the_jobs_memory():
+    # load_ood_sets holds every set as uint8 host arrays for the whole run,
+    # competing with the shard reader and JAX inside --mem=125000.
+    from bllarse.finetune import imagenet as im
+
+    assert im.OOD_PRELOAD_BYTES / 1e9 < 40, "preload would crowd the allocation"
+    assert "--mem=125000" in JOB
+
+
+def test_imagenet_c_stays_out_and_says_why():
+    """A recorded decision, not an omission.
+
+    Only severity 5 is available (so "severity-averaged" is unobtainable), and
+    8 corruptions x 50,000 is 400,000 images per pass -- ~60 GB of host arrays
+    and ~5.7 h of evaluation. Subsampling would fit but is what this suite is
+    defined to avoid.
+    """
+    from bllarse.finetune import imagenet as im
+
+    assert not any(k.startswith("imagenet_c") for k in im.OOD_KEYS)
+    assert "ImageNet-C stays excluded" in im.__doc__
+    assert "severity 5 ALONE" in im.__doc__
+
+
+def test_sketch_is_in_the_suite_and_is_not_subset_masked():
+    # 1000 classes, so it is scored on the full label space -- unlike R and A,
+    # whose 200-class mask is an oracle intervention on the very distribution
+    # whose calibration is being measured.
+    from bllarse.finetune import imagenet as im
+
+    assert "imagenet_sketch" in im.OOD_KEYS
+    assert "imagenet_sketch" not in im.OOD_SUBSET_KEYS
+    assert im.OOD_SUBSET_KEYS == {"imagenet_r", "imagenet_a"}

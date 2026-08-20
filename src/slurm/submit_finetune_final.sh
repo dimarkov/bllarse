@@ -50,6 +50,14 @@ set -euo pipefail
 : "${BLLARSE_FT_MODEL:=dinov3_huge}"
 : "${BLLARSE_FT_EPOCHS:=4.0}"
 : "${BLLARSE_FT_EVAL_QUANTUM:=65536}"
+# Fig 5 is CURVES, so every evaluation is dumped. Fig 6 scores the same
+# trajectory under shift, and OOD rides a stride of that dump grid.
+: "${BLLARSE_FT_DUMP_EVERY_K:=1}"
+# Every 8th dump: 78 evaluations at the default quantum means 9 OOD passes.
+# One pass is 98,389 images (R 30,000 + A 7,500 + V2 10,000 + Sketch 50,889),
+# so 9 passes is ~0.89M forwards, about 1 h -- which is what keeps the job
+# inside the 24 h wall at roughly 23.4 h total.
+: "${BLLARSE_FT_OOD_EVERY_K:=8}"
 : "${BLLARSE_FT_THROTTLE:=5}"
 : "${BLLARSE_FT_VENV:=}"
 : "${BLLARSE_FT_SHARDS:=/ptmp/${USER}/shards}"
@@ -176,8 +184,8 @@ for arm in $BLLARSE_FT_ARMS; do
     exports+=",BLLARSE_HF_HOME=${BLLARSE_HF_HOME}"
   [[ -n "${BLLARSE_FT_PYLIBS:-}" ]] &&
     exports+=",BLLARSE_FT_PYLIBS=${BLLARSE_FT_PYLIBS}"
-  [[ -n "${BLLARSE_FT_DUMP_EVERY_K:-}" ]] &&
-    exports+=",BLLARSE_FT_DUMP_EVERY_K=${BLLARSE_FT_DUMP_EVERY_K}"
+  exports+=",BLLARSE_FT_DUMP_EVERY_K=${BLLARSE_FT_DUMP_EVERY_K}"
+  exports+=",BLLARSE_FT_OOD_EVERY_K=${BLLARSE_FT_OOD_EVERY_K}"
 
   cmd=(sbatch
        --job-name "ftfinal_${arm}_${BLLARSE_FT_CAMPAIGN}"

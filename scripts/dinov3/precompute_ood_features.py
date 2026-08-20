@@ -101,6 +101,16 @@ def prepare_imagenet_c(corruption, wnid_to_idx):
     return RelabeledSplit(ds, labels), "image"
 
 
+def prepare_imagenet_sketch(wnid_to_idx):
+    """ImageNet-Sketch: 1000 classes, so no subset mask.
+
+    Its ClassLabel names are the sorted WNIDs, the same canonical ordering
+    prepare_imagenet_c relies on, so the codes are already ImageNet indices.
+    """
+    ds = load_dataset("songweig/imagenet_sketch", split="train")
+    return RelabeledSplit(ds, np.asarray(ds["label"])), "image"
+
+
 def prepare_imagenet_r(wnid_to_idx):
     ds = load_dataset("axiong/imagenet-r", split="test")
     labels = np.array([wnid_to_idx[w] for w in ds["wnid"]])
@@ -129,6 +139,7 @@ def build_ood_registry():
     reg = {f"imagenet_c_{c}": (lambda w, c=c: prepare_imagenet_c(c, w))
            for c in IMAGENET_C_CORRUPTIONS}
     reg["imagenet_r"] = prepare_imagenet_r
+    reg["imagenet_sketch"] = prepare_imagenet_sketch
     reg["imagenet_a"] = prepare_imagenet_a
     reg["imagenet_v2"] = prepare_imagenet_v2
     return reg

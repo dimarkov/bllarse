@@ -72,7 +72,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dump-root", default=None)
     p.add_argument("--dump-every-k-evals", type=int, default=None,
                    help="Trajectory dumps for Fig 5. Omitted leaves "
-                        "trial_config's value.")
+                        "trial_config's value, which is 0 -- one dump per run.")
+    p.add_argument("--ood-every-k-dumps", type=int, default=None,
+                   help="OOD dumps, as a stride of the dump grid. Needs "
+                        "--dump-every-k-evals nonzero; finetune_jax gates on "
+                        "both.")
     p.add_argument("--eval-splits", default=fc.FINAL_EVAL_SPLITS,
                    choices=["val", "val+test"])
     p.add_argument("--format", default="argv", choices=["argv", "sh", "json", "exec"],
@@ -99,6 +103,7 @@ def main() -> None:
             dump_root=args.dump_root,
             eval_splits=args.eval_splits,
             dump_every_k_evals=args.dump_every_k_evals,
+            ood_every_k_dumps=args.ood_every_k_dumps,
         )
         script = finetune_worker.SCRIPTS[arm]
         argv = adapters.config_to_argv(config)

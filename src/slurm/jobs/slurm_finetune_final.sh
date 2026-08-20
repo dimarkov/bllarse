@@ -83,7 +83,8 @@ final_args=(
   --format exec
 )
 [[ -n "${BLLARSE_EVAL_DUMP_ROOT:-}" ]] && final_args+=(--dump-root "$BLLARSE_EVAL_DUMP_ROOT")
-[[ -n "${BLLARSE_FT_DUMP_EVERY_K:-}" ]] && final_args+=(--dump-every-k-evals "$BLLARSE_FT_DUMP_EVERY_K")
+final_args+=(--dump-every-k-evals "${BLLARSE_FT_DUMP_EVERY_K:-1}")
+final_args+=(--ood-every-k-dumps "${BLLARSE_FT_OOD_EVERY_K:-8}")
 
 # exec, so the training run replaces this shell and SLURM sees its exit code.
 exec srun "$BLLARSE_FT_VENV" scripts/finetune/final_config.py "${final_args[@]}"

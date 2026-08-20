@@ -138,6 +138,7 @@ def final_config(
     enable_mlflow: bool = True,
     mlflow_experiment: str = MLFLOW_EXPERIMENT,
     dump_every_k_evals: int | None = None,
+    ood_every_k_dumps: int | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
     """The final campaign's config for `arm`, transferred from a tuned trial.
@@ -216,6 +217,13 @@ def final_config(
     config["mlflow_experiment"] = mlflow_experiment
     if dump_every_k_evals is not None:
         config["dump_every_k_evals"] = dump_every_k_evals
+    # OOD rides a stride of the dump grid, which is itself a stride of the eval
+    # grid, and finetune_jax gates on BOTH being nonzero. trial_config sets each
+    # to 0 -- right for tuning, where a trial writes one argmin dump and must
+    # never pay the 98,389-image preload -- so the reported campaign has to set
+    # them explicitly or it silently produces no trajectory and no OOD at all.
+    if ood_every_k_dumps is not None:
+        config["ood_every_k_dumps"] = ood_every_k_dumps
     if model is not None:
         config["model"] = model
 
