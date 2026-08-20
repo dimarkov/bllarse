@@ -181,3 +181,56 @@ def test_memory_budget_of_the_real_preload_peak_stays_under_slurm_mem():
     # And the float32 equivalent of just resting memory (no double-copy)
     # still does not fit, which is why the cache is uint8 at all.
     assert resident_gb * 4 > 80.0
+
+
+# --- The canonical WNID map --------------------------------------------------
+
+
+def test_the_wnid_map_is_shipped_not_fetched():
+    """It used to be resolved from a Tsomaros ImageNet-C builder at runtime.
+
+    That made every OOD load depend on reaching the network -- and on an
+    ImageNet-C repo, in a suite that deliberately excludes ImageNet-C. It also
+    broke prepare_ood_cache.py --check-only against a cold cache before it
+    could report on a single set. No cached dataset can substitute:
+    ILSVRC/imagenet-1k carries human-readable names, the benjamin-paine mirror
+    has 1001 classes so its indices are not canonical, and barkermrl/imagenet-a
+    has WNIDs for only 200 classes.
+    """
+    assert imagenet.WNID_FILE.is_file()
+    mapping = imagenet.load_wnid_to_idx()
+    assert len(mapping) == 1000
+
+
+def test_the_ordering_is_canonical_and_anchored():
+    # Sorted-WNID order is what makes an index mean the same class here as in
+    # every dataset that reports ImageNet-1k indices. n01440764 is tench, which
+    # is ImageNet-1k's own label 0 -- the anchor that proves the ordering.
+    wnids = imagenet.canonical_wnids()
+    assert list(wnids) == sorted(wnids)
+    assert wnids[0] == "n01440764"
+    assert imagenet.load_wnid_to_idx()["n01440764"] == 0
+    assert len(set(wnids)) == 1000
+
+
+def test_a_corrupted_wnid_file_raises_rather_than_relabelling(tmp_path, monkeypatch):
+    """The failure this guards is silent.
+
+    A truncated or reordered list relabels every OOD set and produces a
+    plausible accuracy over scrambled classes. Nothing downstream would look
+    wrong, so it has to fail at load.
+    """
+    good = imagenet.canonical_wnids()
+    for name, body in (
+        ("short", "\n".join(good[:999])),
+        ("dupes", "\n".join(good[:999] + (good[0],))),
+        ("unsorted", "\n".join((good[5],) + good[:5] + good[6:])),
+        ("malformed", "\n".join(("banana",) + good[1:])),
+    ):
+        path = tmp_path / f"{name}.txt"
+        path.write_text(body)
+        monkeypatch.setattr(imagenet, "WNID_FILE", path)
+        imagenet.canonical_wnids.cache_clear()
+        with pytest.raises(ValueError):
+            imagenet.canonical_wnids()
+    imagenet.canonical_wnids.cache_clear()

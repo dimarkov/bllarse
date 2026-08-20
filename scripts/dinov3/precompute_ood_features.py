@@ -86,10 +86,15 @@ class RelabeledSplit:
 
 
 def load_wnid_to_idx():
-    """Canonical WNID -> ImageNet-1k index map (sorted-WNID order)."""
-    names = load_dataset_builder(CANONICAL_LABELS_SOURCE).info.features["label"].names
-    assert len(names) == 1000, f"expected 1000 classes, got {len(names)}"
-    return {wnid: i for i, wnid in enumerate(names)}
+    """Canonical WNID -> ImageNet-1k index map (sorted-WNID order).
+
+    Delegates to bllarse.finetune.imagenet, which ships the list as a checked-in
+    constant. It used to read CANONICAL_LABELS_SOURCE's ClassLabel over the
+    network, which made every OOD load depend on reaching an ImageNet-C repo --
+    in a suite that excludes ImageNet-C, and on a path that has to work offline.
+    """
+    from bllarse.finetune.imagenet import load_wnid_to_idx as _canonical
+    return _canonical()
 
 
 # ── Per-dataset preparation: return (split, img_key) with canonical labels ────

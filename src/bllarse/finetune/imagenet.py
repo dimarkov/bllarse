@@ -19,7 +19,8 @@ are what keep sampling noise out of every point on the OOD trajectory.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from functools import lru_cache, partial
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -33,6 +34,51 @@ IMAGENET_N_VAL = 50_000
 # ONLY to fit temperature and to select the reporting step; test is never seen
 # by either.
 DEFAULT_VAL_FRACTION = 0.2
+
+# The canonical WNID -> ImageNet-1k index map, as a CHECKED-IN CONSTANT.
+#
+# It used to be resolved at runtime from a Tsomaros ImageNet-C builder's
+# ClassLabel, which made every OOD load depend on a network fetch -- and on an
+# ImageNet-C repo, of all things, in a suite that deliberately excludes
+# ImageNet-C. That dependency broke `prepare_ood_cache.py --check-only` against
+# a cold cache before it could report on a single set.
+#
+# No locally cached dataset can replace it: ILSVRC/imagenet-1k carries
+# human-readable names rather than WNIDs, the benjamin-paine mirror has 1001
+# classes so its indices are not canonical, and barkermrl/imagenet-a has real
+# WNIDs but only the 200-class subset. So it is shipped instead of fetched --
+# which is what it should always have been. The ordering is sorted-WNID, fixed
+# since 2012, and index 0 is n01440764 (tench), matching ImageNet-1k's own
+# first label.
+WNID_FILE = Path(__file__).with_name("imagenet_wnids.txt")
+
+
+@lru_cache(maxsize=1)
+def canonical_wnids() -> tuple[str, ...]:
+    """The 1000 WNIDs in canonical (sorted) order.
+
+    Validated on load rather than trusted. A truncated or reordered file would
+    silently relabel every OOD set -- producing a plausible accuracy over
+    scrambled classes, which is exactly the failure that is invisible
+    downstream.
+    """
+    wnids = tuple(WNID_FILE.read_text().split())
+    if len(wnids) != 1000:
+        raise ValueError(f"{WNID_FILE} has {len(wnids)} WNIDs, expected 1000")
+    if len(set(wnids)) != 1000:
+        raise ValueError(f"{WNID_FILE} contains duplicates")
+    if list(wnids) != sorted(wnids):
+        raise ValueError(f"{WNID_FILE} is not in sorted-WNID order")
+    bad = [w for w in wnids if not (len(w) == 9 and w[0] == "n" and w[1:].isdigit())]
+    if bad:
+        raise ValueError(f"{WNID_FILE} has malformed entries: {bad[:3]}")
+    return wnids
+
+
+def load_wnid_to_idx() -> dict[str, int]:
+    """WNID -> canonical ImageNet-1k index. Offline, no dataset required."""
+    return {w: i for i, w in enumerate(canonical_wnids())}
+
 
 OOD_KEYS = ("imagenet_r", "imagenet_a", "imagenet_v2", "imagenet_sketch")
 
