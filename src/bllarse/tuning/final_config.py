@@ -134,6 +134,7 @@ def final_config(
     seed: int = space.REPORTED_SEEDS[0],
     group_id: str = FINAL_GROUP_ID,
     eval_splits: str = FINAL_EVAL_SPLITS,
+    eval_quantum: int | None = None,
     enable_mlflow: bool = True,
     mlflow_experiment: str = MLFLOW_EXPERIMENT,
     dump_every_k_evals: int | None = None,
@@ -185,6 +186,22 @@ def final_config(
     config["max_samples"] = 0
     config["epochs"] = epochs
     config["eval_splits"] = eval_splits
+    # A coarser grid than tuning's, and it is a WALL-CLOCK constraint rather
+    # than a preference. The final run forwards val+test (50k) at every
+    # evaluation instead of val alone (10k), over 2.56x the samples. At
+    # protocol.EVAL_QUANTUM that is 312 evaluations x 50k = 15.6M forward
+    # passes against ~15.4M fwd-equivalents of training -- evaluation would
+    # roughly DOUBLE the run, putting a dinov3_huge 4-epoch job near 36 h
+    # against a 24 h partition limit. Passing a multiple of the quantum trades
+    # curve resolution for fitting the wall; see submit_finetune_final.sh.
+    if eval_quantum is not None:
+        if eval_quantum % batch:
+            raise ValueError(
+                f"eval quantum {eval_quantum} is not a whole number of "
+                f"batch-{batch} steps; protocol.eval_every_steps would refuse "
+                f"it and every run would die at startup."
+            )
+        config["eval_quantum"] = eval_quantum
     # The final campaign is 5 seeds per arm, and NOTHING upstream supplies one:
     # trial_config never sets a seed because objective.evaluate passes it for
     # tuning trials, and the final runs have no such wrapper. Without this every

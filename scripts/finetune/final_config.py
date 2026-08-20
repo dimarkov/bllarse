@@ -26,6 +26,7 @@ docstring for why no correction is applied.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -47,6 +48,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--campaign", default=None,
                    help="Campaign suffix the studies were created with.")
     p.add_argument("--epochs", type=float, default=fc.FINAL_EPOCHS)
+    p.add_argument("--seed", type=int, default=None,
+                   help="Reported seed for this run. One process per seed; the "
+                        "uid the scripts derive is keyed on it, so omitting it "
+                        "makes every seed the same run.")
+    p.add_argument("--eval-quantum", type=int, default=None,
+                   help="Samples between evaluations. Coarser than tuning's by "
+                        "default in the launcher: at protocol.EVAL_QUANTUM the "
+                        "val+test forwards roughly double a 4-epoch run.")
     p.add_argument(
         "--batch-size", type=int, default=None,
         help="Target effective batch. Defaults to the tuned batch, i.e. a pure "
@@ -66,7 +75,10 @@ def build_argparser() -> argparse.ArgumentParser:
                         "trial_config's value.")
     p.add_argument("--eval-splits", default=fc.FINAL_EVAL_SPLITS,
                    choices=["val", "val+test"])
-    p.add_argument("--format", default="argv", choices=["argv", "sh", "json"])
+    p.add_argument("--format", default="argv", choices=["argv", "sh", "json", "exec"],
+                   help="`exec` replaces this process with the training run, "
+                        "so a SLURM task resolves its own config from the "
+                        "study instead of having one templated into a script.")
     return p
 
 
@@ -76,8 +88,11 @@ def main() -> None:
     for arm in args.arm:
         study = finetune_worker.open_study(
             arm, args.storage_dir, campaign=args.campaign)
+        kw = {} if args.seed is None else {"seed": args.seed}
+        if args.eval_quantum is not None:
+            kw["eval_quantum"] = args.eval_quantum
         config = fc.best_config(
-            study, arm,
+            study, arm, **kw,
             epochs=args.epochs,
             to_batch=args.batch_size,
             model=args.model,
@@ -87,6 +102,15 @@ def main() -> None:
         )
         script = finetune_worker.SCRIPTS[arm]
         argv = adapters.config_to_argv(config)
+
+        if args.format == "exec":
+            if len(args.arm) != 1:
+                raise SystemExit("[final] --format exec takes exactly one --arm")
+            repo = str(Path(__file__).resolve().parents[2])
+            print(f"[final] exec {script} ({arm}, seed {config['seed']}, "
+                  f"uid derived from model/dataset/arm/seed)", flush=True)
+            os.execv(sys.executable,
+                     [sys.executable, str(Path(repo) / script)] + argv)
 
         if args.format == "json":
             print(json.dumps({"arm": arm, "script": script, "config": config},
