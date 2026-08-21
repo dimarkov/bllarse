@@ -92,7 +92,7 @@ def test_micro_batch_refuses_to_guess():
     # example made the test assert "vbll is unmeasured" -- a fact, not an
     # invariant, and one that expired the moment the probe ran.
     with pytest.raises(KeyError, match="probe_micro_batch"):
-        fs.micro_batch("ivon")
+        fs.micro_batch("ivon", "dinov3_huge")
 
 
 def test_the_pinned_micro_batch_matches_the_full_step_measurement():
@@ -104,33 +104,42 @@ def test_the_pinned_micro_batch_matches_the_full_step_measurement():
     # JAX arms: 32, 64 OOMs. Cross-checks against micro=16 having run on a
     # 32 GB card -- ~13.5 GB of fixed state plus activations scaling about
     # linearly means 16 fits 32 GB and 32 fits 40 GB while 64 does not.
-    assert fs.MICRO_BATCH["ce"] == 32
-    assert fs.MICRO_BATCH["ibprobit"] == 32
+    assert fs.MICRO_BATCH["dinov3_huge"]["ce"] == 32
+    assert fs.MICRO_BATCH["dinov3_huge"]["ibprobit"] == 32
     # vbll: 64 on the same A100, measured the same way (132.1 img/s against
     # 130.0 at 32 and 87.6 at 16). Twice the JAX value because PyTorch frees
     # activations eagerly as the backward consumes them, where the JAX arms
     # hold a jitted graph's live set plus an explicit grads_acc buffer.
-    assert fs.MICRO_BATCH["vbll"] == 64
+    # vbll's 64 belongs to dinov3_large, where it was measured and where 934
+    # tuning trials ran without an OOM. On dinov3_huge it is UNMEASURED and
+    # absent -- returning it there killed five reported runs.
+    assert fs.MICRO_BATCH["dinov3_large"]["vbll"] == 64
+    # HALF that on huge, measured after the borrowed 64 OOMed five runs. The
+    # two backbones needing different values is the whole reason this dict is
+    # keyed on the model.
+    assert fs.MICRO_BATCH["dinov3_huge"]["vbll"] == 32
+    assert fs.MICRO_BATCH["dinov3_huge"]["vbll"] < fs.MICRO_BATCH["dinov3_large"]["vbll"]
     assert "A100" in fs.MICRO_BATCH_DEVICE
 
 
-@pytest.mark.parametrize("arm", sorted(fs.MICRO_BATCH))
-def test_every_pinned_micro_batch_divides_every_rung_of_the_ladder(arm):
+@pytest.mark.parametrize("model,arm", [
+    (m, a) for m, per in sorted(fs.MICRO_BATCH.items()) for a in sorted(per)])
+def test_every_pinned_micro_batch_divides_every_rung_of_the_ladder(model, arm):
     """Otherwise accum_plan raises and the arm cannot run at that batch size.
 
     Design A8: a power of two no larger than the ladder's gcd, so num_accum is
     exact everywhere. 64 satisfies this as readily as 32 -- which is what made
     the vbll measurement adoptable without touching the ladder.
     """
-    micro = fs.MICRO_BATCH[arm]
-    assert micro & (micro - 1) == 0, f"{arm}: {micro} is not a power of two"
+    micro = fs.MICRO_BATCH[model][arm]
+    assert micro & (micro - 1) == 0, f"{model}/{arm}: {micro} is not a power of two"
     for batch in fs.BATCH_SIZES:
-        assert batch % micro == 0, f"{arm}: {micro} does not divide {batch}"
+        assert batch % micro == 0, f"{model}/{arm}: {micro} does not divide {batch}"
 
 
 @pytest.mark.parametrize("arm", ["ce", "ibprobit", "ibprobit_noeps"])
 def test_the_pinned_values_divide_every_rung(arm):
-    micro = fs.micro_batch(arm)
+    micro = fs.micro_batch(arm, "dinov3_large")
     for rung in fs.BATCH_SIZES:
         assert rung % micro == 0, (arm, rung, micro)
 
@@ -139,9 +148,10 @@ def test_any_pinned_micro_batch_divides_every_rung(monkeypatch):
     # protocol.accum_plan raises unless the micro batch divides the target
     # exactly. This pins the invariant so a hand-edited MICRO_BATCH cannot
     # break the bottom rung.
-    monkeypatch.setattr(fs, "MICRO_BATCH", {"ce": 64, "ibprobit": 32, "vbll": 128})
+    monkeypatch.setattr(fs, "MICRO_BATCH",
+                        {"dinov3_large": {"ce": 64, "ibprobit": 32, "vbll": 128}})
     for arm in fs.ARMS:
-        micro = fs.micro_batch(arm)
+        micro = fs.micro_batch(arm, "dinov3_large")
         for rung in fs.BATCH_SIZES:
             assert rung % micro == 0, (arm, rung, micro)
 
@@ -149,8 +159,9 @@ def test_any_pinned_micro_batch_divides_every_rung(monkeypatch):
 def test_both_ibprobit_arms_share_one_micro_batch(monkeypatch):
     # `ibprobit_noeps` is an ablation of the ibprobit head, not a third
     # training step: same script, same memory profile, one measurement.
-    monkeypatch.setattr(fs, "MICRO_BATCH", {"ibprobit": 32})
-    assert fs.micro_batch("ibprobit_noeps") == fs.micro_batch("ibprobit") == 32
+    monkeypatch.setattr(fs, "MICRO_BATCH", {"dinov3_large": {"ibprobit": 32}})
+    assert fs.micro_batch("ibprobit_noeps", "dinov3_large") == fs.micro_batch(
+        "ibprobit", "dinov3_large") == 32
 
 
 # --- Per-arm axes -----------------------------------------------------------
@@ -203,7 +214,7 @@ def test_the_pinned_batch_divides_by_every_arms_micro_batch(arm):
     # protocol.accum_plan raises otherwise, at the top of a ~3 h trial -- and
     # with the batch pinned there is no longer another rung for TPE to escape
     # to, so a mismatch would kill the whole campaign rather than one trial.
-    assert fs.FIXED_BATCH_SIZE % fs.micro_batch(arm) == 0
+    assert fs.FIXED_BATCH_SIZE % fs.micro_batch(arm, "dinov3_large") == 0
 
 
 def test_the_betas_are_searched_rather_than_left_at_the_defaults():
@@ -400,10 +411,10 @@ def test_the_top_rung_evaluates_after_every_optimizer_step():
 
 
 def test_the_pinned_micro_batch_divides_the_new_top_rungs(monkeypatch):
-    monkeypatch.setattr(fs, "MICRO_BATCH", {"ce": 32, "ibprobit": 32})
+    monkeypatch.setattr(fs, "MICRO_BATCH", {"dinov3_large": {"ce": 32, "ibprobit": 32}})
     for rung in (8192, 16384):
-        assert rung % fs.micro_batch("ce") == 0
-        protocol.accum_plan(rung, fs.micro_batch("ce"))
+        assert rung % fs.micro_batch("ce", "dinov3_large") == 0
+        protocol.accum_plan(rung, fs.micro_batch("ce", "dinov3_large"))
 
 
 # --- The batch-invariant search coordinate -----------------------------------

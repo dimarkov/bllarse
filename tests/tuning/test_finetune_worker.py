@@ -18,7 +18,8 @@ from bllarse.tuning import finetune_worker as fw
 def pinned_micro_batch(monkeypatch):
     # MICRO_BATCH ships empty on purpose (it is measured per GPU), so every
     # config test pins it here rather than depending on a checked-in value.
-    monkeypatch.setattr(space, "MICRO_BATCH", {"ce": 64, "ibprobit": 32, "vbll": 64})
+    monkeypatch.setattr(space, "MICRO_BATCH",
+                        {"dinov3_large": {"ce": 64, "ibprobit": 32, "vbll": 64}})
 
 
 def _params(arm):
@@ -69,7 +70,7 @@ def test_the_micro_batch_divides_the_sampled_batch(arm):
 
 def test_an_unmeasured_micro_batch_fails_at_config_time(monkeypatch):
     # Loudly, at submit time -- not three hours into the first trial.
-    monkeypatch.setattr(space, "MICRO_BATCH", {})
+    monkeypatch.setattr(space, "MICRO_BATCH", {"dinov3_large": {}})
     with pytest.raises(KeyError, match="probe_micro_batch"):
         fw.trial_config("ce", params=_params("ce"))
 

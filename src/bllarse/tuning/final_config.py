@@ -179,6 +179,13 @@ def final_config(
         to_batch=batch,
     )
 
+    # The model goes IN, not on afterwards. trial_config derives
+    # micro_batch_size from it, and overriding config["model"] after the fact
+    # left the micro batch pinned to TUNING_MODEL's -- which is precisely how
+    # five vbll runs got dinov3_large's 64 on dinov3_huge and OOMed at model
+    # load. Setting it here means one model decides both.
+    if model is not None:
+        transferred["model"] = model
     config = finetune_worker.trial_config(
         arm, params=transferred, max_samples=from_samples, dump_root=dump_root
     )
@@ -232,9 +239,6 @@ def final_config(
         config["ood_checkpoint_root"] = str(ood_checkpoint_root)
     if ood_max_pending is not None:
         config["ood_max_pending"] = ood_max_pending
-    if model is not None:
-        config["model"] = model
-
     # Check the INVARIANT, not the formula. The betas reach `config` through
     # trial_config's `**params`; what has to survive is the horizon
     # (1-beta)*steps, which is the searched coordinate and the thing the rule

@@ -111,6 +111,49 @@ def open_study(
     )
 
 
+def n_completed(study: optuna.Study) -> int:
+    """Completed trials in the study RIGHT NOW, across every worker.
+
+    `deepcopy=False` and a state filter, not `len(study.trials)`: the property
+    deep-copies every trial including its intermediate values, and these studies
+    already hold thousands of trials with hundreds of reported evaluations each.
+    Called once per trial completion in a callback, that is not free.
+    """
+    return len(
+        study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+    )
+
+
+def stop_at_completed(
+    target: int,
+) -> Callable[[optuna.Study, optuna.trial.FrozenTrial], None]:
+    """Stop this worker once the STUDY -- not this worker -- has `target`
+    completed trials.
+
+    The counterpart to `--n-trials`, which counts trials this worker STARTS and
+    so cannot express "the study should end up with 100 completed". The two
+    differ by everything the pruner kills, and that is most of them: prune rates
+    across this campaign's studies run from 8% to 72%, so a per-worker trial
+    count converts into a completed count nobody can predict in advance. The
+    first campaign gave adamw_ce 16 trials per worker and ibprobit 32, which
+    landed at 40-45 and 35-103 completed respectively -- the arms were searched
+    to different depths, and the depth was not the number anyone chose.
+
+    Reading the shared journal rather than a local counter is what makes four
+    workers cooperate: whoever finishes a trial checks the global total, so a
+    fast worker keeps going while a slow one is mid-trial instead of each
+    stopping at target/4. The cost is a mild overshoot -- up to three trials
+    already in flight elsewhere still complete -- which is why the flag is a
+    floor ("at least") and not an exact count.
+    """
+
+    def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if n_completed(study) >= target:
+            study.stop()
+
+    return callback
+
+
 def summarize_study(study: optuna.Study) -> str:
     """One line describing what this worker achieved.
 
@@ -217,6 +260,7 @@ def make_objective(
     patience: int | None = None,
     warmup_evals: int = objective_mod.DEFAULT_WARMUP_EVALS,
     min_relative_improvement: float = objective_mod.DEFAULT_MIN_RELATIVE_IMPROVEMENT,
+    smooth_window: int | None = None,
     **config_kw: Any,
 ) -> Callable[[optuna.Trial], float]:
     """The optuna objective closure for one study.
@@ -237,6 +281,16 @@ def make_objective(
         trial.set_user_attr("steps", budgets[dataset]["steps"])
         trial.set_user_attr("eval_quantum", config["eval_quantum"])
 
+        # A FIXED evaluation count, identical for every trial -- see
+        # objective.DEFAULT_SMOOTH_WINDOW for why this must not be derived from
+        # the planned grid. Recorded on the trial because it is part of the
+        # objective's definition: two trials scored under different windows are
+        # not comparable, and without this the journal would not say which
+        # applied.
+        window = smooth_window
+        if window is not None:
+            trial.set_user_attr("smooth_window", window)
+
         # Where this trial's val_nll bottomed out, and how far it got. Recorded
         # from the callback rather than from the dumps because tuning dumps are
         # deleted once the objective is computed -- the journal is all that
@@ -250,6 +304,11 @@ def make_objective(
         # patience is too large -- and the two call for opposite corrections.
         # First seed only, like the rest of on_dump.
         seen = {"total": 0, "argmin": 0, "best": float("inf")}
+        # The pruner must judge trials by the statistic they are SCORED on.
+        # Reporting raw val_nll while scoring the windowed mean lets the pruner
+        # select for the dips the objective exists to ignore -- see
+        # objective.RunningWindow for what that cost the `smoothed` campaign.
+        running = None if window is None else objective_mod.RunningWindow(window)
 
         def on_dump(
             eval_index: int, step: int, samples_seen: int,
@@ -267,7 +326,9 @@ def make_objective(
             # means matching samples_seen, which the old geometric step grid did
             # not: at index i a batch-16384 trial had seen 256x the data of a
             # batch-64 one, and the pruner compared them anyway.
-            trial.report(float(scalars["val_nll"]), eval_index)
+            trial.report(
+                value if running is None else running.push(value), eval_index
+            )
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
@@ -286,6 +347,7 @@ def make_objective(
             warmup_evals=warmup_evals,
             min_relative_improvement=min_relative_improvement,
             on_converged=on_converged,
+            smooth_window=window,
         )
 
         # Recorded so a campaign can be audited afterwards for how much
@@ -310,8 +372,19 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--arm", required=True, choices=sorted(objective_mod.SCRIPTS))
     p.add_argument("--dataset", required=True, choices=sorted(space.DATASETS))
     p.add_argument("--n-trials", type=int, required=True,
-                   help="Trials THIS worker runs. With 4 workers, one quarter "
-                        "of the study's total.")
+                   help="Trials THIS worker runs, pruned ones included. With 4 "
+                        "workers, one quarter of the study's total. Acts as the "
+                        "hard cap when --target-complete is also given.")
+    p.add_argument(
+        "--target-complete", type=int, default=None,
+        help="Stop once the STUDY has at least this many COMPLETED trials, "
+             "counting the ones already in its journal from earlier "
+             "submissions. Unlike --n-trials this is invariant to the prune "
+             "rate, which varies 8%%-72%% across these studies, so it is the "
+             "only form in which 'search every arm to the same depth' can be "
+             "requested. --n-trials still caps the worker, so a study that "
+             "cannot reach the target terminates rather than running the wall.",
+    )
     p.add_argument("--storage-dir", required=True)
     p.add_argument("--dump-root",
                    default=os.environ.get("BLLARSE_EVAL_DUMP_ROOT", "eval_dumps"))
@@ -347,6 +420,19 @@ def build_argparser() -> argparse.ArgumentParser:
         default=objective_mod.DEFAULT_MIN_RELATIVE_IMPROVEMENT,
         help="Relative val_nll decrease required to reset the patience counter.",
     )
+    p.add_argument(
+        "--smooth-window", type=int, default=None,
+        help="Score trials on the lowest MEAN val_nll over this many "
+             "CONSECUTIVE evaluations, instead of on the single-point minimum. "
+             "The minimum is the deepest dip of the trajectory, so on a config "
+             "that never converges it measures noise rather than the level "
+             "reached. A COUNT, not a fraction of the grid: patience truncates "
+             "runs far below their planned budget, so a fraction of the plan "
+             "overruns the data and degenerates into the mean of the whole run "
+             f"(see objective.DEFAULT_SMOOTH_WINDOW). Suggested: "
+             f"{objective_mod.DEFAULT_SMOOTH_WINDOW}. Default: disabled. "
+             "Changing this changes the objective, so it needs a new --campaign.",
+    )
     return p
 
 
@@ -357,6 +443,21 @@ def main() -> None:
     # The group_id carries the campaign too, so the dumps and the MLflow runs
     # of two campaigns never land in the same directory or the same tag value.
     group_id = f"tune_{study_name(args.arm, args.dataset, args.campaign)}"
+
+    # Checked BEFORE optimize, not only in the callback: the callback cannot
+    # fire until a trial has completed, so a study already at its target would
+    # otherwise pay one full trial per worker to discover it has nothing to do.
+    # Across 28 studies resumed at once, several of which are already there,
+    # that is a hundred-odd wasted trials and the GPU hours behind them.
+    if args.target_complete is not None:
+        already = n_completed(study)
+        if already >= args.target_complete:
+            print(f"[tune] {study.study_name}: {already} completed trials "
+                  f">= target {args.target_complete}, nothing to do.")
+            print(summarize_study(study))
+            return
+        print(f"[tune] {study.study_name}: {already} completed, "
+              f"target {args.target_complete}, cap {args.n_trials} this worker.")
 
     def log_failed_trial(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         # Printed unconditionally on any non-COMPLETE, non-PRUNED outcome so a
@@ -375,6 +476,7 @@ def main() -> None:
             patience=args.patience,
             warmup_evals=args.warmup_evals,
             min_relative_improvement=args.min_relative_improvement,
+            smooth_window=args.smooth_window,
             cache_dir=args.cache_dir,
             split_cache_dir=args.split_cache_dir,
             enable_mlflow=not args.no_mlflow,
@@ -394,7 +496,10 @@ def main() -> None:
         # without needing to say so explicitly -- a Ctrl-C or job-timeout SIGTERM
         # still tears the worker down instead of being swallowed as a failure.
         catch=(Exception,),
-        callbacks=[log_failed_trial],
+        callbacks=(
+            [log_failed_trial] if args.target_complete is None
+            else [log_failed_trial, stop_at_completed(args.target_complete)]
+        ),
     )
     print(summarize_study(study))
 

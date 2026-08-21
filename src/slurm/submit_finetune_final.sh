@@ -202,7 +202,7 @@ submit_workers() {
   [[ -n "${BLLARSE_HF_HOME:-}" ]] && wexports+=",BLLARSE_HF_HOME=${BLLARSE_HF_HOME}"
   [[ -n "${BLLARSE_FT_PYLIBS:-}" ]] && wexports+=",BLLARSE_FT_PYLIBS=${BLLARSE_FT_PYLIBS}"
   local wcmd=(sbatch
-    --job-name "ftood_${framework}_${BLLARSE_FT_CAMPAIGN}"
+    --job-name "ftood_${framework}_${BLLARSE_FT_MODEL#dinov3_}"
     --array "0-$((n - 1))"
     --export "ALL,${wexports}"
     "${repo_root}/src/slurm/jobs/slurm_ood_worker.sh")
@@ -242,7 +242,7 @@ for arm in $BLLARSE_FT_ARMS; do
   exports+=",BLLARSE_FT_OOD_MAX_PENDING=${BLLARSE_FT_OOD_MAX_PENDING}"
 
   cmd=(sbatch
-       --job-name "ftfinal_${arm}_${BLLARSE_FT_CAMPAIGN}"
+       --job-name "ftfinal_${arm}_${BLLARSE_FT_MODEL#dinov3_}"
        --array "0-$((n_seeds - 1))%${BLLARSE_FT_THROTTLE}"
        --export "ALL,${exports}"
        "$job")

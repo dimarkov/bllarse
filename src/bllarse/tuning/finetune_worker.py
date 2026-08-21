@@ -292,8 +292,9 @@ def trial_config(
     # searched. See space.HEAD_LR_RATIO_BOX.
     head_lr_ratio = params.pop("head_lr_ratio", None)
 
+    model = params.pop("model", None) or space.TUNING_MODEL
     config: dict[str, Any] = {
-        "model": space.TUNING_MODEL,
+        "model": model,
         "dataset": "imagenet1k",
         "img_size": 224,
         "max_samples": max_samples,
@@ -310,7 +311,8 @@ def trial_config(
         "dump_every_k_evals": DUMP_EVERY_K_EVALS,
         "ood_every_k_dumps": OOD_EVERY_K_DUMPS,
         "val_fraction": VAL_FRACTION,
-        "micro_batch_size": space.micro_batch(arm),
+        # Keyed on the MODEL too: vbll fits 64 on large and OOMs on huge.
+        "micro_batch_size": space.micro_batch(arm, model),
         "bf16": bf16,
         **params,
     }

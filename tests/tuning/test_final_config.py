@@ -497,3 +497,40 @@ def test_a_real_suggest_trial_round_trips_through_the_recorded_shape():
         for b in ("beta1", "beta2"):
             assert protocol.horizons(cfg[b], final_steps) == pytest.approx(
                 protocol.horizons(returned[b], tune_steps)), (arm, b)
+
+
+# --- The micro batch must follow the MODEL, not the tuning model -------------
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("dinov3_large", 64), ("dinov3_huge", 32)])
+def test_the_vbll_micro_batch_follows_the_backbone(model, expected):
+    """The bug that killed five reported runs, at the layer it survived in.
+
+    MICRO_BATCH became per-(model, arm), but final_config still set
+    config["model"] AFTER trial_config had already derived micro_batch_size
+    from TUNING_MODEL. So dinov3_huge runs went out carrying dinov3_large's 64
+    and died with `torch.OutOfMemoryError` at model load. The model has to go
+    IN to trial_config, so one value decides both.
+    """
+    params = {"lr": 1.5e-5, "weight_decay": 1.4e-3, "head_lr_ratio": 326.0,
+              "kl_ratio": 3e-7, "prior_scale": 1.7e-3}
+    config = fc.final_config("vbll", params, effective_batch=512,
+                             from_samples=TUNE_SAMPLES, model=model)
+    assert config["model"] == model
+    assert config["micro_batch_size"] == expected
+
+
+def test_the_micro_batch_always_divides_the_batch_it_ships_with():
+    # protocol.accum_plan raises otherwise -- at the top of a ~22 h run.
+    for arm in ("ce", "ibprobit_noeps", "vbll"):
+        params = {"lr": 1e-5, "weight_decay": 1e-5}
+        params.update({"ce": {"head_lr_ratio": 30.0},
+                       "ibprobit_noeps": {"q_init": 5e-5, "num_update_iters": 128},
+                       "vbll": {"head_lr_ratio": 300.0, "kl_ratio": 1e-3,
+                                "prior_scale": 100.0}}[arm])
+        for model in ("dinov3_large", "dinov3_huge"):
+            c = fc.final_config(arm, params, effective_batch=512,
+                                from_samples=TUNE_SAMPLES, model=model)
+            assert c["batch_size"] % c["micro_batch_size"] == 0, (arm, model)
+            protocol.accum_plan(c["batch_size"], c["micro_batch_size"])

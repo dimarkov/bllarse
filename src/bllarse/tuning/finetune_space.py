@@ -173,7 +173,13 @@ BETA1_HORIZONS_BOX = (39.0, 780.0)
 # memory unused, and neither is visible from a finished run's config.
 MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 
-# Per-forward batch, per arm, for dinov3_huge at 224 with bf16.
+# Per-forward batch, keyed by (MODEL, arm), at 224 with bf16 on an A100-40GB.
+#
+# Keyed by MODEL as well as arm, which is a CORRECTION. It used to be arm-only,
+# so micro_batch("vbll") returned 64 whatever backbone was being trained -- a
+# value measured on dinov3_large. The final campaign switched to dinov3_huge
+# and all five vbll runs died at model load. The constant was not wrong; it was
+# answering a question with two arguments while being given one.
 #
 # 32 on both arms; 64 OOMs on both. Measured by
 # scripts/finetune/probe_micro_batch.py running a FULL optimizer step --
@@ -201,24 +207,23 @@ MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 #
 # Values must satisfy probe_micro_batch.floor_to_ladder_divisor: a power of two
 # no larger than 256 (the ladder's gcd), so num_accum is exact at every rung.
-MICRO_BATCH: dict[str, int] = {
-    "ce": 32,
-    "ibprobit": 32,
-    # 64, and it is not a typo that this is twice the JAX arms'. Measured the
-    # same way -- a FULL step of scripts/finetune/finetune_vbll.py at a
-    # one-evaluation budget, not a synthetic forward -- on the same A100:
-    # 64 fits at 132.1 img/s, 32 at 130.0, 16 at 87.6.
+MICRO_BATCH: dict[str, dict[str, int]] = {
+    # Not a fresh measurement: this is what the whole betasearch1m tuning
+    # campaign ran at, 934 trials with no OOM -- a stronger guarantee than a
+    # probe. vbll's 64 belongs to THIS row and always did.
+    "dinov3_large": {"ce": 32, "ibprobit": 32, "vbll": 64},
+    # vbll is 32 here, not the 64 it takes on large. Measured after the
+    # borrowed value killed five reported runs with
+    # `torch.OutOfMemoryError: tried to allocate 32.00 MiB` on a 39.49 GiB
+    # card that already held 36.5 GiB: a real 32,768-sample run completed at
+    # both 32 and 16, and 32 is taken because it needs half the accumulation
+    # steps of 16 for the same memory headroom.
     #
-    # A different framework has a different activation profile, which is
-    # exactly why `micro_batch` raises rather than borrowing. PyTorch frees
-    # activations eagerly as the backward consumes them, where the JAX arms
-    # hold a jitted graph's live set plus an explicit grads_acc buffer; and
-    # VBLL's head is small next to IBProbit's CAVI state.
-    #
-    # 64 over 32 buys 1.5%, so this is not the throughput lever -- the plateau
-    # between them says the trunk's compute binds, not memory. It is taken
-    # because it is free, not because it is worth tuning.
-    "vbll": 64,
+    # The two settings scored val_nll 0.8486 and 0.8489 on identical data,
+    # which is the check that matters: the micro batch is a MEMORY artefact
+    # and must not move the arithmetic. A gap larger than accumulation-order
+    # noise would mean it does.
+    "dinov3_huge": {"ce": 32, "ibprobit": 32, "vbll": 32},
 }
 
 # Pinned, not searched -- the ONE head axis the probing campaign transfers as a
@@ -504,24 +509,30 @@ def _suggest_betas(trial: Any, steps: int) -> tuple[float, float]:
             protocol.beta_from_horizons(h2, steps))
 
 
-def micro_batch(arm: str) -> int:
-    """The pinned per-forward batch for `arm`.
+def micro_batch(arm: str, model: str = TUNING_MODEL) -> int:
+    """The pinned per-forward batch for (`model`, `arm`).
 
-    Raises rather than defaulting: the value is hardware-specific and
-    unrecoverable from a finished run's config, so a guess here would either
-    OOM mid-trial or waste memory across the whole campaign, invisibly.
+    Raises rather than defaulting OR borrowing another backbone's value. The
+    number is hardware- AND model-specific and unrecoverable from a finished
+    run's config, so a guess either OOMs mid-run or wastes memory across a
+    whole campaign, invisibly. Borrowing is the failure that actually happened.
     """
     flag_arm = "ibprobit" if arm.startswith("ibprobit") else arm
-    if flag_arm not in MICRO_BATCH:
+    per_model = MICRO_BATCH.get(model)
+    if per_model is None:
         raise KeyError(
-            f"no pinned micro batch for arm {flag_arm!r}. Measure it on the "
-            f"target GPU first:\n"
+            f"no pinned micro batches for model {model!r}; known: "
+            f"{sorted(MICRO_BATCH)}")
+    if flag_arm not in per_model:
+        raise KeyError(
+            f"no pinned micro batch for arm {flag_arm!r} on {model!r}. "
+            f"Measure it on the target GPU first:\n"
             f"    python scripts/finetune/probe_micro_batch.py "
             f"--arm {flag_arm if flag_arm != 'vbll' else 'ce'} "
-            f"--model {TUNING_MODEL} --bf16\n"
+            f"--model {model} --bf16\n"
             f"then pin the printed value in finetune_space.MICRO_BATCH."
         )
-    return MICRO_BATCH[flag_arm]
+    return per_model[flag_arm]
 
 
 def eval_count(max_samples: int = protocol.MAX_SAMPLES) -> int:
