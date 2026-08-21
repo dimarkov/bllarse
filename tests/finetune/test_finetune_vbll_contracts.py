@@ -204,3 +204,30 @@ def test_both_arms_load_the_same_ood_suite_from_one_place():
 
     assert hasattr(im, "load_ood_sets")
     assert hasattr(fv, "load_ood_sets")
+
+
+def test_the_ood_registry_imports_without_equinox():
+    """The torch OOD worker died on this before consuming one checkpoint.
+
+    imagenet.load_ood_sets imports precompute_ood_features, which imported
+    vit_classification at module scope, which imports equinox -- absent from
+    the torch venv by design (jax[cuda] and torch cannot share an
+    environment). Moving the OOD loader into a shared module made it look
+    framework-agnostic while it still pulled equinox in transitively.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path("scripts/dinov3/precompute_ood_features.py").read_text()
+    tree = ast.parse(src)
+    top_level = {
+        n.module for n in tree.body
+        if isinstance(n, ast.ImportFrom) and n.module
+    } | {
+        a.name for n in tree.body if isinstance(n, ast.Import) for a in n.names
+    }
+    for forbidden in ("vit_classification", "jax", "equinox"):
+        assert not any(m == forbidden or m.startswith(forbidden + ".")
+                       for m in top_level), (
+            f"{forbidden} imported at module scope; the torch venv cannot "
+            f"build the OOD registry")

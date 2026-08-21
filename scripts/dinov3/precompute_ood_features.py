@@ -29,19 +29,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import numpy as np
-from jax import random as jr, config
 
 from datasets import load_dataset, load_dataset_builder
 
-from vit_classification import (
-    EQUIMO_MODELS,
-    IMAGENET_MEAN,
-    IMAGENET_STD,
-    get_pretrained_backbone,
-    load_or_compute_features,
-    download_features_from_hf,
-    upload_features_to_hf,
-)
+# vit_classification and jax are imported INSIDE main(), not here.
+#
+# `build_ood_registry` and the `prepare_*` functions need only `datasets` and
+# numpy, and bllarse.finetune.imagenet.load_ood_sets calls them from BOTH arms
+# -- including the torch venv, which has no equinox. A module-level
+# `from vit_classification import ...` pulls equinox in transitively and killed
+# the torch OOD worker with ModuleNotFoundError before it consumed a single
+# checkpoint. Everything below that needs these names uses them inside main().
 
 # OOD features are extracted at imagenet1k's resolution so the head (trained on
 # imagenet1k_res512 features) sees inputs from the same feature space.
@@ -167,6 +165,17 @@ def build_ood_registry():
 
 
 def main():
+    from jax import random as jr, config
+    from vit_classification import (
+        EQUIMO_MODELS,
+        IMAGENET_MEAN,
+        IMAGENET_STD,
+        get_pretrained_backbone,
+        load_or_compute_features,
+        download_features_from_hf,
+        upload_features_to_hf,
+    )
+
     registry = build_ood_registry()
     all_keys = list(registry.keys())
 
