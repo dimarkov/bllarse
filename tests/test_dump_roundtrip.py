@@ -46,3 +46,40 @@ def test_temperature_fit_survives_the_round_trip(tmp_path):
     )
     rec = evaldump.load_dump(path)
     assert metrics.fit_temperature(rec.logits, rec.labels) == pytest.approx(in_loop_T, rel=1e-2)
+
+
+def _write(tmp_path, step, split, *, n=64, k=5):
+    rng = np.random.default_rng(step)
+    return evaldump.write_dump(
+        tmp_path, "g", "u", step=step,
+        logits=rng.normal(size=(n, k)).astype(np.float32),
+        labels=rng.integers(0, k, size=n),
+        arm="adamw_ce", split=split, logit_kind="softmax_logits",
+        seed=137, samples_seen=step * 10,
+    )
+
+
+def test_iter_dumps_raises_on_a_truncated_dump_by_default(tmp_path):
+    _write(tmp_path, 1, "test")
+    bad = _write(tmp_path, 2, "test")
+    # `write_dump` hands the path straight to np.savez_compressed, so a job
+    # killed mid-write leaves exactly this behind: a half-written zip.
+    bad.write_bytes(bad.read_bytes()[: bad.stat().st_size // 2])
+
+    with pytest.raises(Exception):
+        list(evaldump.iter_dumps(tmp_path, "g", "u"))
+
+
+def test_iter_dumps_skips_and_records_a_truncated_dump_when_asked(tmp_path):
+    _write(tmp_path, 1, "test")
+    bad = _write(tmp_path, 2, "test")
+    _write(tmp_path, 3, "test")
+    bad.write_bytes(bad.read_bytes()[: bad.stat().st_size // 2])
+    evaldump.CORRUPT_DUMPS.clear()
+
+    records = list(evaldump.iter_dumps(tmp_path, "g", "u", skip_corrupt=True))
+
+    # One bad file costs that file, not the run.
+    assert [r.meta["step"] for r in records] == [1, 3]
+    assert evaldump.CORRUPT_DUMPS == [str(bad)]
+    evaldump.CORRUPT_DUMPS.clear()

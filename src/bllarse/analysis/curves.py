@@ -22,16 +22,132 @@ from bllarse import detection, evaldump, metrics
 _METRICISABLE_LOGIT_KINDS = frozenset({"softmax_logits"})
 
 
-def _by_split(root, group_id: str, uid: str) -> dict[str, dict[int, Any]]:
+# Which arms get temperature scaling. AdamW+CE alone, and this is a claim about
+# the experiment, not a convenience.
+#
+# TS is the cheap post-hoc fix available to a plain softmax head, so it belongs
+# beside CE as its own comparator -- results-plan 0.2 requires it there. It does
+# NOT belong on VBLL or IBProbit, for two separate reasons:
+#
+#   1. Their claim is calibration by construction. Temperature-scaling them
+#      measures how much a one-parameter rescaling can rescue a method that says
+#      it does not need one -- a different question, and one the paper does not
+#      ask.
+#   2. It is not even the same operation. `apply_temperature` divides by T and
+#      softmaxes, which is temperature scaling only when the input is a LOGIT
+#      vector. AdamW+CE dumps those. VBLL and IBProbit dump an already-normalized
+#      log-predictive, so dividing it by T and renormalizing yields p^(1/T) --
+#      a sharpening of the predictive, not a rescaling of logits. Reporting it
+#      under the same `ts_` name invites a comparison between two different
+#      transforms.
+#
+# Enforced at BOTH ends: the analysis does not compute these for other arms, and
+# `mlflow_sync.fetch_rows` drops them on read. The second guard is not
+# redundant -- an earlier sync already wrote `scored_ts_*` onto the VBLL and
+# IBProbit runs, and MLflow's API has no way to delete a metric.
+TS_ARMS = frozenset({"adamw_ce"})
+
+
+def applies_temperature_scaling(arm: str | None) -> bool:
+    """Whether `arm` gets a temperature-scaled variant. See TS_ARMS.
+
+    `None` means unknown, and returns False: a caller that cannot say which arm
+    it holds must not get TS numbers by default.
+    """
+    return arm in TS_ARMS
+
+
+# A run whose val optimum falls in the last tenth of its budget had not
+# meaningfully turned. `at_last_eval` alone is too strict to catch that: it is an
+# EXACT comparison, and on the fine grids (batch size == eval quantum, so one
+# evaluation per step) a run peaks at index 29,992 of 30,000 and reads as
+# untruncated. Measured on the Fig 1 campaign, the exact flag fires on 1 run of
+# 599 while 18 sit past this fraction -- including all ten seeds of
+# adamw_ce/flowers102/dinov3_small at a median 99.8% of budget, a whole cell
+# whose plotted point is a lower bound.
+#
+# 0.9 is a judgement, not a derivation, which is why it is one named constant
+# rather than a literal buried in three call sites.
+TRUNCATION_FRACTION = 0.9
+
+
+def completeness(
+    meta: Any, *, eval_index: int | None = None, evals_planned: int | None = None
+) -> dict[str, Any]:
+    """Did the run behind this dump finish its budget, and did it converge?
+
+    Three states, kept distinct because they call for different responses:
+
+      complete    evals_run == evals_planned and the argmin came comfortably
+                  before the end. The reported point is where it converges.
+      truncated   the argmin is at or near the last evaluation -- see
+                  TRUNCATION_FRACTION. The budget ran out before the val curve
+                  turned, so the point is a lower bound on what the
+                  configuration reaches. A real measurement of a run still
+                  improving: mark it, do not drop it.
+      incomplete  evals_run < evals_planned. The run DIED. Its dump measures
+                  nothing about the method, only where the process stopped.
+
+    That third state is invisible without the counts, and it is not
+    hypothetical: both probing scripts call `_write_best` from a `finally`, so a
+    crashed run writes a normal-looking argmin dump. Two such runs reached the
+    published Fig 1 undetected.
+
+    Fields are None on dumps written before they existed. Unknown must never be
+    promoted to complete -- a caller that filters on `incomplete` being truthy
+    keeps unknown runs, which is the safe direction only because the two known
+    casualties are named explicitly in the Fig 1 script.
+
+    `eval_index` and `evals_planned` are FALLBACKS for dumps that predate those
+    meta fields, and the dump's own values always win. They exist because
+    neither quantity actually requires re-running anything: the dump already
+    records the argmin's `samples_seen`, `eval_quantum` is a pure function of
+    the dataset, and the budget is fixed by the sweep config -- so a caller that
+    knows which sweep a dump came from can supply both. Nothing here can
+    reconstruct `evals_run`, which is why a crashed run stays undetectable on
+    old dumps and only `incomplete` genuinely needs the newer writer.
+    """
+    run = meta.get("evals_run")
+    planned = meta.get("evals_planned")
+    planned = evals_planned if planned is None else planned
+    index = meta.get("eval_index")
+    index = eval_index if index is None else index
+    at_last = meta.get("at_last_eval")
+
+    fraction = None
+    if index is not None and planned:
+        fraction = index / planned
+    # The exact flag still counts, and on a coarse grid it is the only signal
+    # there is -- a 26-evaluation budget has no meaningful "last tenth".
+    truncated = at_last
+    if fraction is not None:
+        truncated = bool(at_last) or fraction > TRUNCATION_FRACTION
+
+    return {
+        "at_last_eval": at_last,
+        "eval_index": index,
+        "evals_run": run,
+        "evals_planned": planned,
+        "budget_fraction": fraction,
+        "truncated": truncated,
+        "incomplete": None if run is None or planned is None else run < planned,
+    }
+
+
+def _by_split(
+    root, group_id: str, uid: str, *, skip_corrupt: bool = False
+) -> dict[str, dict[int, Any]]:
     """Index a run's dumps as {split: {step: record}}."""
     indexed: dict[str, dict[int, Any]] = {}
-    for record in evaldump.iter_dumps(root, group_id, uid):
+    for record in evaldump.iter_dumps(root, group_id, uid,
+                                      skip_corrupt=skip_corrupt):
         indexed.setdefault(record.meta["split"], {})[record.meta["step"]] = record
     return indexed
 
 
 def run_curve(
-    root, group_id: str, uid: str, *, temperature_scaled: bool = False
+    root, group_id: str, uid: str, *, temperature_scaled: bool = False,
+    skip_corrupt: bool = False,
 ) -> list[dict[str, Any]]:
     """One row per dumped step, on the test split.
 
@@ -41,8 +157,14 @@ def run_curve(
     Each row carries `seed` and `arm` from the dump's own meta, so a caller
     grouping runs by seed (e.g. for `thresholds.crossings_per_seed`) can read
     them straight off the row instead of re-parsing the uid string.
+
+    `skip_corrupt=True` drops unreadable dumps instead of raising, leaving a
+    hole in the returned grid rather than losing the whole curve. Only the
+    batch scorer should set it -- see `evaldump.iter_dumps`. A TS row needs
+    BOTH the test and the val dump at its step, so a corrupt val dump silently
+    removes that step from the scaled pass while leaving it in the raw one.
     """
-    indexed = _by_split(root, group_id, uid)
+    indexed = _by_split(root, group_id, uid, skip_corrupt=skip_corrupt)
     if "test" not in indexed:
         raise ValueError(f"no test-split dumps found for {group_id}/{uid}")
 
@@ -63,6 +185,11 @@ def run_curve(
         if temperature_scaled:
             val_record = indexed.get("val", {}).get(step)
             if val_record is None:
+                if skip_corrupt:
+                    # The val dump at this step was unreadable, so there is
+                    # nothing to fit T against. Drop the point from the scaled
+                    # pass; the raw pass still keeps it.
+                    continue
                 raise ValueError(
                     f"temperature scaling needs a val dump at step {step} for "
                     f"{group_id}/{uid}, but none was written"
