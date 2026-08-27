@@ -73,19 +73,27 @@ def _mean_curve(data, uids, pass_key="id"):
     on which run happened to be first in a dict.
     """
     per_metric = {}
-    for metric in ("acc", "nll", "brier"):
+    for metric in ("acc", "nll", "brier", "val_nll"):
         per_seed = {seed: [(x, y) for x, y in zip(
             data["runs"][uid][pass_key]["samples_seen"],
             data["runs"][uid][pass_key][metric])] for seed, uid in uids.items()}
         xs, mean, _lo, _hi, _n = final_json.band(per_seed)
         per_metric[metric] = dict(zip(xs, mean))
+    # Intersection, not union: the reference point is chosen by val_nll and
+    # scored on acc/nll/brier, so a step missing any one of them cannot be the
+    # reference and must not enter the curve half-formed.
     xs = sorted(set.intersection(*(set(v) for v in per_metric.values())))
     return [{"step": x, "samples_seen": x,
              **{m: per_metric[m][x] for m in per_metric}} for x in xs]
 
 
-def pick_targets(data, fraction):
-    """Targets from the strongest of the CE variants, by converged NLL."""
+def pick_targets(data, fraction, reference="early_stop"):
+    """Targets from the strongest of the CE variants, at its reference point.
+
+    "Strongest" is decided at the same reference point the targets come from,
+    not at the endpoint: with a non-monotone curve the two can disagree about
+    which CE variant is stronger.
+    """
     best = None
     for arm, pass_key in BASELINES:
         by_arm = final_json.uids_by_arm(data, pass_key)
@@ -95,15 +103,24 @@ def pick_targets(data, fraction):
         curve = _mean_curve(data, uids, pass_key)
         if not curve:
             continue
-        converged = max(curve, key=lambda r: r["step"])
-        if best is None or converged["nll"] < best[0]["nll"]:
-            best = (converged, f"{arm}/{pass_key}", curve)
+        if reference == "early_stop":
+            if "val_nll" not in curve[0]:
+                raise SystemExit(
+                    "[fig7] --reference early_stop needs val_nll on the scored "
+                    "curves; re-score with a score_final that emits it.")
+            chosen = thresholds.early_stop(curve).row
+        else:
+            chosen = max(curve, key=lambda r: r["step"])
+        if best is None or chosen["nll"] < best[0]["nll"]:
+            best = (chosen, f"{arm}/{pass_key}", curve)
     if best is None:
         raise SystemExit("[fig7] no CE baseline in the scored JSON")
-    converged, name, curve = best
-    targets = thresholds.make_targets(curve, fraction=fraction)
-    print(f"[fig7] baseline {name}: converged acc={converged['acc']:.4f} "
-          f"nll={converged['nll']:.4f} brier={converged['brier']:.4f}")
+    chosen, name, curve = best
+    targets = thresholds.make_targets(curve, fraction=fraction,
+                                      reference=reference)
+    print(f"[fig7] baseline {name} at {reference} "
+          f"({chosen['samples_seen']:,} samples): acc={chosen['acc']:.4f} "
+          f"nll={chosen['nll']:.4f} brier={chosen['brier']:.4f}")
     print(f"[fig7] targets at {fraction:g}: acc>={targets.acc:.4f} "
           f"nll<={targets.nll:.4f} brier<={targets.brier:.4f}")
     return targets, name
@@ -271,7 +288,7 @@ def make_figure(data, out_path, *, targets, baseline, fraction,
                  "GiB", "no --memory given;\nrun probe_micro_batch.py")
     fig.suptitle(
         f"Fig 7 — cost to a JOINT acc/NLL/Brier target at "
-        f"{fraction:g}x the {baseline} baseline's converged value\n"
+        f"{fraction:g}x the {baseline} baseline's early-stopped value\n"
         + final_json.provenance(data), fontsize=9, y=1.02)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight", dpi=150)
@@ -286,6 +303,14 @@ def main():
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig7_compute_to_threshold")
     p.add_argument("--fraction", type=float, default=0.95)
+    p.add_argument("--reference", default="early_stop",
+                   choices=["early_stop", "last"],
+                   help="Which point of the baseline the targets come from. "
+                        "early_stop is the val-NLL argmin -- the operating "
+                        "point a practitioner would deploy. `last` is the "
+                        "final evaluation, which on a non-monotone curve "
+                        "spends most of the 5%% tolerance on the baseline's "
+                        "own late decay.")
     p.add_argument("--wallclock", default=None,
                    help="scripts/analysis/wallclock_from_dumps.py output: a "
                         "measured (samples, elapsed) timeline per run.")
@@ -296,7 +321,7 @@ def main():
 
     data = final_json.load(args.scores)
     print(f"[fig7] {final_json.provenance(data)}")
-    targets, baseline = pick_targets(data, args.fraction)
+    targets, baseline = pick_targets(data, args.fraction, args.reference)
     wallclock = json.loads(Path(args.wallclock).read_text()) if args.wallclock else {}
     memory = {}
     for path in args.memory or ():

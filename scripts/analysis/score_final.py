@@ -127,13 +127,18 @@ def main() -> None:
         prior_run = out["runs"].get(uid)
         if prior_run is not None:
             # Keep it only if it carries everything THIS scorer would write. A
-            # record from before `ood_ts` existed is not "already scored" -- it
-            # is missing a field, and silently keeping it would leave the
-            # figure short of a line with no error anywhere.
+            # record from before a field existed is not "already scored" -- it
+            # is missing that field, and silently keeping it would leave the
+            # figure short of a line, or a selection rule short of its
+            # criterion, with no error anywhere.
             wanted_ts = (not args.skip_ts) and "_ce_" in uid
-            if not wanted_ts or prior_run.get("ood_ts"):
+            missing = [f for f in ("ood_ts",) if wanted_ts and not prior_run.get(f)]
+            if "val_nll" not in (prior_run.get("id") or {}):
+                missing.append("id.val_nll")
+            if not missing:
                 continue
-            print(f"[score] {uid}: re-scoring, prior record has no ood_ts")
+            print(f"[score] {uid}: re-scoring, prior record lacks "
+                  f"{', '.join(missing)}")
         run = {"id": {}, "ts": {}, "ood": defaultdict(dict),
                "ood_ts": defaultdict(dict)}
         temperatures: dict[int, float] = {}
@@ -159,6 +164,15 @@ def main() -> None:
                 "nll": [r["nll"] for r in rows],
                 "ece": [r["ece"] for r in rows],
                 "brier": [r["brier"] for r in rows],
+                # The VAL side of the same rows. Selection is on val and
+                # reporting is on test -- disjoint by construction -- so
+                # anything that picks an operating point (early stopping, and
+                # Fig 7's threshold reference) must read these and never the
+                # test curve it is about to report. None where the val dump at
+                # that step was unreadable.
+                "val_nll": [r.get("val_nll") for r in rows],
+                "val_acc": [r.get("val_acc") for r in rows],
+                "val_brier": [r.get("val_brier") for r in rows],
                 "seed": rows[0]["seed"] if rows else None,
                 "arm": rows[0]["arm"] if rows else None,
                 # A boundary T is a clip, not an optimum. Carried through so a

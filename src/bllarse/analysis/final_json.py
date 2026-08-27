@@ -158,12 +158,21 @@ def rows(data, uid, pass_key="id"):
     """
     block = (data["runs"][uid].get(pass_key) or {})
     xs = block.get("samples_seen") or []
-    return [
-        {"step": x, "samples_seen": x, "acc": block["acc"][i],
-         "nll": block["nll"][i], "brier": block["brier"][i],
-         "ece": block["ece"][i]}
-        for i, x in enumerate(xs)
-    ]
+    val_nll = block.get("val_nll") or [None] * len(xs)
+    rows = []
+    for i, x in enumerate(xs):
+        row = {"step": x, "samples_seen": x, "acc": block["acc"][i],
+               "nll": block["nll"][i], "brier": block["brier"][i],
+               "ece": block["ece"][i]}
+        # val_nll rides along so a caller can apply a SELECTION rule
+        # (thresholds.early_stop, and Fig 7's threshold reference) without
+        # reading the test curve it is about to report on. Omitted where the
+        # val dump at that step was unreadable, since early_stop refuses a
+        # curve whose criterion is missing rather than silently ranking None.
+        if val_nll[i] is not None:
+            row["val_nll"] = val_nll[i]
+        rows.append(row)
+    return rows
 
 
 def uids_by_arm(data, pass_key="id"):

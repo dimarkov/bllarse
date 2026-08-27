@@ -4,16 +4,50 @@ import pytest
 from bllarse.analysis import thresholds
 
 
-def _curve(rows):
-    return [dict(step=s, samples_seen=s * 100, acc=a, nll=n, brier=b) for s, a, n, b in rows]
+def _curve(rows, val_nll=None):
+    curve = [dict(step=s, samples_seen=s * 100, acc=a, nll=n, brier=b)
+             for s, a, n, b in rows]
+    # val_nll defaults to tracking test nll, so a curve written without it
+    # early-stops at the same row it would have converged at.
+    for row, v in zip(curve, val_nll if val_nll is not None
+                      else [r["nll"] for r in curve]):
+        row["val_nll"] = v
+    return curve
 
 
-def test_targets_are_a_fraction_of_converged_baseline():
+def test_targets_are_a_fraction_of_the_baselines_early_stopped_value():
     baseline = _curve([(1, 0.10, 3.0, 1.2), (10, 0.80, 0.5, 0.30)])
     t = thresholds.make_targets(baseline, fraction=0.95)
     assert t.acc == pytest.approx(0.76)      # 95% of 0.80
     assert t.nll == pytest.approx(0.5 / 0.95)  # NLL is lower-is-better
     assert t.brier == pytest.approx(0.30 / 0.95)
+
+
+def test_targets_come_from_the_val_argmin_not_the_last_row():
+    # The baseline peaks at step 10 and then DEGRADES, which is what the
+    # dinov3_large campaign does past its tuning budget. val_nll turns with
+    # test nll, so the reference is step 10 and not the endpoint -- otherwise
+    # 95% of a decayed endpoint spends the tolerance on the decay.
+    baseline = _curve([
+        (1, 0.10, 3.00, 1.20),
+        (10, 0.80, 0.50, 0.30),   # the val-NLL argmin
+        (20, 0.78, 0.62, 0.35),   # degraded endpoint
+    ])
+
+    early = thresholds.make_targets(baseline, fraction=0.95)
+    last = thresholds.make_targets(baseline, fraction=0.95, reference="last")
+
+    assert early.nll == pytest.approx(0.50 / 0.95)
+    assert last.nll == pytest.approx(0.62 / 0.95)
+    # The endpoint reference is the LOOSER of the two on every metric.
+    assert last.nll > early.nll
+    assert last.brier > early.brier
+    assert last.acc < early.acc
+
+
+def test_make_targets_rejects_an_unknown_reference():
+    with pytest.raises(ValueError, match="reference"):
+        thresholds.make_targets(_curve([(1, 0.8, 0.5, 0.3)]), reference="best")
 
 
 def test_crossing_requires_all_three_metrics_jointly():

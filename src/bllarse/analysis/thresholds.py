@@ -36,19 +36,41 @@ class Crossing:
     last_step: int | None
 
 
-def make_targets(baseline_curve: Curve, fraction: float = 0.95) -> Targets:
-    """Targets as a fraction of the baseline's converged value.
+def make_targets(baseline_curve: Curve, fraction: float = 0.95,
+                 reference: str = "early_stop") -> Targets:
+    """Targets as a fraction of the baseline's reference value.
 
-    Accuracy is higher-is-better so the target is `fraction * converged`. NLL and
-    Brier are lower-is-better, so the target is `converged / fraction` -- a
+    Accuracy is higher-is-better so the target is `fraction * reference`. NLL
+    and Brier are lower-is-better, so the target is `reference / fraction` -- a
     proportionally looser bound, not a tighter one.
+
+    `reference` picks WHICH point of the baseline curve that is:
+
+    * "early_stop" (default) -- the val-NLL argmin, i.e. the point a
+      practitioner would actually deploy. Selection is on val and reporting is
+      on test, disjoint by construction, so it does not leak.
+    * "last" -- the final evaluation. This was the original behaviour and it
+      assumed the curve is monotone. It is not: on the dinov3_large campaign
+      the CE+TS baseline bottoms out around 70% of the budget and its endpoint
+      sits 4.2% above its own best NLL, so "95% of the endpoint" spends most of
+      its tolerance on the baseline's own late decay rather than on a
+      deliberate margin.
+
+    "best" is deliberately NOT offered. Taking the argmin of the TEST curve
+    would set the target from the split the figure reports on.
     """
     if not baseline_curve:
         raise ValueError("baseline_curve is empty; cannot derive targets")
     if not 0.0 < fraction <= 1.0:
         raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+    if reference not in ("early_stop", "last"):
+        raise ValueError(
+            f"reference must be 'early_stop' or 'last', got {reference!r}")
 
-    converged = max(baseline_curve, key=lambda row: row["step"])
+    if reference == "early_stop":
+        converged = early_stop(baseline_curve).row
+    else:
+        converged = max(baseline_curve, key=lambda row: row["step"])
     return Targets(
         acc=converged["acc"] * fraction,
         nll=converged["nll"] / fraction,
