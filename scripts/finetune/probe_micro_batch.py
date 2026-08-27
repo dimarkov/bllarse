@@ -18,6 +18,7 @@ device and its memory alongside.
 
 import argparse
 import gc
+import json
 import os
 from pathlib import Path
 
@@ -99,7 +100,7 @@ def build_optimizer(arm, backbone, head, *, lr, head_lr, weight_decay):
 
 def probe_ceiling(arm, backbone, loss_fn, head, make_optimizer, *,
                   img_size, init_bs, max_bs, eval_chunk, key, bf16,
-                  num_update_iters) -> int:
+                  num_update_iters, peaks=None) -> int:
     """Double the micro-batch until a FULL optimizer step OOMs.
 
     Returns the last size that fit.
@@ -198,6 +199,8 @@ def probe_ceiling(arm, backbone, loss_fn, head, make_optimizer, *,
             last_ok = bs
             peak = jax.local_devices()[0].memory_stats() or {}
             peak_gib = peak.get("peak_bytes_in_use", 0) / 2**30
+            if peaks is not None:
+                peaks[bs] = peak_gib
             print(f"[probe] {arm} micro_batch_size={bs} OK "
                   f"(full step + eval chunk {eval_chunk}), "
                   f"peak {peak_gib:.2f} GiB", flush=True)
@@ -247,6 +250,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--head-lr", type=float, default=1e-1)
     p.add_argument("--weight-decay", type=float, default=1e-1)
     p.add_argument("--seed", type=int, default=137)
+    p.add_argument("--peak-at", type=int, default=None,
+                   help="Measure ONE micro batch instead of searching for the "
+                        "ceiling. Fig 7c wants peak memory at the batch the "
+                        "campaign actually ran (finetune_space.MICRO_BATCH), "
+                        "which is a different question from how much fits.")
+    p.add_argument("--json-out", default=None,
+                   help="Write the measurement as JSON for plot_fig7.py.")
     return p
 
 
@@ -284,12 +294,30 @@ def main(args) -> None:
             args.arm, backbone, head,
             lr=args.lr, head_lr=args.head_lr, weight_decay=args.weight_decay)
 
+    peaks: dict[int, float] = {}
+    init_bs = args.peak_at if args.peak_at else args.batch_size_init
+    max_bs = args.peak_at if args.peak_at else args.batch_size_max
     probed = probe_ceiling(
         args.arm, backbone, loss_fn, head, make_optimizer,
-        img_size=args.img_size, init_bs=args.batch_size_init,
-        max_bs=args.batch_size_max, eval_chunk=args.eval_chunk,
+        img_size=args.img_size, init_bs=init_bs,
+        max_bs=max_bs, eval_chunk=args.eval_chunk,
         key=fwd_key, bf16=args.bf16, num_update_iters=args.num_update_iters,
+        peaks=peaks,
     )
+    if args.json_out:
+        # Peak at the batch that was MEASURED, which with --peak-at is the
+        # campaign's own micro batch and otherwise is the largest that fit.
+        # Recorded with the device, because the number is meaningless without
+        # it -- an A100 and an A4000 disagree by more than the arms do.
+        Path(args.json_out).write_text(json.dumps({
+            "model": args.model, "arm": args.arm,
+            "micro_batch": probed, "peak_gib": peaks.get(probed),
+            "device": device.device_kind, "bf16": bool(args.bf16),
+            "img_size": args.img_size, "eval_chunk": args.eval_chunk,
+        }, indent=1))
+        print(f"[probe] wrote {args.json_out}")
+    if args.peak_at:
+        return
     pinned = floor_to_ladder_divisor(probed)
     print(
         f"\n[probe] arm={args.arm} model={args.model} img_size={args.img_size} "

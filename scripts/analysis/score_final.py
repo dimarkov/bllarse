@@ -90,6 +90,11 @@ def main() -> None:
                         "the work -- a fresh Newton fit per step against that "
                         "step's val dump, on top of reading the val dumps at "
                         "all -- and the ID curves are readable without it.")
+    p.add_argument("--resume", action="store_true",
+                   help="Keep the runs already in --out and score only the "
+                        "rest. Scoring is hours long and writes after every "
+                        "run, so a crash mid-campaign should cost the run it "
+                        "died on, not the ones already paid for.")
     p.add_argument("--seeds", nargs="*", type=int, default=None,
                    help="Score only these seeds. The full tree is ~116 GB per "
                         "backbone, and one seed per arm is enough to see the "
@@ -106,7 +111,21 @@ def main() -> None:
     print(f"[score] {len(uids)} runs under {args.group_id}/{args.model}*")
 
     out = {"model": args.model, "group_id": args.group_id, "runs": {}}
+    if args.resume and Path(args.out).exists():
+        prior = json.loads(Path(args.out).read_text())
+        if prior.get("model") != args.model or \
+                prior.get("group_id") != args.group_id:
+            raise SystemExit(
+                f"[score] --resume refused: {args.out} is "
+                f"{prior.get('group_id')}/{prior.get('model')}, not "
+                f"{args.group_id}/{args.model}")
+        out["runs"] = prior.get("runs", {})
+        evaldump.CORRUPT_DUMPS.extend(prior.get("corrupt_dumps") or ())
+        print(f"[score] resuming: {len(out['runs'])} runs already scored")
+
     for uid in uids:
+        if uid in out["runs"]:
+            continue
         run = {"id": {}, "ts": {}, "ood": defaultdict(dict)}
         # Temperature scaling is a comparator on CE ALONE, not a per-arm
         # variant. VBLL and IBProbit are reported RAW because their claim is

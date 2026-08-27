@@ -92,7 +92,8 @@ def pick_targets(data, fraction):
     return targets, name
 
 
-def panel_a(ax, data, targets, per_sample_flops):
+def crossings(data, targets):
+    """[(label, colour, arm, {seed: Crossing})] in ARMS order."""
     entries = []
     for (arm, pass_key), label, colour, _marker in final_json.ARMS:
         uids = final_json.uids_by_arm(data, pass_key).get(arm)
@@ -100,10 +101,19 @@ def panel_a(ax, data, targets, per_sample_flops):
             continue
         curves = {seed: final_json.rows(data, uid, pass_key)
                   for seed, uid in uids.items()}
-        crossings = thresholds.crossings_per_seed(curves, targets)
-        entries.append((label, colour, crossings))
+        entries.append((label, colour, arm,
+                        thresholds.crossings_per_seed(curves, targets)))
+    return entries
 
-    scale = per_sample_flops or 1.0
+
+def panel_cost(ax, entries, cost, title, ylabel):
+    """Bars of mean cost to threshold, per-seed dots, censored runs as bounds.
+
+    `cost(arm, seed, crossing) -> (value, is_bound)`. A censored run has no
+    crossing, so its value is the cost of its WHOLE budget and `is_bound` says
+    to draw it as a lower bound rather than as a measurement. Returning None
+    drops the seed, for panels whose measurement is missing for that run.
+    """
     # Bars on a log axis are drawn from the axis floor, so the floor has to be
     # set from the data. Left to matplotlib it lands at a decade boundary far
     # below the smallest bar and every bar reads as full height.
@@ -113,10 +123,31 @@ def panel_a(ax, data, targets, per_sample_flops):
                for c in cr.values() if c.censored]
     floor = min(finite) / 2.0 if finite else 1.0
 
-    for i, (label, colour, crossings) in enumerate(entries):
-        reached = [c.samples_seen * scale for c in crossings.values()
-                   if not c.censored]
-        censored = [c.last_step * scale for c in crossings.values() if c.censored]
+    costed = []
+    for label, colour, arm, cross in entries:
+        reached, censored = [], []
+        for seed, c in cross.items():
+            got = cost(arm, seed, c)
+            if got is None:
+                continue
+            value, is_bound = got
+            (censored if is_bound else reached).append(value)
+        costed.append((label, colour, reached, censored, len(cross)))
+
+    finite = [v for _, _, r, c, _ in costed for v in (r + c)]
+    if not finite:
+        ax.set_title(title, fontsize=10)
+        ax.text(0.5, 0.5, "no measurement for these runs", ha="center",
+                va="center", fontsize=8, color="#777", transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+    # Bars on a log axis are drawn from the axis floor, so the floor has to be
+    # set from the data. Left to matplotlib it lands at a decade boundary far
+    # below the smallest bar and every bar reads as full height.
+    floor = min(finite) / 2.0
+
+    for i, (label, colour, reached, censored, n_seeds) in enumerate(costed):
         if reached:
             ax.bar(i, sum(reached) / len(reached), width=0.6, bottom=floor,
                    color=colour, alpha=0.75, zorder=2)
@@ -134,29 +165,27 @@ def panel_a(ax, data, targets, per_sample_flops):
                         textcoords="offset points",
                         arrowprops=dict(arrowstyle="<|-", color=colour, lw=1.2))
         if censored:
-            ax.annotate(f"{len(censored)}/{len(crossings)} censored",
+            ax.annotate(f"{len(censored)}/{n_seeds} censored",
                         xy=(i, max(censored)), xytext=(0, 20),
                         textcoords="offset points", ha="center", va="bottom",
                         fontsize=7, color=colour)
 
-    ax.set_xticks(range(len(entries)))
-    ax.set_xticklabels([e[0] for e in entries], rotation=20, ha="right",
+    ax.set_xticks(range(len(costed)))
+    ax.set_xticklabels([e[0] for e in costed], rotation=20, ha="right",
                        fontsize=8)
     ax.set_yscale("log")
     # Headroom for the censored arrow and its count, which sit ~20 points above
     # the tallest bar. Without it matplotlib clips the label at the axes edge.
-    any_censored = any(c.censored for _, _, cr in entries for c in cr.values())
+    any_censored = any(c for _, _, _, c, _ in costed)
     ax.set_ylim(floor, max(finite) * (1.9 if any_censored else 1.25))
-    ax.set_ylabel("FLOPs to threshold" if per_sample_flops
-                  else "samples to threshold")
-    ax.set_title("a — cost to joint threshold", fontsize=10)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=10)
     ax.grid(alpha=0.25, lw=0.6, axis="y")
     ax.set_axisbelow(True)
-    return entries
 
 
-def panel_bar(ax, values, title, ylabel, empty_note):
-    """One measured scalar per arm. Shared by panels b and c."""
+def panel_memory(ax, values, title, ylabel, empty_note):
+    """One measured scalar per arm -- peak memory, which has no seed spread."""
     if not values:
         ax.set_title(title, fontsize=10)
         ax.text(0.5, 0.5, empty_note, ha="center", va="center", fontsize=8,
@@ -178,15 +207,56 @@ def panel_bar(ax, values, title, ylabel, empty_note):
     ax.set_axisbelow(True)
 
 
+def _elapsed_at(timeline, samples):
+    """Wall-clock seconds at `samples`, from a measured [(samples, s)] list.
+
+    Interpolated between the two bracketing eval points rather than snapped to
+    one: a crossing lands at an eval point by construction, but the LAST point
+    of a censored run is asked for its own budget and must return it exactly.
+    """
+    if not timeline:
+        return None
+    for x, secs in timeline:
+        if x >= samples:
+            return secs
+    return timeline[-1][1]
+
+
 def make_figure(data, out_path, *, targets, baseline, fraction,
                 per_sample_flops, wallclock, memory):
     fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.0))
-    panel_a(axes[0], data, targets, per_sample_flops)
-    panel_bar(axes[1], wallclock, "b — wall clock to threshold",
-              "seconds", "no --wallclock JSON given;\nMLflow run durations "
-              "not read")
-    panel_bar(axes[2], memory, "c — peak memory (per arm, not per seed)",
-              "GiB", "no --memory JSON given;\nrun probe_micro_batch.py")
+    entries = crossings(data, targets)
+
+    scale = per_sample_flops or 1.0
+
+    def flop_cost(arm, seed, c):
+        if c.censored:
+            return (c.last_step * scale, True)
+        return (c.samples_seen * scale, False)
+
+    panel_cost(axes[0], entries, flop_cost, "a — cost to joint threshold",
+               "FLOPs to threshold" if per_sample_flops
+               else "samples to threshold")
+
+    # {(arm, seed): [(samples, elapsed_s)]} -- a MEASURED timeline per run, so
+    # panel b reads the clock at the crossing instead of assuming throughput is
+    # flat across a run that pays compilation once and evaluation every dump.
+    timelines = {}
+    for run in (wallclock.get("runs") or {}).values():
+        timelines[(run["arm"], int(run["seed"]))] = run["elapsed_s"]
+
+    def wall_cost(arm, seed, c):
+        timeline = timelines.get((arm, seed))
+        if not timeline:
+            return None
+        if c.censored:
+            return (_elapsed_at(timeline, c.last_step), True)
+        return (_elapsed_at(timeline, c.samples_seen), False)
+
+    panel_cost(axes[1], entries, wall_cost, "b — wall clock to threshold",
+               "seconds to threshold (A100)")
+    panel_memory(axes[2], memory, "c — peak memory (per arm, not per seed)",
+                 "GiB", "no --memory given;\nrun probe_micro_batch.py")
     fig.suptitle(
         f"Fig 7 — compute to a JOINT acc/NLL/Brier target at "
         f"{fraction:g}x the {baseline} baseline's converged value\n"
@@ -213,16 +283,28 @@ def main():
                         "a single scalar is an approximation the caption must "
                         "state.")
     p.add_argument("--wallclock", default=None,
-                   help='JSON {"ce": seconds, ...} from MLflow run durations.')
-    p.add_argument("--memory", default=None,
-                   help='JSON {"ce": GiB, ...} from probe_micro_batch.py.')
+                   help="scripts/analysis/wallclock_from_dumps.py output: a "
+                        "measured (samples, elapsed) timeline per run.")
+    p.add_argument("--memory", nargs="*", default=None,
+                   help="probe_micro_batch{,_torch}.py --json-out files, one "
+                        "per arm.")
     args = p.parse_args()
 
     data = final_json.load(args.scores)
     print(f"[fig7] {final_json.provenance(data)}")
     targets, baseline = pick_targets(data, args.fraction)
     wallclock = json.loads(Path(args.wallclock).read_text()) if args.wallclock else {}
-    memory = json.loads(Path(args.memory).read_text()) if args.memory else {}
+    memory = {}
+    for path in args.memory or ():
+        probe = json.loads(Path(path).read_text())
+        if probe.get("model") != data.get("model"):
+            # Peak memory measured on a different backbone answers a different
+            # question, and silently mixing them would make panel c a
+            # comparison of model sizes wearing arm labels.
+            raise SystemExit(
+                f"[fig7] {path} is model={probe.get('model')!r} but the scores "
+                f"are model={data.get('model')!r}")
+        memory[probe["arm"]] = probe["peak_gib"]
 
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):

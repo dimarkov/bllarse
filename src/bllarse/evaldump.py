@@ -12,6 +12,7 @@ exponentiation (see bllarse.metrics).
 import json
 import sys
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -185,8 +186,10 @@ def iter_dumps(
 
     `write_dump` hands the path straight to `np.savez_compressed`, so a run
     killed mid-write (a SLURM wall clock, a preemption) leaves a truncated npz
-    behind. Reading one raises `zipfile.BadZipFile` from deep inside numpy,
-    which by default propagates -- a corrupt file is a real defect and a
+    behind. Reading one raises out of numpy as `zipfile.BadZipFile` when the
+    archive's own CRC catches it and as `zlib.error` when the deflate stream is
+    damaged in a way the CRC never gets to check -- both were seen on the same
+    dinov3_large run. By default either propagates -- a corrupt file is a real defect and a
     single-run analysis should not paper over it. `skip_corrupt=True` is for
     the batch scorer, where one bad file out of thousands must not cost the
     other 3,311: the path is reported on stderr and appended to
@@ -199,7 +202,8 @@ def iter_dumps(
             continue
         try:
             record = load_dump(path)
-        except (zipfile.BadZipFile, EOFError, ValueError, OSError) as exc:
+        except (zipfile.BadZipFile, zlib.error, EOFError, ValueError,
+                OSError) as exc:
             CORRUPT_DUMPS.append(str(path))
             print(f"[evaldump] SKIPPING corrupt dump {path}: "
                   f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
