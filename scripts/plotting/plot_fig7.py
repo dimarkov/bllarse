@@ -47,13 +47,19 @@ from bllarse.analysis import final_json, thresholds  # noqa: E402
 BASELINES = [("ce", "id"), ("ce", "ts")]
 
 
-def _mean_curve(data, uids):
-    """Seed-mean rows for one arm, on the x values any seed reached."""
+def _mean_curve(data, uids, pass_key="id"):
+    """Seed-mean rows for one arm, on the x values any seed reached.
+
+    The TARGETS come from this, so it has to be the mean for every baseline
+    variant alike. Taking one arbitrary seed for the TS baseline and the mean
+    for the raw one -- which an earlier version did -- makes the target depend
+    on which run happened to be first in a dict.
+    """
     per_metric = {}
     for metric in ("acc", "nll", "brier"):
         per_seed = {seed: [(x, y) for x, y in zip(
-            data["runs"][uid]["id"]["samples_seen"],
-            data["runs"][uid]["id"][metric])] for seed, uid in uids.items()}
+            data["runs"][uid][pass_key]["samples_seen"],
+            data["runs"][uid][pass_key][metric])] for seed, uid in uids.items()}
         xs, mean, _lo, _hi, _n = final_json.band(per_seed)
         per_metric[metric] = dict(zip(xs, mean))
     xs = sorted(set.intersection(*(set(v) for v in per_metric.values())))
@@ -69,13 +75,7 @@ def pick_targets(data, fraction):
         uids = by_arm.get(arm)
         if not uids:
             continue
-        curve = _mean_curve(data, uids) if pass_key == "id" else [
-            {"step": x, "samples_seen": x,
-             "acc": data["runs"][uid][pass_key]["acc"][i],
-             "nll": data["runs"][uid][pass_key]["nll"][i],
-             "brier": data["runs"][uid][pass_key]["brier"][i]}
-            for uid in [next(iter(uids.values()))]
-            for i, x in enumerate(data["runs"][uid][pass_key]["samples_seen"])]
+        curve = _mean_curve(data, uids, pass_key)
         if not curve:
             continue
         converged = max(curve, key=lambda r: r["step"])

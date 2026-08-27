@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from bllarse.analysis import final_json  # noqa: E402
 
 
-def make_figure(data, out_path, *, x_log=True):
+def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
     metrics = final_json.METRICS
     fig, axes = plt.subplots(len(metrics), 1, figsize=(6.4, 3.0 * len(metrics)),
                              sharex=True)
@@ -59,6 +59,11 @@ def make_figure(data, out_path, *, x_log=True):
                     mec="white", mew=0.9, zorder=4)
             if label not in seen_labels:
                 seen_labels.append(label)
+        # Where the search actually looked. Every config here was selected at
+        # this budget and transferred to 4 epochs by the AdamW SDE rule, so
+        # everything to the right is the transfer's extrapolation.
+        if tuning_budget:
+            ax.axvline(tuning_budget, color="0.35", ls="--", lw=1.0, zorder=1)
         if x_log:
             ax.set_xscale("log")
         if log_y:
@@ -72,6 +77,14 @@ def make_figure(data, out_path, *, x_log=True):
 
     axes[-1].set_xlabel("samples seen")
     axes[0].legend(frameon=False, fontsize=9, loc="lower right")
+    if tuning_budget:
+        # On the LAST panel, not the first: the first carries the legend, and
+        # the two overprint there.
+        axes[-1].annotate(f"tuning budget\n{tuning_budget / 1e6:.0f}M samples",
+                          xy=(tuning_budget, 0.97),
+                          xycoords=("data", "axes fraction"),
+                          xytext=(4, 0), textcoords="offset points",
+                          fontsize=7, color="0.35", ha="left", va="top")
     fig.suptitle("Fig 5 — sample efficiency (ImageNet val, held-out 80%)\n"
                  + final_json.provenance(data), fontsize=9, y=0.995)
     fig.tight_layout()
@@ -87,6 +100,10 @@ def main():
                    help="score_final.py output JSON.")
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig5_sample_efficiency")
+    p.add_argument("--tuning-budget", type=float,
+                   default=float(final_json.tuning_budget()),
+                   help="Samples the hyperparameter search scored trials at, "
+                        "marked with a dashed rule. 0 to omit.")
     p.add_argument("--linear-x", action="store_true",
                    help="Linear samples axis. The log axis is the default "
                         "because the claim is about the early trajectory.")
@@ -97,7 +114,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),
-                    x_log=not args.linear_x)
+                    x_log=not args.linear_x,
+                    tuning_budget=args.tuning_budget or None)
 
 
 if __name__ == "__main__":

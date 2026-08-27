@@ -27,12 +27,25 @@ ARMS = [
 
 # Row order for Figs 5 and 6. `lower_is_better` drives the threshold direction
 # in Fig 7 and the "↓"/"↑" in the axis label; `log` is a display choice.
+#
+# ECE is SCORED but not plotted. It stays in the JSON -- `rows` carries it and
+# any analysis can read it -- and it is off the reported figures because NLL
+# and Brier are proper scoring rules that already carry the calibration claim,
+# while ECE's value depends on a binning choice the figure would not show.
 METRICS = [
     ("acc", "accuracy ↑", False, False),
-    ("ece", "ECE ↓", True, True),
     ("nll", "NLL ↓", True, True),
     ("brier", "Brier ↓", True, False),
 ]
+
+# Where the hyperparameter search actually looked. Every config on Figs 5-7 was
+# selected at `protocol.MAX_SAMPLES` and transferred to 4 epochs by the AdamW
+# SDE rule, so everything to the RIGHT of this line is the transfer's
+# extrapolation rather than a tuned operating point -- which is the first thing
+# to check when a curve turns after it.
+def tuning_budget() -> int:
+    from bllarse.finetune import protocol
+    return protocol.MAX_SAMPLES
 
 # OOD panel order. Matches finetune.imagenet.OOD_KEYS; R and A cover only 200 of
 # the 1000 classes and are evaluated under the subset mask, which the caption

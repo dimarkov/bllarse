@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from bllarse.analysis import final_json  # noqa: E402
 
 
-def make_figure(data, out_path, *, x_log=True):
+def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
     metrics = final_json.METRICS
     sets = final_json.OOD_SETS
     fig, axes = plt.subplots(len(metrics), len(sets),
@@ -68,6 +68,11 @@ def make_figure(data, out_path, *, x_log=True):
                     ax.fill_between(xs, lo, hi, color=colour, alpha=0.16, lw=0,
                                     zorder=2)
                 drawn += 1
+            # Where the search actually looked; everything right of it is the
+            # AdamW SDE transfer extrapolating past its selection budget.
+            if tuning_budget:
+                ax.axvline(tuning_budget, color="0.35", ls="--", lw=1.0,
+                           zorder=1)
             if x_log:
                 ax.set_xscale("log")
             if log_y:
@@ -87,6 +92,13 @@ def make_figure(data, out_path, *, x_log=True):
     if not drawn:
         raise SystemExit("[fig6] no OOD points in the scored JSON")
     axes[0][0].legend(frameon=False, fontsize=8, loc="best")
+    if tuning_budget:
+        # Bottom-left panel: the top-left one carries the legend.
+        axes[-1][0].annotate(f"tuning\n{tuning_budget / 1e6:.0f}M",
+                             xy=(tuning_budget, 0.97),
+                             xycoords=("data", "axes fraction"),
+                             xytext=(3, 0), textcoords="offset points",
+                             fontsize=7, color="0.35", ha="left", va="top")
     fig.suptitle("Fig 6 — the same trajectory under shift "
                  "(R/A are 200-class, masked; V2/Sketch are 1000-class)\n"
                  + final_json.provenance(data), fontsize=9, y=0.997)
@@ -102,6 +114,10 @@ def main():
     p.add_argument("--scores", required=True)
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig6_shift")
+    p.add_argument("--tuning-budget", type=float,
+                   default=float(final_json.tuning_budget()),
+                   help="Samples the hyperparameter search scored trials at, "
+                        "marked with a dashed rule. 0 to omit.")
     p.add_argument("--linear-x", action="store_true")
     args = p.parse_args()
 
@@ -110,7 +126,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),
-                    x_log=not args.linear_x)
+                    x_log=not args.linear_x,
+                    tuning_budget=args.tuning_budget or None)
 
 
 if __name__ == "__main__":

@@ -170,7 +170,7 @@ def accum_plan(target_batch: int, micro_batch: int) -> tuple[int, int, int]:
 # --------------------------------------------------------------------------
 # Hyperparameter transfer across batch size and training duration.
 #
-# The tuning campaign scores trials at MAX_SAMPLES (2,000,000) and the final
+# The tuning campaign scores trials at MAX_SAMPLES (1,000,000) and the final
 # campaign runs 4 epochs (5,124,668 samples). Nothing made those two
 # comparable: a config tuned at one duration was simply RUN at the other, which
 # assumes the optimum does not move with the budget. It does.
