@@ -40,10 +40,42 @@ from bllarse import evaldump, metrics  # noqa: E402
 from bllarse.analysis import curves  # noqa: E402
 
 
+def _seed_of(uid: str) -> int:
+    return int(uid.rsplit("_seed", 1)[1])
+
+
 def _uids(dump_root, group_id, model):
+    """Every run for one backbone, ordered SEED-MAJOR.
+
+    Name order would be arm-major -- all five CE seeds, then all five IBProbit,
+    then all five VBLL -- so a scorer interrupted or read early would hold five
+    seeds of one arm and nothing to compare them against. Seed-major means the
+    first three runs are already a complete cross-arm comparison at seed 137,
+    which is what a preliminary figure needs. Scoring one backbone reads ~116 GB
+    and takes hours; partial output is the normal case, not the exception.
+    """
     base = Path(dump_root) / group_id
-    return sorted(p.name for p in base.iterdir()
-                  if p.is_dir() and p.name.startswith(model + "_"))
+    names = [p.name for p in base.iterdir()
+             if p.is_dir() and p.name.startswith(model + "_")]
+    return sorted(names, key=lambda u: (_seed_of(u), u))
+
+
+def _write(out_path, out, uids) -> None:
+    """Serialise the scoring so far, atomically.
+
+    Atomically because this is called after every run while a plotting script
+    may be reading the same path -- a half-written JSON is a crash at the other
+    end, and the whole reason this function exists is that partial output gets
+    consumed.
+    """
+    out["runs_scored"] = len(out["runs"])
+    out["runs_total"] = len(uids)
+    out["complete"] = len(out["runs"]) == len(uids)
+    out["corrupt_dumps"] = sorted(set(evaldump.CORRUPT_DUMPS))
+    path = Path(out_path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(out))
+    tmp.replace(path)
 
 
 def main() -> None:
@@ -120,6 +152,11 @@ def main() -> None:
         print(f"[score] {uid:46s} id={len(run['id'].get('acc', []))} "
               f"ts={len(run['ts'].get('acc', []))} ood={n_ood} "
               f"[{_time.time() - t0:.0f}s elapsed]", flush=True)
+        # Written after EVERY run, not once at the end. A full backbone takes
+        # hours, and a plot wants the seed-137 comparison as soon as it exists
+        # rather than after seed 141. `runs_scored`/`runs_total` let a figure
+        # say out loud that it is drawn from a partial scoring.
+        _write(args.out, out, uids)
 
     # `write_dump` is not atomic, so a run killed mid-write leaves a truncated
     # npz behind. Those are skipped rather than fatal (one bad file must not
@@ -127,13 +164,12 @@ def main() -> None:
     # output so a figure built from this JSON can say what is missing, and the
     # count is printed where the launcher's log will show it.
     corrupt = sorted(set(evaldump.CORRUPT_DUMPS))
-    out["corrupt_dumps"] = corrupt
     if corrupt:
         print(f"[score] {len(corrupt)} CORRUPT dumps skipped:")
         for path in corrupt:
             print(f"[score]   {path}")
 
-    Path(args.out).write_text(json.dumps(out))
+    _write(args.out, out, uids)
     print(f"[score] wrote {args.out} "
           f"({os.path.getsize(args.out) / 1e6:.1f} MB)")
 
