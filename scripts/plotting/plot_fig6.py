@@ -12,6 +12,13 @@ subset mask, so their accuracies are over a 200-way decision and are NOT
 comparable in level to V2, Sketch or the ID panels. V2 and Sketch span all 1000
 classes and are unmasked.
 
+AdamW+CE is drawn in its temperature-scaled form, with T fit on the
+IN-DISTRIBUTION val split at that step and applied unchanged to the shifted
+logits. No OOD label goes into T. Refitting it on the shifted set would be
+test-time adaptation, and the symmetric move would be to run IBProbit's CAVI
+update or VBLL's posterior update there too -- every arm is fit
+in-distribution and then evaluated under shift.
+
 The OOD grid is a stride of the dump grid, and on the dinov3_large campaign an
 irregular one -- the OOD workers were under-provisioned and the trainer skipped
 scheduled checkpoints under backpressure. Points are drawn on their own x
@@ -49,8 +56,10 @@ def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
     for r, (metric, ylabel, _lb, log_y) in enumerate(metrics):
         for c, (split, title) in enumerate(sets):
             ax = axes[r][c]
-            for (arm, pass_key), label, colour, marker in final_json.ood_arms():
-                per_seed = final_json.ood_series(data, arm, split, metric)
+            for (arm, pass_key), label, colour, marker in \
+                    final_json.ood_arms(data):
+                per_seed = final_json.ood_series(data, arm, split, metric,
+                                                 pass_key)
                 if not per_seed:
                     continue
                 xs, mean, lo, hi, n = final_json.band(per_seed)

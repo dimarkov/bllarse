@@ -83,3 +83,37 @@ def test_load_refuses_a_json_with_no_scored_runs(tmp_path):
 
     with pytest.raises(SystemExit):
         final_json.load(path)
+
+
+def test_ood_series_reads_the_scaled_variant_when_asked():
+    run = _run("ce", 137, [10], {"nll": [1.0]},
+               ood={"ood_imagenet_r": {"10": {"nll": 4.0}}})
+    # T fit on the ID val split, applied unchanged to the shifted logits.
+    run["ood_ts"] = {"ood_imagenet_r": {"10": {"nll": 2.5}}}
+    data = _doc({"m_d_ce_seed137": run})
+
+    assert final_json.ood_series(data, "ce", "ood_imagenet_r", "nll") == \
+        {137: [(10, 4.0)]}
+    assert final_json.ood_series(data, "ce", "ood_imagenet_r", "nll", "ts") == \
+        {137: [(10, 2.5)]}
+
+
+def test_ood_arms_falls_back_to_raw_when_no_scaled_ood_was_scored():
+    # A JSON from before ood_ts existed must not silently lose the baseline.
+    data = _doc({"m_d_ce_seed137": _run("ce", 137, [10], {"nll": [1.0]})})
+
+    keys = {key: label for key, label, _c, _m in final_json.ood_arms(data)}
+
+    assert ("ce", "id") in keys
+    assert "raw" in keys[("ce", "id")]
+
+
+def test_ood_arms_keeps_the_scaled_entry_once_it_exists():
+    run = _run("ce", 137, [10], {"nll": [1.0]})
+    run["ood_ts"] = {"ood_imagenet_r": {"10": {"nll": 2.5}}}
+    data = _doc({"m_d_ce_seed137": run})
+
+    keys = [key for key, _l, _c, _m in final_json.ood_arms(data)]
+
+    assert ("ce", "ts") in keys
+    assert ("ce", "id") not in keys

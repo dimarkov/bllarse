@@ -30,71 +30,30 @@ ARMS = [
 ]
 
 
-def ood_arms():
-    """ARMS with the TS entries remapped to their RAW pass.
+def ood_arms(data):
+    """ARMS as they can be drawn off-distribution, given what was scored.
 
-    score_final temperature-scales the in-distribution dumps only: T is fit on
-    an in-distribution val split, and carrying it across a distribution shift
-    is a different claim than the one Fig 5 makes -- it would be measuring
-    whether an ID-fit temperature survives the shift, which is worth asking
-    but is not this figure.
+    T is fit ONCE on the in-distribution val split and applied unchanged to the
+    shifted logits -- `score_final` stores that as `ood_ts`. No OOD label is
+    read to obtain it. Refitting T on the shifted set would be test-time
+    adaptation, and the symmetric move would be to run IBProbit's CAVI update
+    or VBLL's posterior update on the same data; every arm here is fit
+    in-distribution and then evaluated under shift, full stop.
 
-    What is NOT on the table is refitting T on the shifted set. That uses OOD
-    labels, and the symmetric move would be to run IBProbit's CAVI update or
-    VBLL's posterior update on the same data -- all three are test-time
-    adaptation, and a calibration-under-shift number obtained that way measures
-    adaptation instead. Every arm here is fit on in-distribution data ONLY and
-    then evaluated under shift.
-
-    Note this leaves CE at T=1 off-distribution while IBProbit and VBLL carry
-    their ID-fitted machinery across, which understates the baseline rather
-    than flattering it. Applying the ID-fit T to OOD logits -- no OOD labels
-    touched -- is the symmetric option, and is a scoring change, not a plotting
-    one.
-
-    So off-distribution there IS no CE+TS curve, and dropping the entry would
-    delete the baseline from Fig 6 entirely. The raw curve stands in, labelled
-    as raw so the two figures cannot be read as showing the same CE line.
+    A JSON scored before `ood_ts` existed carries no such curve, and dropping
+    the entry would delete the baseline from the figure. There the raw curve
+    stands in, labelled as raw -- which UNDERSTATES the baseline, since the
+    Bayesian arms carry their ID-fitted machinery across while CE would be left
+    at T=1.
     """
+    has_ood_ts = any(run.get("ood_ts") for run in data["runs"].values())
     out = []
     for (arm, pass_key), label, colour, marker in ARMS:
-        if pass_key == "ts":
-            label = label.replace("+TS", "") + " (raw — no TS off-distribution)"
+        if pass_key == "ts" and not has_ood_ts:
+            label = label.replace("+TS", "") + " (raw — no TS scored)"
             pass_key = "id"
         out.append(((arm, pass_key), label, colour, marker))
     return out
-
-# Row order for Figs 5 and 6. `lower_is_better` drives the threshold direction
-# in Fig 7 and the "↓"/"↑" in the axis label; `log` is a display choice.
-#
-# ECE is SCORED but not plotted. It stays in the JSON -- `rows` carries it and
-# any analysis can read it -- and it is off the reported figures because NLL
-# and Brier are proper scoring rules that already carry the calibration claim,
-# while ECE's value depends on a binning choice the figure would not show.
-METRICS = [
-    ("acc", "accuracy ↑", False, False),
-    ("nll", "NLL ↓", True, True),
-    ("brier", "Brier ↓", True, False),
-]
-
-# Where the hyperparameter search actually looked. Every config on Figs 5-7 was
-# selected at `protocol.MAX_SAMPLES` and transferred to 4 epochs by the AdamW
-# SDE rule, so everything to the RIGHT of this line is the transfer's
-# extrapolation rather than a tuned operating point -- which is the first thing
-# to check when a curve turns after it.
-def tuning_budget() -> int:
-    from bllarse.finetune import protocol
-    return protocol.MAX_SAMPLES
-
-# OOD panel order. Matches finetune.imagenet.OOD_KEYS; R and A cover only 200 of
-# the 1000 classes and are evaluated under the subset mask, which the caption
-# has to say out loud.
-OOD_SETS = [
-    ("ood_imagenet_r", "ImageNet-R (200c)"),
-    ("ood_imagenet_a", "ImageNet-A (200c)"),
-    ("ood_imagenet_v2", "ImageNet-V2"),
-    ("ood_imagenet_sketch", "ImageNet-Sketch"),
-]
 
 
 def load(path):
@@ -146,8 +105,11 @@ def id_series(data, arm, pass_key, metric):
     return out
 
 
-def ood_series(data, arm, split, metric):
+def ood_series(data, arm, split, metric, pass_key="id"):
     """{seed: [(samples_seen, value), ...]} for one arm on one shift set.
+
+    `pass_key="ts"` reads the temperature-scaled variant, where that step's
+    ID-fit T was applied to the shifted logits.
 
     The OOD grid is a stride of the dump grid and -- on dinov3_large -- an
     irregular one, because OOD workers were under-provisioned and the trainer
@@ -158,7 +120,8 @@ def ood_series(data, arm, split, metric):
     for uid, run in data["runs"].items():
         if _arm_of(uid, run) != arm:
             continue
-        points = (run.get("ood") or {}).get(split) or {}
+        field = "ood_ts" if pass_key == "ts" else "ood"
+        points = (run.get(field) or {}).get(split) or {}
         if not points:
             continue
         out[_seed_of(uid, run)] = sorted(

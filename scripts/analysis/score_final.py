@@ -124,9 +124,19 @@ def main() -> None:
         print(f"[score] resuming: {len(out['runs'])} runs already scored")
 
     for uid in uids:
-        if uid in out["runs"]:
-            continue
-        run = {"id": {}, "ts": {}, "ood": defaultdict(dict)}
+        prior_run = out["runs"].get(uid)
+        if prior_run is not None:
+            # Keep it only if it carries everything THIS scorer would write. A
+            # record from before `ood_ts` existed is not "already scored" -- it
+            # is missing a field, and silently keeping it would leave the
+            # figure short of a line with no error anywhere.
+            wanted_ts = (not args.skip_ts) and "_ce_" in uid
+            if not wanted_ts or prior_run.get("ood_ts"):
+                continue
+            print(f"[score] {uid}: re-scoring, prior record has no ood_ts")
+        run = {"id": {}, "ts": {}, "ood": defaultdict(dict),
+               "ood_ts": defaultdict(dict)}
+        temperatures: dict[int, float] = {}
         # Temperature scaling is a comparator on CE ALONE, not a per-arm
         # variant. VBLL and IBProbit are reported RAW because their claim is
         # calibration by construction -- temperature-scaling them would measure
@@ -155,6 +165,12 @@ def main() -> None:
                 # figure can exclude those points rather than average them in.
                 "t_clipped": sum(bool(r.get("temperature_clipped")) for r in rows),
             }
+            if key == "ts":
+                # T at each eval point, keyed by samples_seen, so the OOD pass
+                # below can apply THAT step's temperature to that step's
+                # shifted logits.
+                temperatures = {r["samples_seen"]: r["temperature"]
+                                for r in rows}
 
         # OOD, on its own (sparser, irregular) grid.
         for rec in evaldump.iter_dumps(args.dump_root, args.group_id, uid,
@@ -162,14 +178,32 @@ def main() -> None:
             split = rec.meta.get("split", "")
             if not split.startswith("ood_"):
                 continue
+            seen = rec.meta["samples_seen"]
             m = metrics.classification_metrics(rec.logits, rec.labels)
-            run["ood"][split][rec.meta["samples_seen"]] = {
-                k: float(v) for k, v in m.items()}
-        run["ood"] = {k: dict(sorted(v.items())) for k, v in run["ood"].items()}
+            run["ood"][split][seen] = {k: float(v) for k, v in m.items()}
+
+            # The SAME T that Fig 5 uses at this step, fit on the
+            # in-distribution val split and applied unchanged to the shifted
+            # logits. No OOD label is read to obtain it: refitting T here would
+            # be test-time adaptation, and the symmetric move would be to run
+            # IBProbit's CAVI update or VBLL's posterior update on the shifted
+            # set. Every arm is fit in-distribution and evaluated under shift.
+            temperature = temperatures.get(seen)
+            if temperature is None:
+                continue
+            scaled_logits = metrics.apply_temperature(rec.logits, temperature)
+            m_ts = metrics.classification_metrics(scaled_logits, rec.labels)
+            run["ood_ts"][split][seen] = {k: float(v) for k, v in m_ts.items()}
+
+        for field in ("ood", "ood_ts"):
+            run[field] = {k: dict(sorted(v.items()))
+                          for k, v in run[field].items()}
         out["runs"][uid] = run
         n_ood = sum(len(v) for v in run["ood"].values())
+        n_ood_ts = sum(len(v) for v in run["ood_ts"].values())
         print(f"[score] {uid:46s} id={len(run['id'].get('acc', []))} "
-              f"ts={len(run['ts'].get('acc', []))} ood={n_ood} "
+              f"ts={len(run['ts'].get('acc', []))} ood={n_ood}"
+              f"{f'+{n_ood_ts}ts' if n_ood_ts else ''} "
               f"[{_time.time() - t0:.0f}s elapsed]", flush=True)
         # Written after EVERY run, not once at the end. A full backbone takes
         # hours, and a plot wants the seed-137 comparison as soon as it exists
