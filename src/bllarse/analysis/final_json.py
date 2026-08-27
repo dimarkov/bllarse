@@ -39,6 +39,19 @@ def ood_arms():
     whether an ID-fit temperature survives the shift, which is worth asking
     but is not this figure.
 
+    What is NOT on the table is refitting T on the shifted set. That uses OOD
+    labels, and the symmetric move would be to run IBProbit's CAVI update or
+    VBLL's posterior update on the same data -- all three are test-time
+    adaptation, and a calibration-under-shift number obtained that way measures
+    adaptation instead. Every arm here is fit on in-distribution data ONLY and
+    then evaluated under shift.
+
+    Note this leaves CE at T=1 off-distribution while IBProbit and VBLL carry
+    their ID-fitted machinery across, which understates the baseline rather
+    than flattering it. Applying the ID-fit T to OOD logits -- no OOD labels
+    touched -- is the symmetric option, and is a scoring change, not a plotting
+    one.
+
     So off-distribution there IS no CE+TS curve, and dropping the entry would
     delete the baseline from Fig 6 entirely. The raw curve stands in, labelled
     as raw so the two figures cannot be read as showing the same CE line.
