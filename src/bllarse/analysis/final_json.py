@@ -18,12 +18,38 @@ from pathlib import Path
 # raw curve and "ts" for the temperature-scaled one. CE+TS is a comparator on CE
 # ALONE -- score_final does not compute a TS pass for VBLL or IBProbit, because
 # their claim is calibration by construction.
+#
+# Raw CE is NOT drawn. CE+TS is the strong form of the baseline: a practitioner
+# with a val split gets it for the cost of a one-parameter fit, so beating raw
+# CE on calibration is not the claim worth making. The raw curve is still
+# scored and still in the JSON.
 ARMS = [
-    (("ce", "id"), "AdamW+CE", "#4C72B0", "o"),
     (("ce", "ts"), "AdamW+CE+TS", "#55A868", "s"),
     (("vbll", "id"), "VBLL", "#C44E52", "^"),
     (("ibprobit", "id"), "IBProbit", "#8172B2", "D"),
 ]
+
+
+def ood_arms():
+    """ARMS with the TS entries remapped to their RAW pass.
+
+    score_final temperature-scales the in-distribution dumps only: T is fit on
+    an in-distribution val split, and carrying it across a distribution shift
+    is a different claim than the one Fig 5 makes -- it would be measuring
+    whether an ID-fit temperature survives the shift, which is worth asking
+    but is not this figure.
+
+    So off-distribution there IS no CE+TS curve, and dropping the entry would
+    delete the baseline from Fig 6 entirely. The raw curve stands in, labelled
+    as raw so the two figures cannot be read as showing the same CE line.
+    """
+    out = []
+    for (arm, pass_key), label, colour, marker in ARMS:
+        if pass_key == "ts":
+            label = label.replace("+TS", "") + " (raw — no TS off-distribution)"
+            pass_key = "id"
+        out.append(((arm, pass_key), label, colour, marker))
+    return out
 
 # Row order for Figs 5 and 6. `lower_is_better` drives the threshold direction
 # in Fig 7 and the "↓"/"↑" in the axis label; `log` is a display choice.

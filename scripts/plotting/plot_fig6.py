@@ -49,13 +49,7 @@ def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
     for r, (metric, ylabel, _lb, log_y) in enumerate(metrics):
         for c, (split, title) in enumerate(sets):
             ax = axes[r][c]
-            for (arm, pass_key), label, colour, marker in final_json.ARMS:
-                # Only the raw pass exists off-distribution: score_final does
-                # not temperature-scale OOD dumps, since T is fit on an
-                # in-distribution val split and carrying it across the shift
-                # would be a different claim than the one Fig 5 makes.
-                if pass_key != "id":
-                    continue
+            for (arm, pass_key), label, colour, marker in final_json.ood_arms():
                 per_seed = final_json.ood_series(data, arm, split, metric)
                 if not per_seed:
                     continue

@@ -20,11 +20,28 @@ before any of these numbers were looked at):
     an open bar with an arrow at its budget -- never dropped and never
     extrapolated.
 
-Panel a is derived from the scored curves alone. Panels b (wall clock) and c
-(peak memory) come from separate measurements -- MLflow run durations and
-`scripts/finetune/probe_micro_batch.py` -- passed in as JSON. A panel with no
-input draws as empty and says so; it is never filled in from the trajectory,
-which cannot support either number.
+There is NO FLOPs panel, and its absence is deliberate. results-plan v2 asks
+for one, derived as `samples-to-threshold x per-step cost from bench_step.py`.
+But `bench_step.step_flops` is a BACKBONE model -- depth, width, token count --
+and is therefore identical across arms by construction. Multiplying every arm
+by one constant makes that panel a rescaled copy of samples-to-threshold with
+the same ranking, presented as though it measured compute.
+
+The arms do not cost the same. VBLL carries a covariance head and IBProbit runs
+128 CAVI iterations per step; neither appears in a trunk-only FLOP count. The
+measured wall clock says how much that matters: over the same 78-eval budget on
+dinov3_large, CE takes 10.2-10.3 h, IBProbit 10.7-10.9 h and VBLL 12.7-12.9 h.
+A model that assigns all three the same per-sample cost is wrong by ~25% on
+VBLL, and wrong in the direction that flatters it.
+
+Reinstating the panel needs a per-arm FLOP model -- head cost and, for
+IBProbit, the Cholesky term at its own iteration count -- not a shared scalar.
+`panel_cost` is general over a per-(arm, seed) cost function and will take one.
+
+Both panels come from separate measurements -- the dump-mtime timeline and
+`probe_micro_batch{,_torch}.py` -- passed in as JSON. A panel with no input
+draws as empty and says so; it is never filled in from the trajectory, which
+cannot support either number.
 
 Peak memory is a property of (arm, model, batch), not of the trajectory: one
 measurement per arm is the honest object and panel c carries no seed spread.
@@ -188,10 +205,16 @@ def panel_memory(ax, values, title, ylabel, empty_note):
         ax.set_xticks([])
         ax.set_yticks([])
         return
-    labelled = [(f"{label}\nmicro {values[arm][1]}" if values[arm][1]
-                 else label, colour, values[arm][0])
-                for (arm, pass_key), label, colour, _m in final_json.ARMS
-                if pass_key == "id" and arm in values]
+    # Peak memory is a property of the TRAINING run, and TS is post hoc -- so
+    # the CE entry is keyed on the arm, not on which pass is plotted elsewhere.
+    seen, labelled = set(), []
+    for (arm, _pass), label, colour, _m in final_json.ARMS:
+        if arm in seen or arm not in values:
+            continue
+        seen.add(arm)
+        peak, micro = values[arm]
+        labelled.append((f"{label.split(' (')[0]}\nmicro {micro}" if micro
+                         else label, colour, peak))
     ax.bar(range(len(labelled)), [v for _, _, v in labelled], width=0.6,
            color=[c for _, c, _ in labelled], alpha=0.75, zorder=2)
     for i, (_lab, _c, v) in enumerate(labelled):
@@ -223,20 +246,9 @@ def _elapsed_at(timeline, samples):
 
 
 def make_figure(data, out_path, *, targets, baseline, fraction,
-                per_sample_flops, wallclock, memory):
-    fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.0))
+                wallclock, memory):
+    fig, axes = plt.subplots(1, 2, figsize=(8.8, 4.0))
     entries = crossings(data, targets)
-
-    scale = per_sample_flops or 1.0
-
-    def flop_cost(arm, seed, c):
-        if c.censored:
-            return (c.last_step * scale, True)
-        return (c.samples_seen * scale, False)
-
-    panel_cost(axes[0], entries, flop_cost, "a — cost to joint threshold",
-               "FLOPs to threshold" if per_sample_flops
-               else "samples to threshold")
 
     # {(arm, seed): [(samples, elapsed_s)]} -- a MEASURED timeline per run, so
     # panel b reads the clock at the crossing instead of assuming throughput is
@@ -253,12 +265,12 @@ def make_figure(data, out_path, *, targets, baseline, fraction,
             return (_elapsed_at(timeline, c.last_step), True)
         return (_elapsed_at(timeline, c.samples_seen), False)
 
-    panel_cost(axes[1], entries, wall_cost, "b — wall clock to threshold",
+    panel_cost(axes[0], entries, wall_cost, "a — wall clock to threshold",
                "seconds to threshold (A100)")
-    panel_memory(axes[2], memory, "c — peak memory (per arm, not per seed)",
+    panel_memory(axes[1], memory, "b — peak memory (per arm, not per seed)",
                  "GiB", "no --memory given;\nrun probe_micro_batch.py")
     fig.suptitle(
-        f"Fig 7 — compute to a JOINT acc/NLL/Brier target at "
+        f"Fig 7 — cost to a JOINT acc/NLL/Brier target at "
         f"{fraction:g}x the {baseline} baseline's converged value\n"
         + final_json.provenance(data), fontsize=9, y=1.02)
     fig.tight_layout()
@@ -274,14 +286,6 @@ def main():
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig7_compute_to_threshold")
     p.add_argument("--fraction", type=float, default=0.95)
-    p.add_argument("--flops-per-sample", type=float, default=None,
-                   help="Forward+backward FLOPs for ONE sample, from "
-                        "scripts/finetune/bench_step.py. Without it panel a is "
-                        "in samples, which is the same ranking whenever the "
-                        "arms share a backbone -- the arms differ only in the "
-                        "head, so the per-sample cost differs between them and "
-                        "a single scalar is an approximation the caption must "
-                        "state.")
     p.add_argument("--wallclock", default=None,
                    help="scripts/analysis/wallclock_from_dumps.py output: a "
                         "measured (samples, elapsed) timeline per run.")
@@ -314,7 +318,6 @@ def main():
     for ext in ("pdf", "png"):
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),
                     targets=targets, baseline=baseline, fraction=args.fraction,
-                    per_sample_flops=args.flops_per_sample,
                     wallclock=wallclock, memory=memory)
 
 
