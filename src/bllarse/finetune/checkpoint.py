@@ -35,6 +35,15 @@ from typing import Any, Callable, Mapping
 # Written last, and the only thing a reader keys on.
 DONE_SUFFIX = ".done"
 META_SUFFIX = ".json"
+# Renamed from DONE by whichever worker takes the slot. rename(2) is atomic
+# within a filesystem, so exactly one worker can win: the losers get
+# FileNotFoundError and move on.
+#
+# Without it, two workers list the same slot, both evaluate it, and the slower
+# one dies on the metadata the winner already deleted. That happened with three
+# workers -- benign (logged, dropped, no data lost) but it wastes a full
+# 98,389-image pass, and the huge campaign runs eleven of them.
+CLAIM_SUFFIX = ".claimed"
 
 
 def run_dir(root, group_id: str, uid: str) -> Path:
@@ -49,11 +58,17 @@ def _stem(directory: Path, step: int) -> Path:
 
 
 def pending_count(root, group_id: str, uid: str) -> int:
-    """Ready-but-unconsumed slots for one run."""
+    """Ready-but-unconsumed slots for one run, CLAIMED ones included.
+
+    A claimed slot is still on disk and still being read, so backpressure has
+    to count it -- otherwise a trainer would happily write more while workers
+    hold several 3.4 GB blobs open.
+    """
     directory = run_dir(root, group_id, uid)
     if not directory.is_dir():
         return 0
-    return sum(1 for _ in directory.glob(f"*{DONE_SUFFIX}"))
+    return sum(1 for suffix in (DONE_SUFFIX, CLAIM_SUFFIX)
+               for _ in directory.glob(f"*{suffix}"))
 
 
 def write(
@@ -121,6 +136,21 @@ def pending(root, group_id: str | None = None, uid: str | None = None) -> list[P
     return [p.with_suffix("") for p in out]
 
 
+def claim(stem: Path) -> bool:
+    """Take exclusive ownership of a slot. True if this caller won it.
+
+    An atomic rename, not a lock file: two workers that both list a slot will
+    both call this, and rename(2) lets exactly one succeed. The loser skips
+    rather than duplicating a 98,389-image evaluation.
+    """
+    stem = Path(stem)
+    try:
+        os.replace(stem.with_suffix(DONE_SUFFIX), stem.with_suffix(CLAIM_SUFFIX))
+        return True
+    except OSError:
+        return False
+
+
 def read_meta(stem: Path) -> dict[str, Any]:
     return json.loads(Path(stem).with_suffix(META_SUFFIX).read_text())
 
@@ -135,6 +165,7 @@ def consume(stem: Path) -> None:
     slot that looks ready but has no blob -- the worker would then fail on it
     forever."""
     stem = Path(stem)
-    stem.with_suffix(DONE_SUFFIX).unlink(missing_ok=True)
+    for marker in (DONE_SUFFIX, CLAIM_SUFFIX):
+        stem.with_suffix(marker).unlink(missing_ok=True)
     for path in stem.parent.glob(stem.name + ".*"):
         path.unlink(missing_ok=True)

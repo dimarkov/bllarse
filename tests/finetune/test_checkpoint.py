@@ -129,3 +129,39 @@ def test_metadata_is_json_and_carries_the_run_identity(tmp_path):
     assert meta["group_id"] == "ftfinal"
     assert meta["uid"] == "dinov3_huge_x_seed137"
     assert meta["blob"].endswith(".eqx")
+
+
+# --- Claiming: exactly one worker per slot -----------------------------------
+
+
+def test_only_one_claimer_wins(tmp_path):
+    """Two workers list the same slot; rename(2) settles it.
+
+    Without this both evaluate it and the slower one dies on metadata the
+    winner already deleted -- benign, but it wastes a 98,389-image pass, and
+    the huge campaign runs eleven workers against one root.
+    """
+    stem = _write(tmp_path, 1)
+    assert ck.claim(stem) is True
+    assert ck.claim(stem) is False
+
+
+def test_a_claimed_slot_is_no_longer_listed(tmp_path):
+    stem = _write(tmp_path, 1)
+    ck.claim(stem)
+    assert ck.pending(tmp_path) == []
+
+
+def test_backpressure_still_counts_a_claimed_slot(tmp_path):
+    # It is on disk and being read, so the trainer must not write over it.
+    stem = _write(tmp_path, 1, max_pending=1)
+    ck.claim(stem)
+    assert ck.pending_count(tmp_path, "g", "u") == 1
+    assert _write(tmp_path, 2, max_pending=1) is None
+
+
+def test_consume_clears_a_claimed_slot_too(tmp_path):
+    stem = _write(tmp_path, 1)
+    ck.claim(stem)
+    ck.consume(stem)
+    assert list(stem.parent.glob(stem.name + ".*")) == []

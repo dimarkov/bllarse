@@ -226,6 +226,10 @@ def main() -> None:
             ood_sets = loader.load_ood_sets(ns, args.img_size)
 
         for stem in slots:
+            # Exactly one worker evaluates a slot. Losing the race is normal
+            # with eleven workers polling one root, not an error.
+            if not checkpoint.claim(stem):
+                continue
             t0 = time.time()
             try:
                 evaluate = (evaluate_checkpoint if args.framework == "jax"
