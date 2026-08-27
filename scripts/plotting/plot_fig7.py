@@ -114,15 +114,6 @@ def panel_cost(ax, entries, cost, title, ylabel):
     to draw it as a lower bound rather than as a measurement. Returning None
     drops the seed, for panels whose measurement is missing for that run.
     """
-    # Bars on a log axis are drawn from the axis floor, so the floor has to be
-    # set from the data. Left to matplotlib it lands at a decade boundary far
-    # below the smallest bar and every bar reads as full height.
-    finite = [c.samples_seen * scale for _, _, cr in entries
-              for c in cr.values() if not c.censored]
-    finite += [c.last_step * scale for _, _, cr in entries
-               for c in cr.values() if c.censored]
-    floor = min(finite) / 2.0 if finite else 1.0
-
     costed = []
     for label, colour, arm, cross in entries:
         reached, censored = [], []
@@ -149,7 +140,11 @@ def panel_cost(ax, entries, cost, title, ylabel):
 
     for i, (label, colour, reached, censored, n_seeds) in enumerate(costed):
         if reached:
-            ax.bar(i, sum(reached) / len(reached), width=0.6, bottom=floor,
+            # height is TOP MINUS BOTTOM. Passing the value itself with a
+            # non-zero `bottom` draws the bar to floor+value, which on a log
+            # axis put every bar ~1.5x above its own per-seed dots.
+            mean = sum(reached) / len(reached)
+            ax.bar(i, mean - floor, width=0.6, bottom=floor,
                    color=colour, alpha=0.75, zorder=2)
             ax.plot([i] * len(reached), reached, "o", ms=5, color="k",
                     mfc="white", mew=1.0, zorder=4)
@@ -159,7 +154,7 @@ def panel_cost(ax, entries, cost, title, ylabel):
         # data units -- a multiplicative offset on a log axis rescales the
         # whole panel and squashes the bars it was meant to annotate.
         for x in censored:
-            ax.bar(i, x, width=0.6, bottom=floor, facecolor="none",
+            ax.bar(i, x - floor, width=0.6, bottom=floor, facecolor="none",
                    edgecolor=colour, hatch="///", lw=1.2, zorder=3)
             ax.annotate("", xy=(i, x), xytext=(0, 16),
                         textcoords="offset points",
@@ -193,14 +188,19 @@ def panel_memory(ax, values, title, ylabel, empty_note):
         ax.set_xticks([])
         ax.set_yticks([])
         return
-    labelled = [(label, colour, values[arm])
+    labelled = [(f"{label}\nmicro {values[arm][1]}" if values[arm][1]
+                 else label, colour, values[arm][0])
                 for (arm, pass_key), label, colour, _m in final_json.ARMS
                 if pass_key == "id" and arm in values]
     ax.bar(range(len(labelled)), [v for _, _, v in labelled], width=0.6,
            color=[c for _, c, _ in labelled], alpha=0.75, zorder=2)
+    for i, (_lab, _c, v) in enumerate(labelled):
+        ax.annotate(f"{v:.2f}", xy=(i, v), xytext=(0, 3),
+                    textcoords="offset points", ha="center", va="bottom",
+                    fontsize=8)
+    ax.set_ylim(0, max(v for _, _, v in labelled) * 1.15)
     ax.set_xticks(range(len(labelled)))
-    ax.set_xticklabels([lab for lab, _, _ in labelled], rotation=20,
-                       ha="right", fontsize=8)
+    ax.set_xticklabels([lab for lab, _, _ in labelled], fontsize=7)
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontsize=10)
     ax.grid(alpha=0.25, lw=0.6, axis="y")
@@ -304,7 +304,11 @@ def main():
             raise SystemExit(
                 f"[fig7] {path} is model={probe.get('model')!r} but the scores "
                 f"are model={data.get('model')!r}")
-        memory[probe["arm"]] = probe["peak_gib"]
+        # The micro batch rides along because the arms do NOT share one --
+        # vbll runs 64 where ce and ibprobit run 32 -- and a memory bar without
+        # it invites the reader to attribute a batch difference to the method.
+        # Batch is matched at the EFFECTIVE level (512) via accumulation.
+        memory[probe["arm"]] = (probe["peak_gib"], probe.get("micro_batch"))
 
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
