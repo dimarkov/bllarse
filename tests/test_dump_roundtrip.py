@@ -83,3 +83,32 @@ def test_iter_dumps_skips_and_records_a_truncated_dump_when_asked(tmp_path):
     assert [r.meta["step"] for r in records] == [1, 3]
     assert evaldump.CORRUPT_DUMPS == [str(bad)]
     evaldump.CORRUPT_DUMPS.clear()
+
+
+def test_write_dump_leaves_no_temp_file_behind(tmp_path):
+    path = _write(tmp_path, 5, "test")
+    strays = list(path.parent.glob(".*tmp.npz"))
+
+    assert path.exists()
+    assert strays == []
+
+
+def test_an_interrupted_write_leaves_no_dump_at_the_final_name(tmp_path, monkeypatch):
+    # A SLURM wall clock lands mid-savez. The point of the rename is that the
+    # final name never holds a half-written archive -- readers see no dump at
+    # all rather than one that parses until it is decompressed.
+    import numpy as _np
+
+    real = _np.savez_compressed
+
+    def die(file, **payload):
+        real(file, **payload)          # the temp file IS written...
+        raise KeyboardInterrupt        # ...and then the job is killed
+    monkeypatch.setattr(evaldump.np, "savez_compressed", die)
+
+    with pytest.raises(KeyboardInterrupt):
+        _write(tmp_path, 6, "test")
+
+    directory = evaldump.dump_dir(tmp_path, "g", "u")
+    assert list(directory.glob("step_*.npz")) == []
+    assert list(directory.glob(".*tmp.npz")) == []

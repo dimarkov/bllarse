@@ -10,6 +10,7 @@ exponentiation (see bllarse.metrics).
 """
 
 import json
+import os
 import sys
 import zipfile
 import zlib
@@ -159,7 +160,28 @@ def write_dump(
     # would silently clobber the first (e.g. the val dump lost under the test
     # dump written right after it).
     path = directory / f"step_{int(step):07d}_{split}.npz"
-    np.savez_compressed(path, **payload)
+    # Written to a sibling temp file and renamed, never straight to `path`.
+    # np.savez_compressed streams a zip: a job killed part-way through -- a
+    # SLURM wall clock, a preemption -- leaves a truncated archive AT THE FINAL
+    # NAME, which reads as a real dump until something decompresses it. That
+    # cost the dinov3_large scoring run twice, once as BadZipFile and once as
+    # zlib.error, and the four casualties are unrecoverable without re-running
+    # the job. os.replace is atomic within a directory, so an interrupted write
+    # now leaves a stray .tmp and no dump, which is the honest outcome.
+    #
+    # The temp name ENDS IN .npz. savez_compressed appends `.npz` to any target
+    # that does not already end in it, so a `.tmp` suffix would put the archive
+    # at `<tmp>.npz` and leave the rename pointing at a file that was never
+    # written. The pid is in the name because OOD workers for several runs
+    # share a directory and a fixed suffix would have two of them writing one
+    # file; the leading dot keeps it out of the `step_*.npz` glob readers use.
+    tmp = directory / f".{path.stem}.{os.getpid()}.tmp.npz"
+    try:
+        np.savez_compressed(tmp, **payload)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     return path
 
 
