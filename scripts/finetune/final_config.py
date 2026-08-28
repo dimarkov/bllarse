@@ -83,6 +83,23 @@ def build_argparser() -> argparse.ArgumentParser:
                         "both.")
     p.add_argument("--eval-splits", default=fc.FINAL_EVAL_SPLITS,
                    choices=["val", "val+test"])
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="Override ONE config key after the transfer, e.g. "
+                        "--set q_init=1.2e-4 or --set no_learn_q=false. For "
+                        "deliberate, recorded deviations from the reported "
+                        "config -- an ablation sweep -- so the run is still "
+                        "the study's config plus exactly the named change, "
+                        "with nothing hand-copied. The key must already exist "
+                        "in the transferred config, or a typo would silently "
+                        "add a flag the script ignores.")
+    p.add_argument("--group-id", default=None,
+                   help="Dump group. Set it for a sweep so the dumps land "
+                        "beside, not inside, the reported campaign.")
+    p.add_argument("--uid", default=None,
+                   help="Run identity. REQUIRED when a sweep varies something "
+                        "other than (model, dataset, arm, seed), since the "
+                        "derived uid is keyed on those alone and two sweep "
+                        "points would otherwise share a directory.")
     p.add_argument("--format", default="argv", choices=["argv", "sh", "json", "exec"],
                    help="`exec` replaces this process with the training run, "
                         "so a SLURM task resolves its own config from the "
@@ -111,6 +128,30 @@ def main() -> None:
             ood_checkpoint_root=args.ood_checkpoint_root,
             ood_max_pending=args.ood_max_pending,
         )
+        if args.group_id is not None:
+            config["group_id"] = args.group_id
+        if args.uid is not None:
+            config["uid"] = args.uid
+        for item in args.set:
+            key, _, raw = item.partition("=")
+            if not _:
+                raise SystemExit(f"[final] --set wants KEY=VALUE, got {item!r}")
+            if key not in config:
+                raise SystemExit(
+                    f"[final] --set {key}: not in the transferred config. "
+                    f"Known keys: {', '.join(sorted(config))}")
+            current = config[key]
+            if isinstance(current, bool) or raw.lower() in ("true", "false"):
+                value = raw.lower() == "true"
+            elif isinstance(current, int) and not isinstance(current, bool):
+                value = int(raw)
+            elif isinstance(current, float):
+                value = float(raw)
+            else:
+                value = raw
+            print(f"[final] override {key}: {current!r} -> {value!r}", flush=True)
+            config[key] = value
+
         script = finetune_worker.SCRIPTS[arm]
         argv = adapters.config_to_argv(config)
 
