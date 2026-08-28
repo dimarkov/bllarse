@@ -111,6 +111,36 @@ def first_crossing(curve: Curve, targets: Targets) -> Crossing:
     )
 
 
+def first_crossing_metric(curve: Curve, metric: str, target: float,
+                          lower_is_better: bool = True) -> Crossing:
+    """First step at which ONE metric reaches `target`. Censored if never.
+
+    The joint acc/NLL/Brier rule (`first_crossing`) answers "when is this run
+    as good as the baseline in every respect". This answers "when does it reach
+    a given value of one quantity", which is the right question when the
+    quantity is the SELECTION criterion -- val_nll -- and accuracy is something
+    you then report at that point rather than something you gate on.
+
+    Gating on val_nll alone is not a weaker joint test; it is a different one.
+    A run can cross here while still behind on accuracy, and the caller is
+    expected to say what accuracy it had.
+    """
+    if not curve:
+        return Crossing(step=None, samples_seen=None, censored=True,
+                        last_step=None)
+    ordered = sorted((r for r in curve if metric in r),
+                     key=lambda row: row["step"])
+    if not ordered:
+        raise ValueError(f"metric {metric!r} is absent from every row")
+    for row in ordered:
+        value = row[metric]
+        if value <= target if lower_is_better else value >= target:
+            return Crossing(step=row["step"], samples_seen=row["samples_seen"],
+                            censored=False, last_step=ordered[-1]["step"])
+    return Crossing(step=None, samples_seen=None, censored=True,
+                    last_step=ordered[-1]["step"])
+
+
 def crossings_per_seed(
     curves_by_seed: Mapping[int, Curve], targets: Targets
 ) -> dict[int, Crossing]:

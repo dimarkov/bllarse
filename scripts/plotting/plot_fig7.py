@@ -126,6 +126,62 @@ def pick_targets(data, fraction, reference="early_stop"):
     return targets, name
 
 
+def val_nll_target(data, fraction, baseline_arm):
+    """The val-NLL every arm is timed against, and where the baseline hit it.
+
+    The reference is `baseline_arm`'s MINIMUM val NLL -- the best that arm ever
+    achieves on the selection split -- taken from its seed-mean curve so one
+    lucky seed cannot set the bar. The target is that value / fraction, the
+    same looser-is-larger convention `make_targets` uses for lower-is-better
+    metrics.
+
+    Deliberately IBProbit's own optimum rather than a CE-derived one. The
+    question this panel answers is "how long does each arm take to reach the
+    quality IBProbit converges to", so the reference has to be that quality;
+    deriving it from CE would answer a question about CE's endpoint instead,
+    and CE's endpoint is not the operating point anyone deploys.
+    """
+    uids = final_json.uids_by_arm(data, "id").get(baseline_arm)
+    if not uids:
+        raise SystemExit(f"[fig7] no {baseline_arm!r} runs in the scored JSON")
+    curve = _mean_curve(data, uids, "id")
+    if not curve or "val_nll" not in curve[0]:
+        raise SystemExit(
+            "[fig7] the scored curves carry no val_nll; re-score with a "
+            "score_final that emits it.")
+    best = min(curve, key=lambda r: r["val_nll"])
+    target = best["val_nll"] / fraction
+    print(f"[fig7] reference {baseline_arm}: min val_nll={best['val_nll']:.4f} "
+          f"at {best['samples_seen']:,} samples "
+          f"(test acc there {best['acc']:.4f})")
+    print(f"[fig7] target: val_nll <= {target:.4f} "
+          f"({fraction:g}x the reference, looser)")
+    return target, best
+
+
+def val_crossings(data, target):
+    """[(label, colour, arm, {seed: (Crossing, row)})] in ARMS order.
+
+    The row is carried alongside the crossing so the caller can report what
+    TEST accuracy the run had at the point its VAL nll crossed. Selection on
+    val, reporting on test.
+    """
+    entries = []
+    for (arm, pass_key), label, colour, _marker in final_json.ARMS:
+        uids = final_json.uids_by_arm(data, pass_key).get(arm)
+        if not uids:
+            continue
+        per_seed = {}
+        for seed, uid in uids.items():
+            rows = final_json.rows(data, uid, pass_key)
+            crossing = thresholds.first_crossing_metric(rows, "val_nll", target)
+            row = next((r for r in rows
+                        if r["samples_seen"] == crossing.samples_seen), None)
+            per_seed[seed] = (crossing, row)
+        entries.append((label, colour, arm, per_seed))
+    return entries
+
+
 def crossings(data, targets):
     """[(label, colour, arm, {seed: Crossing})] in ARMS order."""
     entries = []
@@ -213,6 +269,86 @@ def panel_cost(ax, entries, cost, title, ylabel):
     ax.set_axisbelow(True)
 
 
+def panel_relative(ax, entries, timelines, baseline_arm, title):
+    """Wall clock to the val-NLL target, RELATIVE to the baseline arm.
+
+    Absolute seconds are a property of the A100 this ran on; the ratio is the
+    comparison the paper actually makes, and it is the same number on any
+    device the arms share. The baseline sits at 1.0 by construction, so its bar
+    is a reference line rather than a result -- its per-seed dots still carry
+    its own spread.
+    """
+    costed = {}
+    for label, colour, arm, per_seed in entries:
+        reached, censored, accs = [], [], []
+        for seed, (crossing, row) in per_seed.items():
+            timeline = timelines.get((arm, seed))
+            if not timeline:
+                continue
+            if crossing.censored:
+                censored.append(_elapsed_at(timeline, crossing.last_step))
+                continue
+            reached.append(_elapsed_at(timeline, crossing.samples_seen))
+            if row is not None:
+                accs.append(row["acc"])
+        costed[arm] = (label, colour, reached, censored, accs, len(per_seed))
+
+    base = costed.get(baseline_arm)
+    if not base or not base[2]:
+        raise SystemExit(f"[fig7] {baseline_arm} never reaches the target; "
+                         f"there is nothing to normalise by")
+    unit = sum(base[2]) / len(base[2])
+    base_acc = sum(base[4]) / len(base[4]) if base[4] else None
+    print(f"[fig7] normalising by {baseline_arm}: {unit:.0f} s = 1.0")
+
+    order = [arm for (arm, _p), _l, _c, _m in final_json.ARMS if arm in costed]
+    # Headroom set from the data before anything is drawn: the accuracy note
+    # sits ~8 points above the tallest DOT, not the tallest bar, and a mean bar
+    # well below a spread-out seed hid the note behind the panel title.
+    tallest = max((v / unit for _l, _c, r, c, _a, _n in costed.values()
+                   for v in (r + c)), default=1.0)
+    ax.set_ylim(0, tallest * 1.32)
+
+    for i, arm in enumerate(order):
+        label, colour, reached, censored, accs, n_seeds = costed[arm]
+        rel = [v / unit for v in reached]
+        rel_censored = [v / unit for v in censored]
+        if rel:
+            ax.bar(i, sum(rel) / len(rel), width=0.6, color=colour, alpha=0.75,
+                   zorder=2)
+            ax.plot([i] * len(rel), rel, "o", ms=5, color="k", mfc="white",
+                    mew=1.0, zorder=4)
+        for v in rel_censored:
+            ax.bar(i, v, width=0.6, facecolor="none", edgecolor=colour,
+                   hatch="///", lw=1.2, zorder=3)
+            ax.annotate("", xy=(i, v), xytext=(0, 16),
+                        textcoords="offset points",
+                        arrowprops=dict(arrowstyle="<|-", color=colour, lw=1.2))
+        # What ACCURACY the run had when its val NLL crossed. The panel gates
+        # on one metric, so the other one has to be stated rather than assumed
+        # to have come along -- an arm can cross first and still be behind here.
+        top = max(rel + rel_censored) if (rel or rel_censored) else 0
+        if accs:
+            acc = sum(accs) / len(accs)
+            delta = "" if base_acc is None else f"\n({acc - base_acc:+.3f})"
+            ax.annotate(f"acc {acc:.3f}{delta}", xy=(i, top), xytext=(0, 8),
+                        textcoords="offset points", ha="center", va="bottom",
+                        fontsize=7, color="0.25")
+        if censored:
+            ax.annotate(f"{len(censored)}/{n_seeds} censored", xy=(i, top),
+                        xytext=(0, 26), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=7, color=colour)
+
+    ax.axhline(1.0, color="0.4", ls=":", lw=1.0, zorder=1)
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels([costed[a][0] for a in order], rotation=20, ha="right",
+                       fontsize=8)
+    ax.set_ylabel(f"wall clock / {costed[baseline_arm][0]}")
+    ax.set_title(title, fontsize=10)
+    ax.grid(alpha=0.25, lw=0.6, axis="y")
+    ax.set_axisbelow(True)
+
+
 def panel_memory(ax, values, title, ylabel, empty_note):
     """One measured scalar per arm -- peak memory, which has no seed spread."""
     if not values:
@@ -262,34 +398,29 @@ def _elapsed_at(timeline, samples):
     return timeline[-1][1]
 
 
-def make_figure(data, out_path, *, targets, baseline, fraction,
-                wallclock, memory):
-    fig, axes = plt.subplots(1, 2, figsize=(8.8, 4.0))
-    entries = crossings(data, targets)
+def make_figure(data, out_path, *, target, reference_row, fraction,
+                baseline_arm, wallclock, memory):
+    fig, axes = plt.subplots(1, 2, figsize=(8.8, 4.2))
+    entries = val_crossings(data, target)
 
     # {(arm, seed): [(samples, elapsed_s)]} -- a MEASURED timeline per run, so
-    # panel b reads the clock at the crossing instead of assuming throughput is
-    # flat across a run that pays compilation once and evaluation every dump.
+    # the panel reads the clock at the crossing instead of assuming throughput
+    # is flat across a run that pays compilation once and evaluation per dump.
     timelines = {}
     for run in (wallclock.get("runs") or {}).values():
         timelines[(run["arm"], int(run["seed"]))] = run["elapsed_s"]
+    if not timelines:
+        raise SystemExit("[fig7] --wallclock is required: this panel is a time")
 
-    def wall_cost(arm, seed, c):
-        timeline = timelines.get((arm, seed))
-        if not timeline:
-            return None
-        if c.censored:
-            return (_elapsed_at(timeline, c.last_step), True)
-        return (_elapsed_at(timeline, c.samples_seen), False)
-
-    panel_cost(axes[0], entries, wall_cost, "a — wall clock to threshold",
-               "seconds to threshold (A100)")
+    panel_relative(axes[0], entries, timelines, baseline_arm,
+                   "a — time to reach the target val NLL")
     panel_memory(axes[1], memory, "b — peak memory (per arm, not per seed)",
                  "GiB", "no --memory given;\nrun probe_micro_batch.py")
     fig.suptitle(
-        f"Fig 7 — cost to a JOINT acc/NLL/Brier target at "
-        f"{fraction:g}x the {baseline} baseline's early-stopped value\n"
-        + final_json.provenance(data), fontsize=9, y=1.02)
+        f"Fig 7 — time to val NLL ≤ {target:.4f} "
+        f"({fraction:g}× {baseline_arm}'s best val NLL, {reference_row['val_nll']:.4f}),"
+        f" relative to {baseline_arm}\n"
+        + final_json.provenance(data), fontsize=9, y=1.03)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight", dpi=150)
     plt.close(fig)
@@ -303,14 +434,10 @@ def main():
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig7_compute_to_threshold")
     p.add_argument("--fraction", type=float, default=0.95)
-    p.add_argument("--reference", default="early_stop",
-                   choices=["early_stop", "last"],
-                   help="Which point of the baseline the targets come from. "
-                        "early_stop is the val-NLL argmin -- the operating "
-                        "point a practitioner would deploy. `last` is the "
-                        "final evaluation, which on a non-monotone curve "
-                        "spends most of the 5%% tolerance on the baseline's "
-                        "own late decay.")
+    p.add_argument("--baseline-arm", default="ibprobit",
+                   help="Whose best val NLL sets the target, and what the "
+                        "times are relative to. Its bar is 1.0 by "
+                        "construction.")
     p.add_argument("--wallclock", default=None,
                    help="scripts/analysis/wallclock_from_dumps.py output: a "
                         "measured (samples, elapsed) timeline per run.")
@@ -321,7 +448,8 @@ def main():
 
     data = final_json.load(args.scores)
     print(f"[fig7] {final_json.provenance(data)}")
-    targets, baseline = pick_targets(data, args.fraction, args.reference)
+    target, reference_row = val_nll_target(data, args.fraction,
+                                          args.baseline_arm)
     wallclock = json.loads(Path(args.wallclock).read_text()) if args.wallclock else {}
     memory = {}
     for path in args.memory or ():
@@ -342,7 +470,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),
-                    targets=targets, baseline=baseline, fraction=args.fraction,
+                    target=target, reference_row=reference_row,
+                    fraction=args.fraction, baseline_arm=args.baseline_arm,
                     wallclock=wallclock, memory=memory)
 
 

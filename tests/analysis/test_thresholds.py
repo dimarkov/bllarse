@@ -309,3 +309,37 @@ def test_every_stage4_sweep_has_a_figure_group_that_reads_it():
             f"{sweep}.GROUP_ID={gid!r} is read by no figure and no analysis -- "
             f"its runs would be written and then never looked at"
         )
+
+
+def test_single_metric_crossing_ignores_the_other_metrics():
+    # Accuracy is still terrible at step 2, but the panel that uses this gates
+    # on val_nll alone and REPORTS accuracy rather than requiring it.
+    curve = [dict(step=s, samples_seen=s * 100, acc=a, val_nll=v)
+             for s, a, v in [(1, 0.10, 3.0), (2, 0.20, 0.45), (3, 0.80, 0.40)]]
+
+    c = thresholds.first_crossing_metric(curve, "val_nll", 0.50)
+
+    assert c.step == 2
+    assert c.samples_seen == 200
+    assert not c.censored
+
+
+def test_single_metric_crossing_censors_a_run_that_never_reaches_it():
+    curve = [dict(step=s, samples_seen=s * 100, val_nll=v)
+             for s, v in [(1, 3.0), (2, 2.0)]]
+
+    c = thresholds.first_crossing_metric(curve, "val_nll", 0.5)
+
+    assert c.censored
+    assert c.step is None
+    assert c.last_step == 2
+
+
+def test_single_metric_crossing_handles_higher_is_better():
+    curve = [dict(step=s, samples_seen=s * 100, acc=a)
+             for s, a in [(1, 0.10), (2, 0.85)]]
+
+    c = thresholds.first_crossing_metric(curve, "acc", 0.80,
+                                         lower_is_better=False)
+
+    assert c.step == 2
