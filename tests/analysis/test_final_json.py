@@ -117,3 +117,19 @@ def test_ood_arms_keeps_the_scaled_entry_once_it_exists():
 
     assert ("ce", "ts") in keys
     assert ("ce", "id") not in keys
+
+
+def test_the_module_still_exports_what_the_figure_scripts_import():
+    """A guard against silent deletion.
+
+    plot_fig5 and plot_fig6 are scripts with no test of their own, so when an
+    edit to this module dropped METRICS, OOD_SETS and tuning_budget the whole
+    suite stayed green and only rendering a figure showed it. These four names
+    are the module's contract with those scripts.
+    """
+    for name in ("ARMS", "METRICS", "OOD_SETS", "tuning_budget"):
+        assert hasattr(final_json, name), f"final_json.{name} is gone"
+
+    assert [m[0] for m in final_json.METRICS] == ["acc", "nll", "brier"]
+    assert len(final_json.OOD_SETS) == 4
+    assert final_json.tuning_budget() > 0
