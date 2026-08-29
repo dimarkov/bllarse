@@ -324,6 +324,13 @@ def build_argparser() -> argparse.ArgumentParser:
     # script runs at ~3906 steps when tuning and ~10,009 for a 4-epoch final
     # run. protocol.betas_for holds (1 - beta) * steps invariant across that.
     # The defaults are torch's, so an invocation that omits them is unchanged.
+    p.add_argument("--lr-decay-frac", type=float, default=0.0,
+                   help="Fraction of the run spent in a linear LR decay "
+                        "(Warmup-Stable-Decay). 0, the default, is the "
+                        "constant-LR schedule every reported run used.")
+    p.add_argument("--lr-decay-to", type=float, default=0.5,
+                   help="LR multiplier at the END of the decay, relative to "
+                        "the peak. Applied to the head group as well.")
     p.add_argument("--beta1", type=float, default=protocol.REFERENCE_BETAS[0],
                    help="AdamW beta1. Transfers with the run length; see "
                         "protocol.betas_for.")
@@ -489,6 +496,23 @@ def _train(args, on_dump=None, run=None) -> None:
         {"params": head.parameters(), "lr": args.head_lr, "weight_decay": 0.0},
     ], betas=(args.beta1, args.beta2))
 
+    # Warmup-Stable-Decay, from protocol.wsd_multiplier so this arm and the JAX
+    # arms provably run the SAME schedule under the same flag. At the default
+    # (--lr-decay-frac 0) the multiplier is 1.0 at every step, so the scheduler
+    # is a no-op and the reported runs are reproduced exactly.
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: protocol.wsd_multiplier(
+            step, plan["steps"], decay_frac=args.lr_decay_frac,
+            decay_to=args.lr_decay_to))
+    if args.lr_decay_frac:
+        mult = protocol.wsd_mean_multiplier(args.lr_decay_frac, args.lr_decay_to)
+        print(f"[vbll-ft] WSD: constant for "
+              f"{(1 - args.lr_decay_frac) * 100:.0f}% of {plan['steps']} steps, "
+              f"then linear to {args.lr_decay_to:g}x. Mean lr is {mult:.3f}x the "
+              f"peak; torch AdamW scales decoupled weight decay by lr, so total "
+              f"shrinkage is {mult:.3f}x the tuned configuration's.", flush=True)
+
     from datasets import load_dataset
     ds = load_dataset(ds_config["hf_path"], name=ds_config.get("hf_config"))
     eval_split = ds[ds_config["test_split"]]
@@ -541,6 +565,7 @@ def _train(args, on_dump=None, run=None) -> None:
                 loss.backward()
 
             optimizer.step()
+            scheduler.step()
 
             step_time = time.perf_counter() - step_t0
             if step > 1:

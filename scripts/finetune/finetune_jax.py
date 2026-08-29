@@ -292,6 +292,17 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="override q0 directly (bypasses alpha^2 / B; 1/D is the pre-Wishart value)")
     p.add_argument("--kappa", type=float, default=None,
                    help="Inverse-Wishart prior pseudo-count (default: 0.5, i.e. half a pseudo-observation against the K the likelihood adds per step)")
+    p.add_argument("--lr-decay-frac", type=float, default=0.0,
+                   help="Fraction of the run spent in a linear LR decay "
+                        "(Warmup-Stable-Decay). 0, the default, is the "
+                        "constant-LR schedule every reported run used. WSD "
+                        "rather than cosine because the transfer rule's "
+                        "hyperparameters were tuned at a constant LR: a WSD "
+                        "run keeps that exact operating point for its stable "
+                        "phase, a cosine run shares no phase with it.")
+    p.add_argument("--lr-decay-to", type=float, default=0.5,
+                   help="LR multiplier at the END of the decay, relative to "
+                        "the peak. Applied to the head as well as the trunk.")
     p.add_argument("--warmup", type=int, default=1,
                    help="hold the contamination gate at 1 for the first N update steps")
     p.add_argument("--eps-init", type=float, default=0.01,
@@ -644,8 +655,30 @@ def _train(args, on_dump=None, run=None) -> None:
         args, embed_dim=embed_dim, num_classes=num_classes,
         init_key=init_key, effective_batch=plan["effective_batch"])
 
+    # Warmup-Stable-Decay. `--lr-decay-frac 0` (the default) returns the scalar
+    # unchanged, so every reported run so far is reproduced exactly.
+    #
+    # The SAME schedule object goes on the head as on the trunk: the head is
+    # fitted to the trunk's features, and annealing one while the other keeps
+    # moving would leave the head chasing a target at full speed with a
+    # shrinking step. Both groups also take the same number of steps, which is
+    # the same reason the betas are not split between them.
+    lr_sched = protocol.wsd_schedule(
+        args.lr, plan["steps"], decay_frac=args.lr_decay_frac,
+        decay_to=args.lr_decay_to)
+    if args.lr_decay_frac:
+        mult = protocol.wsd_mean_multiplier(args.lr_decay_frac, args.lr_decay_to)
+        print(f"[finetune] WSD: constant for "
+              f"{(1 - args.lr_decay_frac) * 100:.0f}% of {plan['steps']} steps, "
+              f"then linear to {args.lr_decay_to:g}x. Mean lr is {mult:.3f}x the "
+              f"peak, so total shrinkage steps*lr*wd is {mult:.3f}x the tuned "
+              f"configuration's.", flush=True)
+
     if args.arm == "ce":
         head_lr = args.head_lr if args.head_lr is not None else DEFAULT_HEAD_LR
+        head_sched = protocol.wsd_schedule(
+            head_lr, plan["steps"], decay_frac=args.lr_decay_frac,
+            decay_to=args.lr_decay_to)
         param_labels = (
             jax.tree.map(lambda _: "backbone", eqx.filter(backbone, eqx.is_array)),
             jax.tree.map(lambda _: "head", eqx.filter(head, eqx.is_array)),
@@ -653,7 +686,7 @@ def _train(args, on_dump=None, run=None) -> None:
         optimizer = optax.multi_transform(
             {
                 "backbone": optax.adamw(
-                    args.lr, b1=args.beta1, b2=args.beta2,
+                    lr_sched, b1=args.beta1, b2=args.beta2,
                     weight_decay=args.weight_decay),
                 # Head weight decay is 0 on every arm (design D6): VBLL's KL is
                 # its head regulariser and IBProbit runs no optimizer on the
@@ -663,14 +696,14 @@ def _train(args, on_dump=None, run=None) -> None:
                 # averaging horizon in steps, and both groups take the same
                 # number of steps.
                 "head": optax.adamw(
-                    head_lr, b1=args.beta1, b2=args.beta2, weight_decay=0.0),
+                    head_sched, b1=args.beta1, b2=args.beta2, weight_decay=0.0),
             },
             param_labels,
         )
         opt_state = optimizer.init(eqx.filter((backbone, head), eqx.is_array))
     else:
         optimizer = optax.adamw(
-            args.lr, b1=args.beta1, b2=args.beta2,
+            lr_sched, b1=args.beta1, b2=args.beta2,
             weight_decay=args.weight_decay)
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
 

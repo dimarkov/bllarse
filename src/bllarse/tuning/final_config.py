@@ -142,6 +142,8 @@ def final_config(
     ood_checkpoint_root: str | None = None,
     ood_max_pending: int | None = None,
     model: str | None = None,
+    lr_decay_frac: float = 0.0,
+    lr_decay_to: float = 0.5,
 ) -> dict[str, Any]:
     """The final campaign's config for `arm`, transferred from a tuned trial.
 
@@ -164,6 +166,16 @@ def final_config(
     So the transplant stays an assumption that the paper reports, exactly as it
     was before this module existed. This function narrows the batch/duration
     gap and leaves the width gap visible.
+
+    `lr_decay_frac`/`lr_decay_to` carry the WSD schedule. They default to OFF,
+    reproducing the constant-LR runs exactly, and they are emitted into the
+    config unconditionally so a sweep can reach them through
+    `final_config.py --set` -- which refuses a key the config does not already
+    have, and so would refuse a schedule that only existed as a script flag.
+    Turning the schedule on changes what the transferred hyperparameters mean:
+    they were tuned at a constant LR, and optax scales decoupled weight decay
+    by the learning rate, so the run's total shrinkage falls by
+    `protocol.wsd_mean_multiplier`.
     """
     to_samples = int(epochs * n_train)
     batch = effective_batch if to_batch is None else to_batch
@@ -222,6 +234,11 @@ def final_config(
     config["group_id"] = group_id
     # Overrides trial_config's tuning experiment: same flag, same scripts, but
     # a reported 4-epoch run does not belong in the search's experiment.
+    # Always emitted, both of them, even at the default. --set refuses a key
+    # the config lacks, so a schedule that appeared only when already enabled
+    # could never be enabled through it.
+    config["lr_decay_frac"] = float(lr_decay_frac)
+    config["lr_decay_to"] = float(lr_decay_to)
     config["enable_mlflow"] = enable_mlflow
     config["mlflow_experiment"] = mlflow_experiment
     if dump_every_k_evals is not None:
