@@ -142,7 +142,7 @@ def final_config(
     ood_checkpoint_root: str | None = None,
     ood_max_pending: int | None = None,
     model: str | None = None,
-    lr_decay_frac: float = 0.0,
+    lr_decay_start: float = 1.0,
     lr_decay_to: float = 0.5,
 ) -> dict[str, Any]:
     """The final campaign's config for `arm`, transferred from a tuned trial.
@@ -167,7 +167,9 @@ def final_config(
     was before this module existed. This function narrows the batch/duration
     gap and leaves the width gap visible.
 
-    `lr_decay_frac`/`lr_decay_to` carry the WSD schedule. They default to OFF,
+    `lr_decay_start`/`lr_decay_to` carry the WSD schedule. `lr_decay_start` is
+    the fraction of the run at which the decay BEGINS, not its length. They
+    default to OFF (start 1.0),
     reproducing the constant-LR runs exactly, and they are emitted into the
     config unconditionally so a sweep can reach them through
     `final_config.py --set` -- which refuses a key the config does not already
@@ -237,7 +239,7 @@ def final_config(
     # Always emitted, both of them, even at the default. --set refuses a key
     # the config lacks, so a schedule that appeared only when already enabled
     # could never be enabled through it.
-    config["lr_decay_frac"] = float(lr_decay_frac)
+    config["lr_decay_start"] = float(lr_decay_start)
     config["lr_decay_to"] = float(lr_decay_to)
     config["enable_mlflow"] = enable_mlflow
     config["mlflow_experiment"] = mlflow_experiment

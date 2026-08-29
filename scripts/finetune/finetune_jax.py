@@ -292,10 +292,13 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="override q0 directly (bypasses alpha^2 / B; 1/D is the pre-Wishart value)")
     p.add_argument("--kappa", type=float, default=None,
                    help="Inverse-Wishart prior pseudo-count (default: 0.5, i.e. half a pseudo-observation against the K the likelihood adds per step)")
-    p.add_argument("--lr-decay-frac", type=float, default=0.0,
-                   help="Fraction of the run spent in a linear LR decay "
-                        "(Warmup-Stable-Decay). 0, the default, is the "
-                        "constant-LR schedule every reported run used. WSD "
+    p.add_argument("--lr-decay-start", type=float, default=1.0,
+                   help="Fraction of the run at which the linear LR decay "
+                        "BEGINS (Warmup-Stable-Decay): 0.25 holds the peak to "
+                        "25%% of the steps then ramps down over the remaining "
+                        "75%%. NOT the length of the decay phase. 1.0, the "
+                        "default, never decays and is the constant-LR "
+                        "schedule every reported run used. WSD "
                         "rather than cosine because the transfer rule's "
                         "hyperparameters were tuned at a constant LR: a WSD "
                         "run keeps that exact operating point for its stable "
@@ -655,7 +658,7 @@ def _train(args, on_dump=None, run=None) -> None:
         args, embed_dim=embed_dim, num_classes=num_classes,
         init_key=init_key, effective_batch=plan["effective_batch"])
 
-    # Warmup-Stable-Decay. `--lr-decay-frac 0` (the default) returns the scalar
+    # Warmup-Stable-Decay. `--lr-decay-start 1.0` (the default) returns the scalar
     # unchanged, so every reported run so far is reproduced exactly.
     #
     # The SAME schedule object goes on the head as on the trunk: the head is
@@ -664,12 +667,12 @@ def _train(args, on_dump=None, run=None) -> None:
     # shrinking step. Both groups also take the same number of steps, which is
     # the same reason the betas are not split between them.
     lr_sched = protocol.wsd_schedule(
-        args.lr, plan["steps"], decay_frac=args.lr_decay_frac,
+        args.lr, plan["steps"], decay_start=args.lr_decay_start,
         decay_to=args.lr_decay_to)
-    if args.lr_decay_frac:
-        mult = protocol.wsd_mean_multiplier(args.lr_decay_frac, args.lr_decay_to)
+    if args.lr_decay_start < 1.0:
+        mult = protocol.wsd_mean_multiplier(args.lr_decay_start, args.lr_decay_to)
         print(f"[finetune] WSD: constant for "
-              f"{(1 - args.lr_decay_frac) * 100:.0f}% of {plan['steps']} steps, "
+              f"{args.lr_decay_start * 100:.0f}% of {plan['steps']} steps, "
               f"then linear to {args.lr_decay_to:g}x. Mean lr is {mult:.3f}x the "
               f"peak, so total shrinkage steps*lr*wd is {mult:.3f}x the tuned "
               f"configuration's.", flush=True)
@@ -677,7 +680,7 @@ def _train(args, on_dump=None, run=None) -> None:
     if args.arm == "ce":
         head_lr = args.head_lr if args.head_lr is not None else DEFAULT_HEAD_LR
         head_sched = protocol.wsd_schedule(
-            head_lr, plan["steps"], decay_frac=args.lr_decay_frac,
+            head_lr, plan["steps"], decay_start=args.lr_decay_start,
             decay_to=args.lr_decay_to)
         param_labels = (
             jax.tree.map(lambda _: "backbone", eqx.filter(backbone, eqx.is_array)),

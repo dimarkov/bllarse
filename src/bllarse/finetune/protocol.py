@@ -227,22 +227,30 @@ def accum_plan(target_batch: int, micro_batch: int) -> tuple[int, int, int]:
 # 512 duplicates finetune_space.FIXED_BATCH_SIZE rather than importing it:
 # finetune_space imports THIS module, so the dependency cannot run the other
 # way. `test_protocol_reference_matches_the_pinned_batch` keeps them equal.
-def wsd_multiplier(step: int, steps: int, *, decay_frac: float,
+def wsd_multiplier(step: int, steps: int, *, decay_start: float,
                    decay_to: float) -> float:
     """The WSD multiplier on the peak LR at `step`, as plain arithmetic.
+
+    `decay_start` is WHERE THE DECAY BEGINS, as a fraction of the run: 0.25
+    holds the peak until 25% of the steps and then ramps down over the
+    remaining 75%. It is not the length of the decay phase. The first version
+    of this took the length and was read as the start within a day, which is
+    the whole reason it is named for the boundary now.
+
+    `decay_start = 1.0` never decays, which is the OFF setting.
 
     THE definition of the schedule. `wsd_schedule` is its optax realisation for
     the JAX arms and the torch arm reads this directly, so the two frameworks
     cannot drift into running different schedules under one flag --
     `test_the_two_realisations_agree` pins them together.
     """
-    if not 0.0 <= decay_frac <= 1.0:
-        raise ValueError(f"decay_frac must be in [0, 1], got {decay_frac}")
+    if not 0.0 <= decay_start <= 1.0:
+        raise ValueError(f"decay_start must be in [0, 1], got {decay_start}")
     if not 0.0 < decay_to <= 1.0:
         raise ValueError(f"decay_to must be in (0, 1], got {decay_to}")
-    if decay_frac == 0.0:
+    if decay_start >= 1.0:
         return 1.0
-    stable = int(round(steps * (1.0 - decay_frac)))
+    stable = int(round(steps * decay_start))
     if step <= stable:
         return 1.0
     span = max(1, steps - stable)
@@ -250,38 +258,40 @@ def wsd_multiplier(step: int, steps: int, *, decay_frac: float,
     return 1.0 + (decay_to - 1.0) * frac
 
 
-def wsd_schedule(peak: float, steps: int, *, decay_frac: float,
+def wsd_schedule(peak: float, steps: int, *, decay_start: float,
                  decay_to: float):
     """Warmup-Stable-Decay learning rate: constant, then a linear tail.
 
-    Returns the scalar `peak` unchanged when `decay_frac` is 0, so the default
-    path is bit-identical to the constant-LR runs and adding this cannot
-    silently perturb a reported campaign.
+    `decay_start` is the fraction of the run at which the ramp BEGINS, so 0.25
+    decays over the last 75% of the steps. Returns the scalar `peak` unchanged
+    when `decay_start` is 1.0 (the OFF setting), so the default path is
+    bit-identical to the constant-LR runs and adding this cannot silently
+    perturb a reported campaign.
 
     WSD rather than cosine, and the reason is the transfer rule. Every
     hyperparameter in both campaigns was tuned at a CONSTANT learning rate and
     moved by the AdamW SDE rule, whose authors note it "might be specific to
     the fixed (cosine) schedule that we use". A cosine run shares no phase with
-    the tuned configuration. A WSD run spends `1 - decay_frac` of its steps at
+    the tuned configuration. A WSD run spends `decay_start` of its steps at
     exactly the tuned constant, so the tuned point remains the operating point
     for most of the run and only the tail is new.
 
     NOTE what this does to weight decay: optax.adamw scales the decoupled decay
     update BY the learning rate, so decaying lr decays the shrinkage rate with
     it. Total shrinkage `steps x lr x wd` therefore falls by the schedule's own
-    mean multiplier -- (1 - decay_frac) + decay_frac * (1 + decay_to) / 2 --
+    mean multiplier -- decay_start + (1 - decay_start) * (1 + decay_to) / 2 --
     and is NOT the value the tuned configuration was selected at.
     """
-    if not 0.0 <= decay_frac <= 1.0:
-        raise ValueError(f"decay_frac must be in [0, 1], got {decay_frac}")
+    if not 0.0 <= decay_start <= 1.0:
+        raise ValueError(f"decay_start must be in [0, 1], got {decay_start}")
     if not 0.0 < decay_to <= 1.0:
         raise ValueError(f"decay_to must be in (0, 1], got {decay_to}")
-    if decay_frac == 0.0:
+    if decay_start >= 1.0:
         return peak
 
     import optax
 
-    stable = int(round(steps * (1.0 - decay_frac)))
+    stable = int(round(steps * decay_start))
     return optax.join_schedules(
         [optax.constant_schedule(peak),
          optax.linear_schedule(peak, peak * decay_to,
@@ -290,15 +300,16 @@ def wsd_schedule(peak: float, steps: int, *, decay_frac: float,
     )
 
 
-def wsd_mean_multiplier(decay_frac: float, decay_to: float) -> float:
+def wsd_mean_multiplier(decay_start: float, decay_to: float) -> float:
     """Mean LR over a WSD run, as a fraction of the peak.
 
     The factor by which the run's total decoupled shrinkage falls relative to
     the constant-LR configuration the hyperparameters were tuned at.
     """
-    if decay_frac == 0.0:
+    if decay_start >= 1.0:
         return 1.0
-    return (1.0 - decay_frac) + decay_frac * (1.0 + decay_to) / 2.0
+    decaying = 1.0 - decay_start
+    return decay_start + decaying * (1.0 + decay_to) / 2.0
 
 
 REFERENCE_BATCH = 512
