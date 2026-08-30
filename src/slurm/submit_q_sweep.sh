@@ -28,6 +28,7 @@ set -euo pipefail
 : "${BLLARSE_FT_MODEL:=dinov3_large}"
 : "${BLLARSE_FT_SEED:=137}"
 : "${BLLARSE_FT_GROUP:=qsweep}"
+: "${BLLARSE_FT_ARM:=ibprobit_noeps}"
 : "${BLLARSE_FT_VENV:=}"
 : "${BLLARSE_FT_DRY_RUN:=}"
 
@@ -68,7 +69,7 @@ IFS=';' read -r -a POINTS <<< "$BLLARSE_FT_POINTS"
 echo "Resolving ${#POINTS[@]} points:" >&2
 for point in "${POINTS[@]}"; do
   IFS='|' read -r -a fields <<< "$point"
-  args=(--arm ibprobit_noeps --seed "$BLLARSE_FT_SEED"
+  args=(--arm "$BLLARSE_FT_ARM" --seed "$BLLARSE_FT_SEED"
         --storage-dir "$(readlink -f "$BLLARSE_FT_STORAGE")"
         --campaign "$BLLARSE_FT_CAMPAIGN" --model "$BLLARSE_FT_MODEL"
         --uid "check" --group-id "$BLLARSE_FT_GROUP")
@@ -80,7 +81,12 @@ for point in "${POINTS[@]}"; do
     echo "$out" >&2
     exit 2
   fi
-  echo "  ${fields[0]}: $(echo "$out" | grep -E '"(q_init|no_learn_q)"' | tr -d ' \n')" >&2
+  # Echo what this point actually OVERRODE, not a fixed key list. A WSD point
+  # sets lr_decay_*, a q point sets q_init, and printing the wrong pair made a
+  # correctly-configured run look unconfigured -- which is worse than silence,
+  # because this line exists to catch the opposite mistake.
+  echo "  ${fields[0]}: $(echo "$out" | sed -n 's/^\[final\] override //p' \
+        | tr '\n' ';')" >&2
 done
 
 # The points go through a FILE, not --export: the list contains ';' and '|',
@@ -92,8 +98,8 @@ printf '%s\n' "${POINTS[@]}" > "$points_file"
 echo "Points file: $points_file" >&2
 
 n=$(( ${#POINTS[@]} - 1 ))
-cmd=(sbatch --job-name="qsweep_${BLLARSE_FT_MODEL#dinov3_}" --array="0-${n}"
-     --export="ALL,BLLARSE_FT_POINTS_FILE=${points_file},BLLARSE_FT_STORAGE=${BLLARSE_FT_STORAGE},BLLARSE_FT_CAMPAIGN=${BLLARSE_FT_CAMPAIGN},BLLARSE_FT_SHARDS=${BLLARSE_FT_SHARDS},BLLARSE_FT_MODEL=${BLLARSE_FT_MODEL},BLLARSE_FT_SEED=${BLLARSE_FT_SEED},BLLARSE_FT_GROUP=${BLLARSE_FT_GROUP},BLLARSE_FT_VENV=${BLLARSE_FT_VENV}"
+cmd=(sbatch --job-name="sweep_${BLLARSE_FT_ARM%_noeps}_${BLLARSE_FT_MODEL#dinov3_}" --array="0-${n}"
+     --export="ALL,BLLARSE_FT_ARM=${BLLARSE_FT_ARM},BLLARSE_FT_VBLL_VENV=${BLLARSE_FT_VBLL_VENV:-},BLLARSE_FT_POINTS_FILE=${points_file},BLLARSE_FT_STORAGE=${BLLARSE_FT_STORAGE},BLLARSE_FT_CAMPAIGN=${BLLARSE_FT_CAMPAIGN},BLLARSE_FT_SHARDS=${BLLARSE_FT_SHARDS},BLLARSE_FT_MODEL=${BLLARSE_FT_MODEL},BLLARSE_FT_SEED=${BLLARSE_FT_SEED},BLLARSE_FT_GROUP=${BLLARSE_FT_GROUP},BLLARSE_FT_VENV=${BLLARSE_FT_VENV}"
      "$job")
 if [[ -n "$BLLARSE_FT_DRY_RUN" ]]; then
   printf '%q ' "${cmd[@]}"; echo

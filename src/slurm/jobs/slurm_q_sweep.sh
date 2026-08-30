@@ -79,12 +79,17 @@ set -a; [ -f .env.secrets ] && . ./.env.secrets; set +a
 SEED="${BLLARSE_FT_SEED:-137}"
 MODEL="${BLLARSE_FT_MODEL:-dinov3_large}"
 GROUP="${BLLARSE_FT_GROUP:-qsweep}"
-UID_STR="${MODEL}_${BLLARSE_FT_DATASET:-imagenet1k}_ibprobit_${LABEL}_seed${SEED}"
+ARM="${BLLARSE_FT_ARM:-ibprobit_noeps}"
+# The uid token is the SCRIPT arm, which is what the dumps' own meta records:
+# the study is `ibprobit_noeps` but every dump it produces says `ibprobit`. A
+# uid built from the study name would not match its own dumps.
+ARM_TOKEN="${ARM%_noeps}"
+UID_STR="${MODEL}_${BLLARSE_FT_DATASET:-imagenet1k}_${ARM_TOKEN}_${LABEL}_seed${SEED}"
 
-echo "[qsweep] point=$LABEL uid=$UID_STR node=$(hostname)"
+echo "[qsweep] arm=$ARM point=$LABEL uid=$UID_STR node=$(hostname)"
 
 final_args=(
-  --arm ibprobit_noeps
+  --arm "$ARM"
   --seed "$SEED"
   --storage-dir "$(readlink -f "$BLLARSE_FT_STORAGE")"
   --campaign "$BLLARSE_FT_CAMPAIGN"
@@ -101,4 +106,9 @@ for ((i = 1; i < ${#FIELDS[@]}; i++)); do
 done
 final_args+=(--format exec)
 
-exec srun "$BLLARSE_FT_VENV" scripts/finetune/final_config.py "${final_args[@]}"
+# vbll is the torch arm and cannot share the JAX environment.
+interp="$BLLARSE_FT_VENV"
+if [[ "$ARM" == "vbll" && -n "${BLLARSE_FT_VBLL_VENV:-}" ]]; then
+  interp="$BLLARSE_FT_VBLL_VENV"
+fi
+exec srun "$interp" scripts/finetune/final_config.py "${final_args[@]}"
