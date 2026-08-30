@@ -92,7 +92,12 @@ done
 # The points go through a FILE, not --export: the list contains ';' and '|',
 # and SLURM's export parsing is not where to find out that one of them did not
 # survive. On shared storage, since /tmp is node-local on this cluster.
-points_file="${repo_root}/.jobscripts/qsweep_${BLLARSE_FT_GROUP}_points.txt"
+# Keyed on ARM as well as group. A pending job reads this file when it STARTS,
+# so a second submission into the same group -- another arm, a different point
+# list -- would silently rewrite the config of a job still sitting in the queue.
+# The ce and vbll WSD runs happened to carry identical points, so nothing was
+# lost; the next pair would not be so lucky.
+points_file="${repo_root}/.jobscripts/qsweep_${BLLARSE_FT_GROUP}_${BLLARSE_FT_ARM}_points.txt"
 mkdir -p "$(dirname "$points_file")"
 printf '%s\n' "${POINTS[@]}" > "$points_file"
 echo "Points file: $points_file" >&2
