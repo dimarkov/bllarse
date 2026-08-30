@@ -34,6 +34,7 @@ a different framework has a different activation profile).
 """
 
 import argparse
+import re
 import gc
 import math
 import os
@@ -324,6 +325,11 @@ def build_argparser() -> argparse.ArgumentParser:
     # script runs at ~3906 steps when tuning and ~10,009 for a 4-epoch final
     # run. protocol.betas_for holds (1 - beta) * steps invariant across that.
     # The defaults are torch's, so an invocation that omits them is unchanged.
+    p.add_argument("--layer-decay", type=float, default=protocol.LAYER_DECAY_OFF,
+                   help="Layer-wise LR decay for the TRUNK: layer i runs at "
+                        "decay^(depth-1-i), so the top layer is 1.0 and the "
+                        "embeddings are damped hardest. 1.0, the default, is "
+                        "off and reproduces every reported run.")
     p.add_argument("--lr-decay-start", type=float, default=1.0,
                    help="Fraction of the run at which the linear LR decay "
                         "BEGINS (Warmup-Stable-Decay): 0.25 holds the peak to "
@@ -374,6 +380,56 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cuda")
     p.add_argument("--bf16", action="store_true")
     return p
+
+
+_TORCH_LAYER_RE = re.compile(r"(?:^|\.)(?:layers?|blocks?)\.(\d+)\.")
+
+
+def _trunk_lr_groups(model, base_lr, weight_decay, decay):
+    """AdamW param groups for the trunk, with layer-wise learning rates.
+
+    transformers names dinov3's parameters `layer.<i>....` for the blocks, plus
+    seven non-block tensors: `embeddings.*` (patch embedding, cls / mask /
+    register tokens), which sit BELOW every layer, and the final `norm.*`,
+    which is the TOP and runs at 1.0 alongside the last layer. Same split as
+    the JAX arms' equimo paths, and the multiplier itself is
+    `protocol.llrd_scale`, so the two frameworks cannot disagree.
+
+    Raises if the parameter names yield a layer count other than the config's
+    `num_hidden_layers`. That check is the whole safety of this function: a
+    naming change would otherwise put every tensor in one group and silently
+    train with LLRD off while the run logs a decay value.
+    """
+    if decay == protocol.LAYER_DECAY_OFF:
+        return [{"params": list(model.parameters()), "lr": base_lr,
+                 "weight_decay": weight_decay}]
+
+    depth = int(model.config.num_hidden_layers)
+    by_block: dict[int | None, list] = {}
+    for name, param in model.named_parameters():
+        hit = _TORCH_LAYER_RE.search(name)
+        if hit is not None:
+            block = int(hit.group(1))
+        elif name.startswith("norm."):
+            block = depth - 1
+        else:
+            block = None
+        by_block.setdefault(block, []).append(param)
+
+    found = sorted(b for b in by_block if b is not None)
+    if len(found) != depth or found != list(range(depth)):
+        raise SystemExit(
+            f"[vbll-ft] layer-wise decay found blocks {found} but the config "
+            f"says num_hidden_layers={depth}. The parameter naming changed; "
+            f"refusing to train with LLRD silently disabled."
+        )
+
+    groups = []
+    for block, params in sorted(by_block.items(),
+                                key=lambda kv: -1 if kv[0] is None else kv[0]):
+        groups.append({"params": params, "weight_decay": weight_decay,
+                       "lr": base_lr * protocol.llrd_scale(block, depth, decay)})
+    return groups
 
 
 def build_model(args, *, embed_dim, num_classes, device):
@@ -492,16 +548,21 @@ def _train(args, on_dump=None, run=None) -> None:
     # Two param groups, two rates. weight_decay 0 on the head: see --weight-decay.
     # betas are set on the optimizer rather than per group: they are an
     # averaging horizon in STEPS, and both groups take the same steps.
-    optimizer = torch.optim.AdamW([
-        {"params": model.parameters(), "lr": args.lr,
-         "weight_decay": args.weight_decay},
-        {"params": head.parameters(), "lr": args.head_lr, "weight_decay": 0.0},
-    ], betas=(args.beta1, args.beta2))
+    trunk_groups = _trunk_lr_groups(
+        model, args.lr, args.weight_decay, args.layer_decay)
+    optimizer = torch.optim.AdamW(
+        trunk_groups
+        + [{"params": list(head.parameters()), "lr": args.head_lr,
+            "weight_decay": 0.0}],
+        betas=(args.beta1, args.beta2))
 
     # Warmup-Stable-Decay, from protocol.wsd_multiplier so this arm and the JAX
     # arms provably run the SAME schedule under the same flag. At the default
     # (--lr-decay-start 1.0) the multiplier is 1.0 at every step, so the scheduler
     # is a no-op and the reported runs are reproduced exactly.
+    # One lambda for every group: torch multiplies it by each group's OWN base
+    # lr, and the layer-wise scale already lives there. A per-group lambda would
+    # apply the decay twice.
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lambda step: protocol.wsd_multiplier(
