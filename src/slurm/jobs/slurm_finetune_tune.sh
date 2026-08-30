@@ -162,11 +162,27 @@ fi
 if [[ -n "${BLLARSE_EVAL_DUMP_ROOT:-}" ]]; then
   worker_args+=(--dump-root "$BLLARSE_EVAL_DUMP_ROOT")
 fi
-# Smoke tests only. The campaign runs at protocol.MAX_SAMPLES (2,000,000) and
-# a shortened budget is not comparable to it -- never set this on a study whose
-# trials are meant to be scored against each other.
+# The tuning budget. Was "smoke tests only" while the campaign was pinned to
+# protocol.MAX_SAMPLES; it is now a first-class campaign setting, since the
+# dinov3_small study deliberately tunes at 100k. Trials from DIFFERENT budgets
+# are still not comparable -- that is what --campaign is for.
 if [[ -n "${BLLARSE_FT_MAX_SAMPLES:-}" ]]; then
   worker_args+=(--max-samples "$BLLARSE_FT_MAX_SAMPLES")
+fi
+# The four campaign-level settings that are NOT searched. They move together
+# with the budget by necessity: the beta axes are drawn in horizon units and
+# converted at the trial's own step count, which is samples / batch.
+if [[ -n "${BLLARSE_FT_MODEL:-}" ]]; then
+  worker_args+=(--model "$BLLARSE_FT_MODEL")
+fi
+if [[ -n "${BLLARSE_FT_BATCH:-}" ]]; then
+  worker_args+=(--batch-size "$BLLARSE_FT_BATCH")
+fi
+if [[ -n "${BLLARSE_FT_EVAL_QUANTUM:-}" ]]; then
+  worker_args+=(--eval-quantum "$BLLARSE_FT_EVAL_QUANTUM")
+fi
+if [[ -n "${BLLARSE_FT_LAYER_DECAY:-}" ]]; then
+  worker_args+=(--layer-decay "$BLLARSE_FT_LAYER_DECAY")
 fi
 
 exec srun "$BLLARSE_FT_VENV" -m bllarse.tuning.finetune_worker "${worker_args[@]}"

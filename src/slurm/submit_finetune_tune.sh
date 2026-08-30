@@ -187,6 +187,43 @@ fi
 # builder revision hash -- so the same cache can resolve for one interpreter and
 # trigger a rebuild for the other. That is not hypothetical: vbll runs its own
 # torch venv and it is the arm that took 0 completions out of 960.
+# The BACKBONE has to be cached too, and for exactly the same reason the
+# dataset does. dinov3_small was present as 7 KB of config with zero weight
+# files when its campaign was first prepared -- every worker would have raced
+# to fetch it. Checked per interpreter because the two frameworks pull from
+# different places: equimo has its own archive cache, transformers has HF_HOME.
+check_backbone() {
+  local interp="$1" label="$2" model="$3"
+  echo "Resolving backbone $model offline via $label ..." >&2
+  # JAX_PLATFORMS=cpu: this runs on a LOGIN node with no GPU, and initialising
+  # the CUDA backend there aborts with a core dump rather than falling back.
+  # The check only has to load weights, so the backend is irrelevant to it.
+  if HF_HOME="${BLLARSE_HF_HOME:-$HOME/.cache/huggingface}" \
+     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 JAX_PLATFORMS=cpu \
+     PYTHONPATH="${repo_root}/src:${repo_root}/scripts/dinov3" \
+     "$interp" -c "
+import sys
+model = '${model}'
+if '${label}' == 'vbll':
+    sys.path.insert(0, '${repo_root}/scripts/finetune')
+    from transformers import AutoModel
+    from finetune_vbll import HF_CHECKPOINTS
+    m = AutoModel.from_pretrained(HF_CHECKPOINTS[model])
+    print('  OK', model, m.config.num_hidden_layers, 'layers')
+else:
+    import jax.random as jr
+    from vit_classification import get_pretrained_backbone
+    bb = get_pretrained_backbone(model, jr.PRNGKey(0))
+    print('  OK', model, len(bb.blocks[0].blocks), 'blocks')
+" >&2; then
+    return 0
+  fi
+  echo "ERROR: backbone $model does not resolve OFFLINE for $label." >&2
+  echo "       Fetch it ONCE, serially, then re-run this script. Submitting" >&2
+  echo "       anyway would have every worker download it at the same time." >&2
+  exit 2
+}
+
 check_dataset() {
   local interp="$1" label="$2"
   echo "Resolving $hf_path offline via $label ..." >&2
@@ -222,6 +259,14 @@ for arm in $BLLARSE_FT_ARMS; do
   if [[ -z "${_checked[$interp]:-}" ]]; then
     _checked[$interp]=1
     check_dataset "$interp" "${arm}'s interpreter"
+    # Only when the campaign names a backbone. Without BLLARSE_FT_MODEL the
+    # worker uses space.TUNING_MODEL, whose weights every previous campaign
+    # already pulled -- checking it would fail closed on a machine that is
+    # simply running the old default.
+    if [[ -n "${BLLARSE_FT_MODEL:-}" ]]; then
+      label="jax"; [[ "$arm" == "vbll" ]] && label="vbll"
+      check_backbone "$interp" "$label" "$BLLARSE_FT_MODEL"
+    fi
   fi
 done
 
@@ -242,6 +287,14 @@ for arm in $BLLARSE_FT_ARMS; do
     exports+=",BLLARSE_HF_HOME=${BLLARSE_HF_HOME}"
   [[ -n "${BLLARSE_FT_PYLIBS:-}" ]] &&
     exports+=",BLLARSE_FT_PYLIBS=${BLLARSE_FT_PYLIBS}"
+  # Campaign-level and not searched. Forwarded unconditionally when set, so a
+  # campaign cannot half-apply: the beta horizon axes convert at samples/batch,
+  # so a budget without its batch searches a different space than it records.
+  for var in BLLARSE_FT_MAX_SAMPLES BLLARSE_FT_MODEL BLLARSE_FT_BATCH \
+             BLLARSE_FT_EVAL_QUANTUM BLLARSE_FT_LAYER_DECAY \
+             BLLARSE_FT_PATIENCE; do
+    [[ -n "${!var:-}" ]] && exports+=",${var}=${!var}"
+  done
 
   # ALL, not just the listed ones: --export replaces the environment wholesale
   # rather than adding to it, and the job script needs PATH and HOME to find

@@ -92,6 +92,33 @@ for _bad in samples40 smoothed smoothed2; do
   fi
 done
 
+# The CONVERSE guard, and it is the one that bites now that more than one
+# windowed campaign exists. The loop above stops a windowed submission from
+# resuming an UNWINDOWED journal; nothing stopped the reverse. Re-running
+# `BLLARSE_TUNE_CAMPAIGN=win2` with the window forgotten -- or typed as 5 --
+# appends single-point-minimum trials to journals that already hold ~100 trials
+# scored on the 2-window mean, and TPE then models a value column meaning two
+# different things. The damage is silent and irreversible: three win2 studies
+# exist (adamw_ce/oxford_pets, ibprobit_noeps/cifar10, vbll/dtd), each ~100
+# completed trials, and a journal cannot be un-appended.
+#
+# So the campaign NAME decides the window rather than the caller re-typing it.
+# A campaign not listed here keeps whatever the caller passed -- new names are
+# free, existing ones are not.
+case "$BLLARSE_TUNE_CAMPAIGN" in
+  win2)       _want_window=2 ;;
+  win5|win5b) _want_window=5 ;;
+  *)          _want_window="$BLLARSE_TUNE_SMOOTH_WINDOW" ;;
+esac
+if [[ "$BLLARSE_TUNE_SMOOTH_WINDOW" != "$_want_window" ]]; then
+  echo "[bllarse] ERROR: campaign '$BLLARSE_TUNE_CAMPAIGN' was written with" >&2
+  echo "  BLLARSE_TUNE_SMOOTH_WINDOW=${_want_window}, but this submission passes" >&2
+  echo "  '${BLLARSE_TUNE_SMOOTH_WINDOW:-<unset>}'. Its journals would then hold" >&2
+  echo "  trials scored on two different statistics. Pass the matching window," >&2
+  echo "  or choose a new BLLARSE_TUNE_CAMPAIGN." >&2
+  exit 2
+fi
+
 export BLLARSE_TUNE_STORAGE BLLARSE_TUNE_CAMPAIGN BLLARSE_TUNE_TARGET_COMPLETE \
        BLLARSE_TUNE_TRIALS BLLARSE_TUNE_SMOOTH_WINDOW
 

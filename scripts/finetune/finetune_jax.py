@@ -198,43 +198,40 @@ def _scaled(schedule, scale: float):
     return scale * schedule
 
 
-def _trunk_lr_groups(backbone, depth: int, decay: float):
-    """(labels pytree, {label: lr scale}) for layer-wise decay on the trunk.
+def _trunk_block_of(path, depth: int) -> int | None:
+    """Which transformer block a trunk leaf belongs to, from its pytree path.
 
-    equimo nests its transformer layers as `.blocks[<stage>].blocks[<layer>]`,
-    so the LAYER index is the SECOND `blocks[...]` in the path -- taking the
-    first labels every parameter as block 0 and silently disables the whole
-    mechanism while looking like it works.
+    equimo nests its layers as `.blocks[<stage>].blocks[<layer>]`, so the LAYER
+    index is the SECOND `blocks[...]` -- taking the first labels every parameter
+    as block 0 and silently disables LLRD while the run still trains.
 
-    Non-block parameters split by which END of the trunk they sit at: the final
-    `.norm` is the top and runs at 1.0 alongside the last block, while the patch
-    embedding, cls/register/mask tokens and positional embeddings sit below
-    every block and take the strongest damping.
+    The trunk's final `.norm` is the TOP and rides with the last block; the
+    patch embedding, cls / register / mask tokens and positional embeddings sit
+    below every block and return None, the strongest damping.
     """
-    filtered = eqx.filter(backbone, eqx.is_array)
-    if decay == protocol.LAYER_DECAY_OFF:
-        # The exact pre-LLRD path: ONE trunk group at scale 1.0. Short-circuited
-        # rather than derived, so the default cannot depend on a backbone
-        # exposing `.blocks` -- the contract tests drive stubs that do not.
-        return jax.tree.map(lambda _: "backbone", filtered), {"backbone": 1.0}
+    key = jax.tree_util.keystr(path)
+    found = re.findall(r"blocks\[(\d+)\]", key)
+    if len(found) >= 2:
+        return int(found[1])
+    if key.startswith(".norm."):
+        return depth - 1
+    return None
 
-    scales: dict[str, float] = {}
 
-    def label(path, _leaf):
-        key = jax.tree_util.keystr(path)
-        found = re.findall(r"blocks\[(\d+)\]", key)
-        if len(found) >= 2:
-            block = int(found[1])
-        elif key.startswith(".norm."):
-            block = depth - 1
-        else:
-            block = None
-        name = "trunk_embed" if block is None else f"trunk_b{block:03d}"
-        scales[name] = protocol.llrd_scale(block, depth, decay)
-        return name
+def _trunk_lr_scales(depth: int, decay: float) -> dict[str, float]:
+    """Every trunk group's LR multiplier. Derived from depth, not from a walk,
+    so the transform dict exists before any pytree is touched."""
+    scales = {"trunk_embed": protocol.llrd_scale(None, depth, decay)}
+    for block in range(depth):
+        scales[f"trunk_b{block:03d}"] = protocol.llrd_scale(block, depth, decay)
+    return scales
 
-    labels = jax.tree_util.tree_map_with_path(label, filtered)
-    return labels, scales
+
+def _trunk_labels_of(tree, depth: int):
+    name = lambda path, _leaf: (  # noqa: E731
+        "trunk_embed" if (b := _trunk_block_of(path, depth)) is None
+        else f"trunk_b{b:03d}")
+    return jax.tree_util.tree_map_with_path(name, eqx.filter(tree, eqx.is_array))
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -740,8 +737,9 @@ def _train(args, on_dump=None, run=None) -> None:
     # Layer-wise decay groups. At --layer-decay 1.0 every scale is 1.0 and this
     # collapses to the two-group (backbone, head) split that produced every
     # reported run; the extra optax transforms are then all identical.
-    trunk_labels, trunk_scales = _trunk_lr_groups(
-        backbone, trunk_depth, args.layer_decay)
+    llrd_on = args.layer_decay != protocol.LAYER_DECAY_OFF
+    trunk_scales = (_trunk_lr_scales(trunk_depth, args.layer_decay) if llrd_on
+                    else {"backbone": 1.0})
     if args.layer_decay != protocol.LAYER_DECAY_OFF:
         lo, hi = min(trunk_scales.values()), max(trunk_scales.values())
         print(f"[finetune] LLRD: decay={args.layer_decay:g} over {trunk_depth} "
@@ -751,7 +749,6 @@ def _train(args, on_dump=None, run=None) -> None:
     # With LLRD off the trunk is ONE group and ONE adamw -- built once, not
     # once per path. Two constructions would be invisible at runtime but make
     # the optimizer count a lie, which is what the CE contract test checks.
-    llrd_on = args.layer_decay != protocol.LAYER_DECAY_OFF
     trunk_tx = ({name: optax.adamw(_scaled(lr_sched, scale), b1=args.beta1,
                                    b2=args.beta2, weight_decay=args.weight_decay)
                  for name, scale in trunk_scales.items()}
@@ -764,9 +761,16 @@ def _train(args, on_dump=None, run=None) -> None:
         head_sched = protocol.wsd_schedule(
             head_lr, plan["steps"], decay_start=args.lr_decay_start,
             decay_to=args.lr_decay_to)
-        param_labels = (
-            trunk_labels,
-            jax.tree.map(lambda _: "head", eqx.filter(head, eqx.is_array)),
+        # A CALLABLE, not a pytree. optax's multi_transform accepts either,
+        # but handing it a labels PYTREE built from an equinox Module makes it
+        # treat the Module itself as a leaf and reach for `.shape` --
+        # `AttributeError: 'VisionTransformer' object has no attribute 'shape'`.
+        # Called with the real params, the structure matches by construction.
+        param_labels = lambda p: (  # noqa: E731
+            (_trunk_labels_of(p[0], trunk_depth) if llrd_on
+             else jax.tree.map(lambda _: "backbone",
+                               eqx.filter(p[0], eqx.is_array))),
+            jax.tree.map(lambda _: "head", eqx.filter(p[1], eqx.is_array)),
         )
         optimizer = optax.multi_transform(
             {
@@ -790,8 +794,10 @@ def _train(args, on_dump=None, run=None) -> None:
         # real equimo backbone, but reconstructing one trips the stubs the
         # contract tests drive. With LLRD off there is nothing to partition, so
         # the bare optimizer is used and every reported run's path is preserved.
-        optimizer = (optax.multi_transform(trunk_tx, trunk_labels) if llrd_on
-                     else trunk_tx["backbone"])
+        optimizer = (
+            optax.multi_transform(
+                trunk_tx, lambda p: _trunk_labels_of(p, trunk_depth))
+            if llrd_on else trunk_tx["backbone"])
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
 
     shard = None
