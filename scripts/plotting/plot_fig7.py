@@ -126,14 +126,22 @@ def pick_targets(data, fraction, reference="early_stop"):
     return targets, name
 
 
-def val_nll_target(data, fraction, baseline_arm):
+def val_nll_target(data, fraction, baseline_arm, point="optimum"):
     """The val-NLL every arm is timed against, and where the baseline hit it.
 
-    The reference is `baseline_arm`'s MINIMUM val NLL -- the best that arm ever
-    achieves on the selection split -- taken from its seed-mean curve so one
-    lucky seed cannot set the bar. The target is that value / fraction, the
-    same looser-is-larger convention `make_targets` uses for lower-is-better
-    metrics.
+    The reference is `baseline_arm`'s val NLL at `point`, taken from its
+    seed-mean curve so one lucky seed cannot set the bar:
+
+    * "optimum" -- its MINIMUM, the best that arm ever achieves on the
+      selection split, i.e. the model a practitioner would deploy.
+    * "endpoint" -- its value at the LAST evaluation. The right reference when
+      the question is "how long do the others need to match what this arm
+      finishes at", and the honest one when an arm degrades past its own
+      optimum: its endpoint is what a fixed-budget run without early stopping
+      would actually hand you.
+
+    The target is that value / fraction, the same looser-is-larger convention
+    `make_targets` uses for lower-is-better metrics.
 
     Deliberately IBProbit's own optimum rather than a CE-derived one. The
     question this panel answers is "how long does each arm take to reach the
@@ -149,10 +157,16 @@ def val_nll_target(data, fraction, baseline_arm):
         raise SystemExit(
             "[fig7] the scored curves carry no val_nll; re-score with a "
             "score_final that emits it.")
-    best = min(curve, key=lambda r: r["val_nll"])
+    if point == "endpoint":
+        best = max(curve, key=lambda r: r["samples_seen"])
+    elif point == "optimum":
+        best = min(curve, key=lambda r: r["val_nll"])
+    else:
+        raise SystemExit(f"[fig7] --reference-point must be optimum|endpoint, "
+                         f"got {point!r}")
     target = best["val_nll"] / fraction
-    print(f"[fig7] reference {baseline_arm}: min val_nll={best['val_nll']:.4f} "
-          f"at {best['samples_seen']:,} samples "
+    print(f"[fig7] reference {baseline_arm} at its {point}: "
+          f"val_nll={best['val_nll']:.4f} at {best['samples_seen']:,} samples "
           f"(test acc there {best['acc']:.4f})")
     print(f"[fig7] target: val_nll <= {target:.4f} "
           f"({fraction:g}x the reference, looser)")
@@ -399,7 +413,7 @@ def _elapsed_at(timeline, samples):
 
 
 def make_figure(data, out_path, *, target, reference_row, fraction,
-                baseline_arm, wallclock, memory):
+                baseline_arm, point, wallclock, memory):
     fig, axes = plt.subplots(1, 2, figsize=(8.8, 4.2))
     entries = val_crossings(data, target)
 
@@ -418,8 +432,8 @@ def make_figure(data, out_path, *, target, reference_row, fraction,
                  "GiB", "no --memory given;\nrun probe_micro_batch.py")
     fig.suptitle(
         f"Fig 7 — time to val NLL ≤ {target:.4f} "
-        f"({fraction:g}× {baseline_arm}'s best val NLL, {reference_row['val_nll']:.4f}),"
-        f" relative to {baseline_arm}\n"
+        f"({fraction:g}× {baseline_arm}'s {point} val NLL, "
+        f"{reference_row['val_nll']:.4f}), relative to {baseline_arm}\n"
         + final_json.provenance(data), fontsize=9, y=1.03)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight", dpi=150)
@@ -434,6 +448,12 @@ def main():
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig7_compute_to_threshold")
     p.add_argument("--fraction", type=float, default=0.95)
+    p.add_argument("--reference-point", default="optimum",
+                   choices=["optimum", "endpoint"],
+                   help="Which point of the baseline arm sets the target: its "
+                        "val-NLL minimum, or its last evaluation. `endpoint` "
+                        "answers 'how long do the others need to match what "
+                        "this arm finishes at'.")
     p.add_argument("--baseline-arm", default="ibprobit",
                    help="Whose best val NLL sets the target, and what the "
                         "times are relative to. Its bar is 1.0 by "
@@ -449,7 +469,8 @@ def main():
     data = final_json.load(args.scores)
     print(f"[fig7] {final_json.provenance(data)}")
     target, reference_row = val_nll_target(data, args.fraction,
-                                          args.baseline_arm)
+                                          args.baseline_arm,
+                                          args.reference_point)
     wallclock = json.loads(Path(args.wallclock).read_text()) if args.wallclock else {}
     memory = {}
     for path in args.memory or ():
@@ -472,6 +493,7 @@ def main():
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),
                     target=target, reference_row=reference_row,
                     fraction=args.fraction, baseline_arm=args.baseline_arm,
+                    point=args.reference_point,
                     wallclock=wallclock, memory=memory)
 
 
