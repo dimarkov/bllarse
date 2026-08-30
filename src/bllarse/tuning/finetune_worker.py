@@ -365,18 +365,40 @@ def make_objective(
     patience: int | None = PATIENCE,
     warmup_evals: int = WARMUP_EVALS,
     keep_dumps: bool = True,
+    model: str | None = None,
+    batch_size: int = space.FIXED_BATCH_SIZE,
+    eval_quantum: int = protocol.EVAL_QUANTUM,
+    layer_decay: float = protocol.LAYER_DECAY_OFF,
 ) -> Callable[[optuna.Trial], float]:
-    """The optuna objective closure for one arm's study."""
+    """The optuna objective closure for one arm's study.
+
+    `batch_size`, `eval_quantum` and `layer_decay` are campaign-level and are
+    recorded as trial user attrs, not searched. They have to travel together
+    with `max_samples`: the beta axes are drawn in horizon units and converted
+    at the trial's own STEP count, which is samples/batch, so a campaign that
+    changed one without the other would search a space it did not record.
+    """
 
     def run_trial(trial: optuna.Trial) -> float:
         # max_samples, not the default: the beta axes are drawn in horizon
         # units and converted at this trial's step count, so a shortened smoke
         # budget must convert against ITS budget rather than the campaign's.
-        params = space.suggest(trial, arm, max_samples=max_samples)
+        params = space.suggest(trial, arm, max_samples=max_samples,
+                               batch_size=batch_size)
+        # Campaign-level settings ride in through params, which trial_config
+        # splats LAST -- so they override its defaults without it needing to
+        # know about them.
+        params["eval_quantum"] = eval_quantum
+        if layer_decay != protocol.LAYER_DECAY_OFF:
+            params["layer_decay"] = layer_decay
+        if model is not None:
+            params["model"] = model
         config = trial_config(
             arm, params=params, max_samples=max_samples, dump_root=dump_root)
         trial.set_user_attr("max_samples", max_samples)
-        trial.set_user_attr("eval_quantum", protocol.EVAL_QUANTUM)
+        trial.set_user_attr("eval_quantum", eval_quantum)
+        trial.set_user_attr("layer_decay", layer_decay)
+        trial.set_user_attr("model", config["model"])
         trial.set_user_attr("micro_batch_size", config["micro_batch_size"])
         trial.set_user_attr("effective_batch", config["batch_size"])
         # Recorded so a trial's wall-clock is interpretable after the fact: the
@@ -481,11 +503,47 @@ def build_argparser() -> argparse.ArgumentParser:
              "samples, so N of them is always the same amount of training.",
     )
     p.add_argument("--warmup-evals", type=int, default=WARMUP_EVALS)
+    p.add_argument("--model", default=None,
+                   help="Backbone to tune on. Defaults to space.TUNING_MODEL.")
+    p.add_argument("--batch-size", type=int, default=space.FIXED_BATCH_SIZE,
+                   help="EFFECTIVE batch for every trial. Not searched. Moves "
+                        "the step count, and therefore what the beta horizon "
+                        "axes can express -- see space.beta1_horizons_box.")
+    p.add_argument("--eval-quantum", type=int, default=protocol.EVAL_QUANTUM,
+                   help="Samples between evaluations. The pruner and the "
+                        "patience clock are counted in EVALUATIONS, so this "
+                        "sets whether they can fire at all: max_samples / "
+                        "quantum must exceed warmup + patience.")
+    p.add_argument("--layer-decay", type=float,
+                   default=protocol.LAYER_DECAY_OFF,
+                   help="Layer-wise LR decay for the trunk, applied to every "
+                        "trial. Recipe, not a searched axis.")
     return p
 
 
 def main() -> None:
     args = build_argparser().parse_args()
+
+    # Refused HERE, not discovered after a campaign of trials that could never
+    # be stopped. Both clocks are counted in EVALUATIONS, so a coarse quantum
+    # silently disables them: at 100k samples and quantum 16384 there are 6
+    # evaluations against a warmup of 10.
+    n_evals = args.max_samples // args.eval_quantum
+    need = args.warmup_evals + (args.patience or 0) + 1
+    if n_evals <= args.warmup_evals:
+        raise SystemExit(
+            f"[ft-tune] {args.max_samples:,} samples at quantum "
+            f"{args.eval_quantum} gives {n_evals} evaluations, at or below the "
+            f"pruner warmup of {args.warmup_evals}: the pruner can never fire. "
+            f"Lower --eval-quantum or raise --max-samples."
+        )
+    if args.patience and n_evals < need:
+        raise SystemExit(
+            f"[ft-tune] {n_evals} evaluations cannot reach the earliest "
+            f"patience stop at {need} (warmup {args.warmup_evals} + patience "
+            f"{args.patience}). Lower --eval-quantum, or --patience."
+        )
+
     study = open_study(args.arm, args.storage_dir, args.campaign)
     group_id = f"fttune_{study_name(args.arm, args.campaign)}"
 
@@ -514,6 +572,10 @@ def main() -> None:
             max_samples=args.max_samples,
             patience=args.patience,
             warmup_evals=args.warmup_evals,
+            model=args.model,
+            batch_size=args.batch_size,
+            eval_quantum=args.eval_quantum,
+            layer_decay=args.layer_decay,
         ),
         n_trials=args.n_trials,
         # Scoped to `Exception`, deliberately NOT `BaseException`:

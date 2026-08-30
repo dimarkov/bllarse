@@ -344,3 +344,46 @@ def test_the_streak_limit_is_small_enough_to_be_worth_something():
     # At ~1.4 h a completed trial and seconds for a launch fault, the guard only
     # helps if it fires in minutes. 16 workers x limit is the wasted-trial bound.
     assert 1 < fw.CONSECUTIVE_FAILURE_LIMIT <= 10
+
+
+def test_campaign_settings_reach_the_config_and_the_trial_record():
+    """model, batch, quantum and layer decay are campaign-level, not searched.
+
+    They have to travel together: the beta axes are drawn in horizon units and
+    converted at the trial's own STEP count (samples / batch), so a campaign
+    that moved one without the others would search a space it did not record.
+    """
+    import optuna
+
+    study = optuna.create_study()
+    objective_seen = {}
+
+    def fake_trial_config(arm, *, params, max_samples, dump_root=None, **kw):
+        objective_seen.update(params)
+        return {"model": params.get("model", "dinov3_large"),
+                "batch_size": params["batch_size"],
+                "micro_batch_size": 128, "train_shards": ""}
+
+    trial = study.ask()
+    params = space.suggest(trial, "ce", max_samples=100_000, batch_size=128)
+
+    assert params["batch_size"] == 128
+    # the horizon axes were converted at 100_000/128 = 781 steps, so beta1 sits
+    # inside the box that budget can express
+    lo, hi = space.beta1_horizons_box(781)
+    assert lo <= trial.params["beta1_horizons"] <= hi
+
+
+def test_worker_refuses_a_quantum_that_disables_the_pruner(monkeypatch, capsys):
+    """The failure mode this guard exists for: both the pruner warmup and the
+    patience clock count EVALUATIONS, so a coarse quantum silently makes them
+    unfireable and the campaign runs every trial to its budget."""
+    import sys
+
+    argv = ["finetune_worker", "--arm", "ce", "--storage-dir", "/tmp/x",
+            "--max-samples", "100000", "--eval-quantum", "16384",
+            "--n-trials", "1"]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit, match="pruner can never fire"):
+        fw.main()

@@ -235,6 +235,12 @@ MICRO_BATCH_DEVICE = "NVIDIA A100-SXM4-40GB"
 # Values must satisfy probe_micro_batch.floor_to_ladder_divisor: a power of two
 # no larger than 256 (the ladder's gcd), so num_accum is exact at every rung.
 MICRO_BATCH: dict[str, dict[str, int]] = {
+    # dinov3_small at 128 is the whole target batch in ONE forward
+    # (num_accum = 1), measured at 7.18 / 7.17 / 8.81 GiB on the 40 GB card --
+    # a quarter of it, so the ceiling is nowhere near. 128 is pinned rather
+    # than probed higher because the batch ladder needs micro to DIVIDE the
+    # target and 128 is the target.
+    "dinov3_small": {"ce": 128, "ibprobit": 128, "vbll": 128},
     # Not a fresh measurement: this is what the whole betasearch1m tuning
     # campaign ran at, 934 trials with no OOM -- a stronger guarantee than a
     # probe. vbll's 64 belongs to THIS row and always did.
