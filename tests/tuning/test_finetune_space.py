@@ -521,3 +521,36 @@ def test_the_top_rungs_cannot_carry_a_transferred_beta():
     # ... while the pinned rung and everything below it is fine.
     for rung in (256, 512, 1024, 2048):
         protocol.betas_for(protocol.steps_for_samples(protocol.MAX_SAMPLES, rung))
+
+
+def test_beta1_box_is_unchanged_at_the_campaign_budget():
+    """1953 steps is what every completed campaign searched. Narrowing the box
+    there would re-scope a finished search."""
+    steps = protocol.steps_for_samples(protocol.MAX_SAMPLES, fs.FIXED_BATCH_SIZE)
+    assert steps == 1953
+    assert fs.beta1_horizons_box(steps) == fs.BETA1_HORIZONS_BOX
+
+
+def test_beta1_box_narrows_where_the_constant_would_be_unreachable():
+    # 100k samples at batch 128 = 781 steps. beta_from_horizons raises for
+    # H >= steps, so the 780 ceiling sits ON the boundary -- the sampler could
+    # draw a point that cannot be realised and kill the trial.
+    lo, hi = fs.beta1_horizons_box(781)
+
+    assert lo == fs.BETA1_HORIZONS_BOX[0]
+    assert hi < 781
+    assert hi == pytest.approx(0.4 * 781)
+
+
+def test_beta1_box_refuses_a_budget_too_short_to_search_b1_at_all():
+    with pytest.raises(ValueError, match="too short"):
+        fs.beta1_horizons_box(50)
+
+
+def test_suggest_honours_a_non_default_batch():
+    import optuna
+
+    study = optuna.create_study()
+    params = fs.suggest(study.ask(), "ce", max_samples=100_000, batch_size=128)
+
+    assert params["batch_size"] == 128

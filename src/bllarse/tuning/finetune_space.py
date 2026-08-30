@@ -168,6 +168,33 @@ BETA2_HORIZONS_BOX = (0.4, 40.0)
 # This is the axis that sets the floor under MAX_SAMPLES; see the note there.
 BETA1_HORIZONS_BOX = (39.0, 780.0)
 
+# The ceiling is not really a constant -- it is `b1 >= 0.6`, which is
+# H1 <= 0.4 x steps, and 780 is that rule evaluated at the 1953-step tuning
+# budget (0.4 x 1953 = 781). Stated as a rule because a SHORTER budget makes
+# the constant infeasible rather than merely wide: at 781 steps (100k samples
+# at batch 128) `beta_from_horizons` raises for any H >= 781, so the sampler
+# would draw points that cannot be realised, on a boundary, and the trial would
+# die rather than be scored.
+BETA1_MAX_H_FRACTION = 0.4
+
+
+def beta1_horizons_box(steps: int) -> tuple[float, float]:
+    """The b1 horizon box at a given tuning budget.
+
+    Identical to BETA1_HORIZONS_BOX at the 1953-step budget every completed
+    campaign used, so nothing already searched is re-scoped; it narrows only
+    where the constant would be unreachable.
+    """
+    lo, hi = BETA1_HORIZONS_BOX
+    capped = min(hi, BETA1_MAX_H_FRACTION * steps)
+    if capped <= lo:
+        raise ValueError(
+            f"{steps} steps leaves no b1 horizon box: the ceiling "
+            f"{capped:.1f} is at or below the floor {lo}. The tuning budget is "
+            f"too short to search b1 at all -- raise it, or lower the batch."
+        )
+    return (lo, capped)
+
 # The GPU MICRO_BATCH was measured on. The constants below are valid for this
 # device and nothing else -- a smaller card OOMs on them, a larger one leaves
 # memory unused, and neither is visible from a finished run's config.
@@ -503,7 +530,8 @@ def _suggest_betas(trial: Any, steps: int) -> tuple[float, float]:
     new step count preserves H by construction -- so a searched beta and a
     transferred one are the same quantity seen at two budgets.
     """
-    h1 = trial.suggest_float(f"beta1{HORIZONS_SUFFIX}", *BETA1_HORIZONS_BOX, log=True)
+    h1 = trial.suggest_float(f"beta1{HORIZONS_SUFFIX}",
+                             *beta1_horizons_box(steps), log=True)
     h2 = trial.suggest_float(f"beta2{HORIZONS_SUFFIX}", *BETA2_HORIZONS_BOX, log=True)
     return (protocol.beta_from_horizons(h1, steps),
             protocol.beta_from_horizons(h2, steps))
@@ -551,7 +579,8 @@ def eval_count(max_samples: int = protocol.MAX_SAMPLES) -> int:
 
 
 def _suggest_ibprobit(
-    trial: Any, *, search_eps: bool, steps: int
+    trial: Any, *, search_eps: bool, steps: int,
+    batch_size: int = FIXED_BATCH_SIZE,
 ) -> dict[str, Any]:
     """IBProbit's axes.
 
@@ -569,18 +598,18 @@ def _suggest_ibprobit(
         # axis with one value still becomes a dimension TPE models and reports.
         # See FIXED_BATCH_SIZE. The value reaches the study record through the
         # trial's `effective_batch` user attr either way.
-        "batch_size": FIXED_BATCH_SIZE,
+        "batch_size": batch_size,
         # IBPROBIT_TRUNK_LR_BOX, not TRUNK_LR_BOX: the closed-form head refits
         # from features the trunk has already moved past once the trunk is fast
         # enough. See the constant.
         "lr": _suggest_per_sqrt_batch(
-            trial, "lr", IBPROBIT_TRUNK_LR_BOX, FIXED_BATCH_SIZE),
+            trial, "lr", IBPROBIT_TRUNK_LR_BOX, batch_size),
         # Both ibprobit arms keep the wide shared box: wd measured FLAT on this
         # head (rho +0.17 and +0.03, best-of-decade spread 0.004 with no
         # ordering). "Does not matter" is a result here, so it is left free to
         # be re-measured rather than narrowed on noise.
         "weight_decay": _suggest_per_sqrt_batch(
-            trial, "weight_decay", TRUNK_WD_BOX, FIXED_BATCH_SIZE),
+            trial, "weight_decay", TRUNK_WD_BOX, batch_size),
         "q_init": trial.suggest_float("q_init", *Q_INIT_BOX, log=True),
         "num_update_iters": trial.suggest_categorical(
             "num_update_iters", list(IBPROBIT_UPDATE_ITERS)
@@ -593,7 +622,8 @@ def _suggest_ibprobit(
 
 
 def suggest(
-    trial: Any, arm: str, *, max_samples: int = protocol.MAX_SAMPLES
+    trial: Any, arm: str, *, max_samples: int = protocol.MAX_SAMPLES,
+    batch_size: int = FIXED_BATCH_SIZE,
 ) -> dict[str, Any]:
     """One TPE-sampled configuration for `arm`.
 
@@ -618,23 +648,24 @@ def suggest(
     # The betas are drawn in horizon units and converted at the trial's OWN
     # step count, so a shortened smoke budget stays self-consistent instead of
     # inheriting the campaign's betas at a budget they are wrong for.
-    steps = protocol.steps_for_samples(max_samples, FIXED_BATCH_SIZE)
+    steps = protocol.steps_for_samples(max_samples, batch_size)
 
     if arm.startswith("ibprobit"):
         return _suggest_ibprobit(
-            trial, search_eps=(arm == "ibprobit"), steps=steps)
+            trial, search_eps=(arm == "ibprobit"), steps=steps,
+            batch_size=batch_size)
 
     params: dict[str, Any] = {
         # See FIXED_BATCH_SIZE, and _suggest_ibprobit on why it is a constant
         # rather than a one-element categorical.
-        "batch_size": FIXED_BATCH_SIZE,
+        "batch_size": batch_size,
         "lr": _suggest_per_sqrt_batch(
-            trial, "lr", TRUNK_LR_BOX, FIXED_BATCH_SIZE),
+            trial, "lr", TRUNK_LR_BOX, batch_size),
         # Per arm: ce presses the floor, vbll has an interior optimum. See
         # CE_WD_BOX / VBLL_WD_BOX.
         "weight_decay": _suggest_per_sqrt_batch(
             trial, "weight_decay",
-            VBLL_WD_BOX if arm == "vbll" else CE_WD_BOX, FIXED_BATCH_SIZE),
+            VBLL_WD_BOX if arm == "vbll" else CE_WD_BOX, batch_size),
         "head_lr_ratio": trial.suggest_float(
             "head_lr_ratio", *HEAD_LR_RATIO_BOX, log=True
         ),
