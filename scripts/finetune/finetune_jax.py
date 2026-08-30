@@ -13,6 +13,7 @@ kernels via bllarse.finetune.jax_steps.
 """
 
 import argparse
+import re
 import gc
 import math
 import os
@@ -188,6 +189,54 @@ def resolve_plan(args, micro_batch: int) -> dict:
     }
 
 
+def _scaled(schedule, scale: float):
+    """`schedule` times a constant, whether it is a float or an optax callable."""
+    if scale == 1.0:
+        return schedule
+    if callable(schedule):
+        return lambda count: scale * schedule(count)
+    return scale * schedule
+
+
+def _trunk_lr_groups(backbone, depth: int, decay: float):
+    """(labels pytree, {label: lr scale}) for layer-wise decay on the trunk.
+
+    equimo nests its transformer layers as `.blocks[<stage>].blocks[<layer>]`,
+    so the LAYER index is the SECOND `blocks[...]` in the path -- taking the
+    first labels every parameter as block 0 and silently disables the whole
+    mechanism while looking like it works.
+
+    Non-block parameters split by which END of the trunk they sit at: the final
+    `.norm` is the top and runs at 1.0 alongside the last block, while the patch
+    embedding, cls/register/mask tokens and positional embeddings sit below
+    every block and take the strongest damping.
+    """
+    filtered = eqx.filter(backbone, eqx.is_array)
+    if decay == protocol.LAYER_DECAY_OFF:
+        # The exact pre-LLRD path: ONE trunk group at scale 1.0. Short-circuited
+        # rather than derived, so the default cannot depend on a backbone
+        # exposing `.blocks` -- the contract tests drive stubs that do not.
+        return jax.tree.map(lambda _: "backbone", filtered), {"backbone": 1.0}
+
+    scales: dict[str, float] = {}
+
+    def label(path, _leaf):
+        key = jax.tree_util.keystr(path)
+        found = re.findall(r"blocks\[(\d+)\]", key)
+        if len(found) >= 2:
+            block = int(found[1])
+        elif key.startswith(".norm."):
+            block = depth - 1
+        else:
+            block = None
+        name = "trunk_embed" if block is None else f"trunk_b{block:03d}"
+        scales[name] = protocol.llrd_scale(block, depth, decay)
+        return name
+
+    labels = jax.tree_util.tree_map_with_path(label, filtered)
+    return labels, scales
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--arm", required=True, choices=["ce", "ibprobit"])
@@ -292,6 +341,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="override q0 directly (bypasses alpha^2 / B; 1/D is the pre-Wishart value)")
     p.add_argument("--kappa", type=float, default=None,
                    help="Inverse-Wishart prior pseudo-count (default: 0.5, i.e. half a pseudo-observation against the K the likelihood adds per step)")
+    p.add_argument("--layer-decay", type=float, default=protocol.LAYER_DECAY_OFF,
+                   help="Layer-wise LR decay for the TRUNK: block i runs at "
+                        "decay^(depth-1-i), so the top block is 1.0 and the "
+                        "embeddings are damped hardest. 1.0, the default, is "
+                        "off and reproduces every reported run. Standard for "
+                        "transformer fine-tuning; 0.65-0.75 is usual for a ViT.")
     p.add_argument("--lr-decay-start", type=float, default=1.0,
                    help="Fraction of the run at which the linear LR decay "
                         "BEGINS (Warmup-Stable-Decay): 0.25 holds the peak to "
@@ -658,6 +713,11 @@ def _train(args, on_dump=None, run=None) -> None:
         args, embed_dim=embed_dim, num_classes=num_classes,
         init_key=init_key, effective_batch=plan["effective_batch"])
 
+    # Only needed when LLRD is on; a stub backbone in a contract test has no
+    # `.blocks` and must not be forced to grow one.
+    trunk_depth = (len(backbone.blocks[0].blocks)
+                   if args.layer_decay != protocol.LAYER_DECAY_OFF else 0)
+
     # Warmup-Stable-Decay. `--lr-decay-start 1.0` (the default) returns the scalar
     # unchanged, so every reported run so far is reproduced exactly.
     #
@@ -677,20 +737,40 @@ def _train(args, on_dump=None, run=None) -> None:
               f"peak, so total shrinkage steps*lr*wd is {mult:.3f}x the tuned "
               f"configuration's.", flush=True)
 
+    # Layer-wise decay groups. At --layer-decay 1.0 every scale is 1.0 and this
+    # collapses to the two-group (backbone, head) split that produced every
+    # reported run; the extra optax transforms are then all identical.
+    trunk_labels, trunk_scales = _trunk_lr_groups(
+        backbone, trunk_depth, args.layer_decay)
+    if args.layer_decay != protocol.LAYER_DECAY_OFF:
+        lo, hi = min(trunk_scales.values()), max(trunk_scales.values())
+        print(f"[finetune] LLRD: decay={args.layer_decay:g} over {trunk_depth} "
+              f"blocks, {len(trunk_scales)} groups, lr scale {lo:.4f}..{hi:.4f}. "
+              f"The TOP block runs at 1.0 -- this damps the layers furthest "
+              f"from the head.", flush=True)
+    # With LLRD off the trunk is ONE group and ONE adamw -- built once, not
+    # once per path. Two constructions would be invisible at runtime but make
+    # the optimizer count a lie, which is what the CE contract test checks.
+    llrd_on = args.layer_decay != protocol.LAYER_DECAY_OFF
+    trunk_tx = ({name: optax.adamw(_scaled(lr_sched, scale), b1=args.beta1,
+                                   b2=args.beta2, weight_decay=args.weight_decay)
+                 for name, scale in trunk_scales.items()}
+                if llrd_on else
+                {"backbone": optax.adamw(lr_sched, b1=args.beta1, b2=args.beta2,
+                                         weight_decay=args.weight_decay)})
+
     if args.arm == "ce":
         head_lr = args.head_lr if args.head_lr is not None else DEFAULT_HEAD_LR
         head_sched = protocol.wsd_schedule(
             head_lr, plan["steps"], decay_start=args.lr_decay_start,
             decay_to=args.lr_decay_to)
         param_labels = (
-            jax.tree.map(lambda _: "backbone", eqx.filter(backbone, eqx.is_array)),
+            trunk_labels,
             jax.tree.map(lambda _: "head", eqx.filter(head, eqx.is_array)),
         )
         optimizer = optax.multi_transform(
             {
-                "backbone": optax.adamw(
-                    lr_sched, b1=args.beta1, b2=args.beta2,
-                    weight_decay=args.weight_decay),
+                **trunk_tx,
                 # Head weight decay is 0 on every arm (design D6): VBLL's KL is
                 # its head regulariser and IBProbit runs no optimizer on the
                 # head at all, so a nonzero value here would be an asymmetry.
@@ -705,9 +785,13 @@ def _train(args, on_dump=None, run=None) -> None:
         )
         opt_state = optimizer.init(eqx.filter((backbone, head), eqx.is_array))
     else:
-        optimizer = optax.adamw(
-            lr_sched, b1=args.beta1, b2=args.beta2,
-            weight_decay=args.weight_decay)
+        # multi_transform partitions by mapping over a labels pytree, which for
+        # an equinox Module is itself a Module carrying strings -- fine for a
+        # real equimo backbone, but reconstructing one trips the stubs the
+        # contract tests drive. With LLRD off there is nothing to partition, so
+        # the bare optimizer is used and every reported run's path is preserved.
+        optimizer = (optax.multi_transform(trunk_tx, trunk_labels) if llrd_on
+                     else trunk_tx["backbone"])
         opt_state = optimizer.init(eqx.filter(backbone, eqx.is_array))
 
     shard = None

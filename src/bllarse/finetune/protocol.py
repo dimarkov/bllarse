@@ -227,6 +227,45 @@ def accum_plan(target_batch: int, micro_batch: int) -> tuple[int, int, int]:
 # 512 duplicates finetune_space.FIXED_BATCH_SIZE rather than importing it:
 # finetune_space imports THIS module, so the dependency cannot run the other
 # way. `test_protocol_reference_matches_the_pinned_batch` keeps them equal.
+# Layer-wise learning-rate decay. Standard for transformer fine-tuning (ULMFiT's
+# discriminative rates; the MAE/BEiT ViT recipes), and the convention is that
+# the multiplier grows with depth: the layers nearest the head adapt at the full
+# rate while the layers nearest the input are damped, on the argument that
+# generic features should not be disturbed to fit a task.
+#
+# NOTE which end this damps, because it decides what LLRD can and cannot fix
+# here. IBProbit's head consumes the pooled patch-token mean of the FINAL block,
+# so the features it fits are produced by the layers LLRD leaves at full rate.
+# Late-run drift in the top blocks is not what this instrument targets.
+LAYER_DECAY_OFF = 1.0
+
+
+def llrd_scale(block: int | None, depth: int, decay: float) -> float:
+    """LR multiplier for a parameter in `block` of a `depth`-layer trunk.
+
+    Layers are numbered from the input, so `block=0` is the first transformer
+    block and `block=depth-1` the last. `block=None` is a NON-BLOCK parameter --
+    patch embedding, cls token, positional embeddings -- which sits BELOW every
+    block and takes the strongest damping; the trunk's final norm counts as the
+    top and takes 1.0, which is why callers pass `depth - 1` for it rather than
+    None.
+
+    The last block gets exactly 1.0, so `decay=1.0` is the identity and every
+    run recorded before this existed is reproduced bit-for-bit.
+    """
+    if not 0.0 < decay <= 1.0:
+        raise ValueError(f"decay must be in (0, 1], got {decay}")
+    if depth < 1:
+        raise ValueError(f"depth must be >= 1, got {depth}")
+    if block is None:
+        exponent = depth
+    else:
+        if not 0 <= block < depth:
+            raise ValueError(f"block {block} outside [0, {depth})")
+        exponent = depth - 1 - block
+    return float(decay ** exponent)
+
+
 def wsd_multiplier(step: int, steps: int, *, decay_start: float,
                    decay_to: float) -> float:
     """The WSD multiplier on the peak LR at `step`, as plain arithmetic.
