@@ -241,6 +241,22 @@ MICRO_BATCH: dict[str, dict[str, int]] = {
     # than probed higher because the batch ladder needs micro to DIVIDE the
     # target and 128 is the target.
     "dinov3_small": {"ce": 128, "ibprobit": 128, "vbll": 128},
+    # dinov3_big (ViT-B/16, 768 dim, 12 blocks). Measured 2026-08-31 by a true
+    # ceiling SEARCH: the JAX arms take 128 at 16.94 / 16.97 GiB and OOM at
+    # 256, while vbll fits 256 at 26.38 GiB reserved. So the torch arm needs no
+    # accumulation at the target batch of 256 and the JAX arms accumulate 2.
+    #
+    # The asymmetry is the same shape as dinov3_large's (vbll 64 against 32)
+    # and has the same cause: the JAX arms hold optimizer state for the whole
+    # trunk in one jitted step, so their peak lands inside the step rather than
+    # across it.
+    #
+    # An earlier probe reported 64 for both JAX arms. That measurement was
+    # void: it was invoked with --peak-at 64, which pins batch_size_init AND
+    # batch_size_max to its argument (probe_micro_batch.py), so it measured
+    # exactly where it was told to and reported the input back. 9.08 GiB on a
+    # 40 GB card should have been the tell.
+    "dinov3_big": {"ce": 128, "ibprobit": 128, "vbll": 256},
     # Not a fresh measurement: this is what the whole betasearch1m tuning
     # campaign ran at, 934 trials with no OOM -- a stronger guarantee than a
     # probe. vbll's 64 belongs to THIS row and always did.
