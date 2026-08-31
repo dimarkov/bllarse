@@ -534,3 +534,47 @@ def test_the_micro_batch_always_divides_the_batch_it_ships_with():
                                 from_samples=TUNE_SAMPLES, model=model)
             assert c["batch_size"] % c["micro_batch_size"] == 0, (arm, model)
             protocol.accum_plan(c["batch_size"], c["micro_batch_size"])
+
+
+# --- Layer-wise decay survives the transfer ---------------------------------
+
+
+def test_layer_decay_crosses_from_user_attrs_into_the_config():
+    """The defect this guards ran to completion and produced figures.
+
+    LLRD is a campaign setting, so it lives in the trial's user attrs and never
+    appears in `trial.params` -- which is what `best_config` transfers. Dropped,
+    the final run trains every block at 1.0x on hyperparameters selected under a
+    0.032x-1.0x trunk: on dinov3_small at decay 0.75 the embeddings move 31x
+    faster than anything the search ever scored.
+    """
+    trial = FakeTrial(CE_BEST, effective_batch=512,
+                      max_samples=TUNE_SAMPLES, layer_decay=0.75)
+    config = fc.best_config(FakeStudy(trial), "ce")
+    assert config["layer_decay"] == pytest.approx(0.75)
+
+
+def test_a_study_tuned_without_llrd_transfers_it_off():
+    # The previously reported campaigns carry no such attr, and must keep
+    # producing byte-identical commands rather than inheriting a default.
+    trial = FakeTrial(CE_BEST, effective_batch=512, max_samples=TUNE_SAMPLES)
+    config = fc.best_config(FakeStudy(trial), "ce")
+    assert config["layer_decay"] == protocol.LAYER_DECAY_OFF
+
+
+def test_layer_decay_is_emitted_even_when_off():
+    # Same rule as the WSD pair: `final_config.py --set` refuses a key the
+    # config lacks, so a decay appearing only when already enabled could never
+    # be turned on -- or off -- through it.
+    config = fc.final_config("ce", CE_BEST, effective_batch=512,
+                             from_samples=TUNE_SAMPLES)
+    assert "layer_decay" in config
+
+
+def test_layer_decay_reaches_the_emitted_flag():
+    # The config is only a means; what runs is the argv.
+    trial = FakeTrial(CE_BEST, effective_batch=512,
+                      max_samples=TUNE_SAMPLES, layer_decay=0.75)
+    argv = adapters.config_to_argv(fc.best_config(FakeStudy(trial), "ce"))
+    assert "--layer-decay" in argv
+    assert argv[argv.index("--layer-decay") + 1] == "0.75"

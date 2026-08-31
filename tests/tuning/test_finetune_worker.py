@@ -387,3 +387,42 @@ def test_worker_refuses_a_quantum_that_disables_the_pruner(monkeypatch, capsys):
 
     with pytest.raises(SystemExit, match="pruner can never fire"):
         fw.main()
+
+
+def test_the_objective_draws_with_the_campaigns_layer_decay(monkeypatch):
+    """LLRD must reach `space.suggest`, not merely the config after the draw.
+
+    It widens IBProbit's trunk-rate box, so setting it afterwards would leave
+    the draw at the no-LLRD ceiling -- the one the `small100k` campaign pinned
+    8 of 8 top trials against, making the box rather than the objective pick
+    the rate.
+    """
+    seen = {}
+
+    def fake_suggest(trial, arm, **kwargs):
+        seen.update(kwargs)
+        return {"batch_size": kwargs["batch_size"], "lr": 1e-5,
+                "weight_decay": 1e-6, "q_init": 1e-4,
+                "num_update_iters": 128, "beta1": 0.9, "beta2": 0.999}
+
+    monkeypatch.setattr(fw.space, "suggest", fake_suggest)
+    objective = fw.make_objective(
+        "ibprobit_noeps", dump_root=None, group_id="t", layer_decay=0.75)
+
+    class _Trial:
+        number = 0
+        params: dict = {}
+        def set_user_attr(self, *a): pass
+        def report(self, *a): pass
+        def should_prune(self): return False
+
+    # The draw is all this asserts on; stop before the run.
+    monkeypatch.setattr(fw.objective_mod, "evaluate",
+                        lambda *a, **k: (_ for _ in ()).throw(_Stop()))
+    with pytest.raises(_Stop):
+        objective(_Trial())
+    assert seen["layer_decay"] == 0.75
+
+
+class _Stop(Exception):
+    pass

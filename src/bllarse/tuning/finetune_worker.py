@@ -383,8 +383,13 @@ def make_objective(
         # max_samples, not the default: the beta axes are drawn in horizon
         # units and converted at this trial's step count, so a shortened smoke
         # budget must convert against ITS budget rather than the campaign's.
+        # layer_decay goes IN, not on afterwards: it widens IBProbit's trunk
+        # rate box (space.ibprobit_trunk_lr_box), so a study that ran with LLRD
+        # and one that did not are searching different spaces. Setting it after
+        # the draw would leave the box at the no-LLRD ceiling that the
+        # small100k campaign pinned 8 of 8 top trials against.
         params = space.suggest(trial, arm, max_samples=max_samples,
-                               batch_size=batch_size)
+                               batch_size=batch_size, layer_decay=layer_decay)
         # Campaign-level settings ride in through params, which trial_config
         # splats LAST -- so they override its defaults without it needing to
         # know about them.

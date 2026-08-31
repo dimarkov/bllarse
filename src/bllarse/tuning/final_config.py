@@ -144,6 +144,7 @@ def final_config(
     model: str | None = None,
     lr_decay_start: float = 1.0,
     lr_decay_to: float = 0.5,
+    layer_decay: float = protocol.LAYER_DECAY_OFF,
 ) -> dict[str, Any]:
     """The final campaign's config for `arm`, transferred from a tuned trial.
 
@@ -241,6 +242,10 @@ def final_config(
     # could never be enabled through it.
     config["lr_decay_start"] = float(lr_decay_start)
     config["lr_decay_to"] = float(lr_decay_to)
+    # Emitted unconditionally, like the WSD pair above and for the same reason:
+    # --set refuses a key the config lacks, so a decay that only appeared when
+    # already enabled could never be turned on -- or OFF -- through it.
+    config["layer_decay"] = float(layer_decay)
     config["enable_mlflow"] = enable_mlflow
     config["mlflow_experiment"] = mlflow_experiment
     if dump_every_k_evals is not None:
@@ -299,4 +304,12 @@ def best_config(study: Any, arm: str, **kwargs: Any) -> dict[str, Any]:
         batch = space.FIXED_BATCH_SIZE
     kwargs.setdefault("from_samples", trial.user_attrs.get(
         "max_samples", protocol.MAX_SAMPLES))
+    # LLRD is a CAMPAIGN setting, not a searched param, so it lives in the
+    # trial's user attrs and never appears in `trial.params`. Without this it
+    # is silently dropped by the transfer and the final run trains every block
+    # at 1.0x -- on hyperparameters selected under a 0.032x-1.0x trunk. On
+    # dinov3_small at 0.75 that is the embeddings moving 31x faster than
+    # anything the search ever scored.
+    kwargs.setdefault("layer_decay", float(
+        trial.user_attrs.get("layer_decay", protocol.LAYER_DECAY_OFF)))
     return final_config(arm, trial.params, effective_batch=int(batch), **kwargs)

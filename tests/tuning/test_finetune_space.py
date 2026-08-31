@@ -554,3 +554,66 @@ def test_suggest_honours_a_non_default_batch():
     params = fs.suggest(study.ask(), "ce", max_samples=100_000, batch_size=128)
 
     assert params["batch_size"] == 128
+
+
+# --- Layer-wise decay widens IBProbit's trunk box ---------------------------
+
+
+@pytest.mark.parametrize("arm", ["ibprobit", "ibprobit_noeps"])
+def test_llrd_widens_only_ibprobits_ceiling(arm):
+    """The ceiling bounds EFFECTIVE trunk speed, not the nominal rate.
+
+    Under layer-wise decay the trunk runs at decay^(depth-1-i) x lr, so the
+    nominal rate that produces a given trunk speed is several times larger. The
+    `small100k` campaign measured the consequence: 8 of 8 top IBProbit trials
+    drew between 91.7% and 99.9% of the no-LLRD ceiling, so the box -- not the
+    objective -- chose the rate.
+    """
+    off = RecordingTrial()
+    fs.suggest(off, arm, layer_decay=protocol.LAYER_DECAY_OFF)
+    on = RecordingTrial()
+    fs.suggest(on, arm, layer_decay=0.75)
+
+    _k, off_lo, off_hi, _log = searched_box(off, "lr")
+    _k, on_lo, on_hi, _log = searched_box(on, "lr")
+
+    assert (off_lo, off_hi) == fs.IBPROBIT_TRUNK_LR_BOX
+    assert (on_lo, on_hi) == fs.IBPROBIT_TRUNK_LR_BOX_LLRD
+    # Widened at the TOP only. A floor that moved would put rates the previous
+    # campaigns searched out of reach, and the pinning was at the ceiling.
+    assert on_lo == off_lo
+    assert on_hi > off_hi
+
+
+@pytest.mark.parametrize("arm", ["ce", "vbll"])
+def test_llrd_does_not_touch_the_optimiser_driven_arms(arm):
+    # Their top trials sat at 8.8-22.3% of ceiling in the same campaign: the
+    # box was nowhere near binding, so widening it would only dilute TPE.
+    off = RecordingTrial()
+    fs.suggest(off, arm, layer_decay=protocol.LAYER_DECAY_OFF)
+    on = RecordingTrial()
+    fs.suggest(on, arm, layer_decay=0.75)
+    assert searched_box(off, "lr") == searched_box(on, "lr")
+    assert searched_box(on, "lr")[1:3] == fs.TRUNK_LR_BOX
+
+
+def test_the_llrd_ceiling_is_above_the_shared_one_deliberately():
+    """This INVERTS the no-LLRD asymmetry, and that is the intent.
+
+    Without LLRD IBProbit is capped half a decade BELOW the shared box; with it
+    the cap sits above. The two together say the conjugate head's tolerance is
+    a bound on effective trunk speed and the nominal rate reaching it depends
+    on the schedule. Asserted so the inversion cannot be "fixed" by someone
+    reading only the no-LLRD constant.
+    """
+    assert fs.IBPROBIT_TRUNK_LR_BOX[1] < fs.TRUNK_LR_BOX[1]
+    assert fs.IBPROBIT_TRUNK_LR_BOX_LLRD[1] > fs.TRUNK_LR_BOX[1]
+    assert fs.IBPROBIT_TRUNK_LR_BOX_LLRD[1] == pytest.approx(1e-3)
+
+
+def test_the_box_is_keyed_on_llrd_being_on_not_on_its_value():
+    # No rule measured here derives a safe rate at 0.9 from one at 0.75, so the
+    # function must not interpolate and imply a precision it does not have.
+    assert fs.ibprobit_trunk_lr_box(0.75) == fs.ibprobit_trunk_lr_box(0.9)
+    assert fs.ibprobit_trunk_lr_box(
+        protocol.LAYER_DECAY_OFF) == fs.IBPROBIT_TRUNK_LR_BOX
