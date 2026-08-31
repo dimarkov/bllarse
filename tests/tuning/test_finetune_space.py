@@ -352,41 +352,6 @@ def test_suggest_rejects_an_unknown_arm():
         fs.suggest(RecordingTrial(), "ivon")
 
 
-@pytest.mark.parametrize("arm", ["ibprobit", "ibprobit_noeps"])
-def test_ibprobit_caps_the_trunk_rate_half_a_decade_below_the_others(arm):
-    """The closed-form head cannot track a fast trunk.
-
-    IBProbit assimilates its head once per optimizer step from the features
-    that step's accumulation window produced. Past some trunk rate those
-    sufficient statistics describe a representation the trunk has already left,
-    so the head is permanently one step stale. The optimiser-driven arms have
-    no equivalent failure -- their head is updated by the same gradient step as
-    the trunk.
-    """
-    trial = RecordingTrial()
-    fs.suggest(trial, arm)
-    _kind, low, high, log = searched_box(trial, "lr")
-    assert (low, high, log) == (*fs.IBPROBIT_TRUNK_LR_BOX, True)
-
-
-@pytest.mark.parametrize("arm", ["ce", "vbll"])
-def test_the_optimiser_driven_arms_keep_the_full_trunk_range(arm):
-    # The cap is a property of the conjugate update, not a budget cut applied
-    # unevenly -- so it must NOT leak onto the arms that do not need it.
-    trial = RecordingTrial()
-    fs.suggest(trial, arm)
-    _kind, low, high, log = searched_box(trial, "lr")
-    assert (low, high, log) == (*fs.TRUNK_LR_BOX, True)
-
-
-def test_only_the_top_of_the_trunk_range_differs_between_arms():
-    # Same floor on every arm: the cap removes the top half-decade and nothing
-    # else, so IBProbit can still reach every trunk rate the others can bar
-    # that slice.
-    assert fs.IBPROBIT_TRUNK_LR_BOX[0] == fs.TRUNK_LR_BOX[0]
-    assert fs.IBPROBIT_TRUNK_LR_BOX[1] < fs.TRUNK_LR_BOX[1]
-
-
 def test_the_ladder_reaches_the_eval_quantum():
     """The ceiling is the quantum, and nothing else.
 
@@ -556,64 +521,43 @@ def test_suggest_honours_a_non_default_batch():
     assert params["batch_size"] == 128
 
 
-# --- Layer-wise decay widens IBProbit's trunk box ---------------------------
+# --- One trunk-rate ceiling on every arm ------------------------------------
 
 
-@pytest.mark.parametrize("arm", ["ibprobit", "ibprobit_noeps"])
-def test_llrd_widens_only_ibprobits_ceiling(arm):
-    """The ceiling bounds EFFECTIVE trunk speed, not the nominal rate.
+@pytest.mark.parametrize("arm", ["ce", "vbll", "ibprobit", "ibprobit_noeps"])
+def test_every_arm_shares_the_same_trunk_rate_box(arm):
+    """The half-decade cap on IBProbit is retired, and this is why.
 
-    Under layer-wise decay the trunk runs at decay^(depth-1-i) x lr, so the
-    nominal rate that produces a given trunk speed is several times larger. The
-    `small100k` campaign measured the consequence: 8 of 8 top IBProbit trials
-    drew between 91.7% and 99.9% of the no-LLRD ceiling, so the box -- not the
-    objective -- chose the rate.
+    It encoded the claim that the closed-form head cannot track a trunk past
+    some rate. Two campaigns retired it: at ceiling 1e-4 all 8 of IBProbit's
+    top trials drew 91.7-99.9% of the cap, and when the cap moved to 1e-3 the
+    top 8 landed at 1.28e-4..1.37e-4 -- just outside the old one -- improving
+    best val NLL from 1.0131 to 1.0071. The box, not the objective, had been
+    choosing the rate.
     """
-    off = RecordingTrial()
-    fs.suggest(off, arm, layer_decay=protocol.LAYER_DECAY_OFF)
-    on = RecordingTrial()
-    fs.suggest(on, arm, layer_decay=0.75)
-
-    _k, off_lo, off_hi, _log = searched_box(off, "lr")
-    _k, on_lo, on_hi, _log = searched_box(on, "lr")
-
-    assert (off_lo, off_hi) == fs.IBPROBIT_TRUNK_LR_BOX
-    assert (on_lo, on_hi) == fs.IBPROBIT_TRUNK_LR_BOX_LLRD
-    # Widened at the TOP only. A floor that moved would put rates the previous
-    # campaigns searched out of reach, and the pinning was at the ceiling.
-    assert on_lo == off_lo
-    assert on_hi > off_hi
+    trial = RecordingTrial()
+    fs.suggest(trial, arm)
+    _kind, low, high, log = searched_box(trial, "lr")
+    assert (low, high, log) == (1e-6, 1e-3, True)
 
 
-@pytest.mark.parametrize("arm", ["ce", "vbll"])
-def test_llrd_does_not_touch_the_optimiser_driven_arms(arm):
-    # Their top trials sat at 8.8-22.3% of ceiling in the same campaign: the
-    # box was nowhere near binding, so widening it would only dilute TPE.
-    off = RecordingTrial()
-    fs.suggest(off, arm, layer_decay=protocol.LAYER_DECAY_OFF)
-    on = RecordingTrial()
-    fs.suggest(on, arm, layer_decay=0.75)
-    assert searched_box(off, "lr") == searched_box(on, "lr")
-    assert searched_box(on, "lr")[1:3] == fs.TRUNK_LR_BOX
+def test_the_arms_are_equal_by_measurement_not_by_aliasing():
+    # Equal boxes are a RESULT, so the two names stay distinct: a future
+    # measurement may separate them again, and aliasing would hide that the
+    # question was ever asked.
+    assert fs.IBPROBIT_TRUNK_LR_BOX == fs.TRUNK_LR_BOX
+    # Referenced through its OWN name at the draw site, so separating the arms
+    # again is a one-line constant change rather than a re-plumbing.
+    import inspect
+    assert "IBPROBIT_TRUNK_LR_BOX" in inspect.getsource(fs._suggest_ibprobit)
 
 
-def test_the_llrd_ceiling_is_above_the_shared_one_deliberately():
-    """This INVERTS the no-LLRD asymmetry, and that is the intent.
+def test_the_ceiling_is_not_binding_for_any_arm():
+    """1e-3 is above every optimum measured so far, with room to spare.
 
-    Without LLRD IBProbit is capped half a decade BELOW the shared box; with it
-    the cap sits above. The two together say the conjugate head's tolerance is
-    a bound on effective trunk speed and the nominal rate reaching it depends
-    on the schedule. Asserted so the inversion cannot be "fixed" by someone
-    reading only the no-LLRD constant.
+    The point of the raise was to stop the box choosing the rate. Recorded
+    here as the fact that justifies the number: the best trunk rates measured
+    are CE 4.4e-5, VBLL 2.9e-5 and IBProbit 1.3e-4, all at most 13% of it.
     """
-    assert fs.IBPROBIT_TRUNK_LR_BOX[1] < fs.TRUNK_LR_BOX[1]
-    assert fs.IBPROBIT_TRUNK_LR_BOX_LLRD[1] > fs.TRUNK_LR_BOX[1]
-    assert fs.IBPROBIT_TRUNK_LR_BOX_LLRD[1] == pytest.approx(1e-3)
-
-
-def test_the_box_is_keyed_on_llrd_being_on_not_on_its_value():
-    # No rule measured here derives a safe rate at 0.9 from one at 0.75, so the
-    # function must not interpolate and imply a precision it does not have.
-    assert fs.ibprobit_trunk_lr_box(0.75) == fs.ibprobit_trunk_lr_box(0.9)
-    assert fs.ibprobit_trunk_lr_box(
-        protocol.LAYER_DECAY_OFF) == fs.IBPROBIT_TRUNK_LR_BOX
+    for measured in (4.4e-5, 2.9e-5, 1.3e-4):
+        assert measured < 0.2 * fs.TRUNK_LR_BOX[1]

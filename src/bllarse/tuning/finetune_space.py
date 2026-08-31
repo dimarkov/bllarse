@@ -378,7 +378,7 @@ PRIOR_SCALE_BOX = (1e-3, 1e3)
 # file were just found clipped, and a narrow lr box would be a fourth. The
 # floor is untouched -- ce at 512 is expected to want roughly half its 1024
 # value (2e-6 to 2e-5), near the bottom of the box, not the top.
-TRUNK_LR_BOX = (1e-6, 3e-4)
+TRUNK_LR_BOX = (1e-6, 1e-3)
 
 # Weight decay is now PER ARM, because the first campaign found three different
 # behaviours on one axis. Best val_nll by wd decade, over all completed trials:
@@ -437,43 +437,25 @@ VBLL_WD_BOX = (1e-5, 1e-2)
 # Ceiling lowered from 5e-4 to 1e-4 alongside TRUNK_LR_BOX's 1e-3 -> 3e-4, so
 # the half-decade asymmetry this constant exists to express is preserved rather
 # than quietly closed by narrowing only the other box.
-IBPROBIT_TRUNK_LR_BOX = (1e-6, 1e-4)
+IBPROBIT_TRUNK_LR_BOX = (1e-6, 1e-3)
 
-# The ceiling above holds for a trunk trained at ONE rate. Layer-wise decay
-# breaks that premise: at decay d over `depth` blocks the trunk runs at
-# d^(depth-1-i) x lr, so on dinov3_small at 0.75 the blocks span 0.032x
-# (embeddings) to 1.0x (top block), mean 0.30x. The staleness the ceiling
-# guards against is driven by how fast the trunk ACTUALLY moves, and under
-# LLRD that is several times slower than the nominal rate the box caps.
+# One ceiling on every arm, and the half-decade asymmetry that used to live
+# here is GONE. It was the claim that IBProbit's closed-form head cannot track
+# a trunk past some rate, so its box was capped 5x below the others'. Two
+# measurements retired it:
 #
-# Measured, not assumed: in the `small100k` campaign (batch 128, decay 0.75)
-# all 8 of IBProbit's top trials drew a trunk rate between 91.7% and 99.9% of
-# the 1e-4 ceiling -- two of them touching it -- while CE sat at 11.5-22.3% and
-# VBLL at 8.8-14.5% of theirs. The arm never got to try the rate it wanted, so
-# its result was box-limited rather than optimal.
+#   * small100k (ceiling 1e-4): all 8 of IBProbit's top trials drew 91.7-99.9%
+#     of the ceiling. The BOX was choosing the rate, not the objective.
+#   * small100klr (ceiling 1e-3): the top 8 cluster at 1.28e-4..1.37e-4 --
+#     just OUTSIDE the old cap -- and best val NLL improved 1.0131 -> 1.0071.
 #
-# 1e-3 is ABOVE TRUNK_LR_BOX's 3e-4, which INVERTS the half-decade asymmetry
-# the constant above exists to express. That is deliberate and it is the
-# LLRD-conditioned value only: the asymmetry was measured without LLRD, and it
-# is preserved unchanged there. What the two constants now say together is that
-# the conjugate head's tolerance for trunk motion is a bound on EFFECTIVE
-# trunk speed, and the nominal rate that reaches it depends on the schedule.
-IBPROBIT_TRUNK_LR_BOX_LLRD = (1e-6, 1e-3)
+# So the optimum sat a hair above the old ceiling and the cap was costing real
+# performance. At 1e-3 the top trials sit at ~13% of the ceiling on every arm,
+# i.e. the box binds nowhere and each arm's rate is now the objective's choice.
+# Kept as its own name rather than aliased to TRUNK_LR_BOX: the arms having
+# equal boxes is a measured RESULT, and a future measurement may separate them
+# again.
 
-
-def ibprobit_trunk_lr_box(
-    layer_decay: float = protocol.LAYER_DECAY_OFF,
-) -> tuple[float, float]:
-    """IBProbit's trunk-rate box, widened when layer-wise decay is active.
-
-    Keyed on whether LLRD is on at all, not on the decay value. A rate that is
-    safe at 0.75 is not derived from one at 0.9 by any rule measured here, and
-    a formula would imply a precision the single measurement above does not
-    support. Off is the previously reported campaigns' box, byte for byte.
-    """
-    if layer_decay == protocol.LAYER_DECAY_OFF:
-        return IBPROBIT_TRUNK_LR_BOX
-    return IBPROBIT_TRUNK_LR_BOX_LLRD
 
 # The head rate is ALWAYS at least 5x the trunk rate. Because the RATIO is the
 # searched axis, this is a floor on the box rather than a rejected-sample
@@ -623,7 +605,6 @@ def eval_count(max_samples: int = protocol.MAX_SAMPLES) -> int:
 def _suggest_ibprobit(
     trial: Any, *, search_eps: bool, steps: int,
     batch_size: int = FIXED_BATCH_SIZE,
-    layer_decay: float = protocol.LAYER_DECAY_OFF,
 ) -> dict[str, Any]:
     """IBProbit's axes.
 
@@ -646,7 +627,7 @@ def _suggest_ibprobit(
         # from features the trunk has already moved past once the trunk is fast
         # enough. See the constant.
         "lr": _suggest_per_sqrt_batch(
-            trial, "lr", ibprobit_trunk_lr_box(layer_decay), batch_size),
+            trial, "lr", IBPROBIT_TRUNK_LR_BOX, batch_size),
         # Both ibprobit arms keep the wide shared box: wd measured FLAT on this
         # head (rho +0.17 and +0.03, best-of-decade spread 0.004 with no
         # ordering). "Does not matter" is a result here, so it is left free to
@@ -667,7 +648,6 @@ def _suggest_ibprobit(
 def suggest(
     trial: Any, arm: str, *, max_samples: int = protocol.MAX_SAMPLES,
     batch_size: int = FIXED_BATCH_SIZE,
-    layer_decay: float = protocol.LAYER_DECAY_OFF,
 ) -> dict[str, Any]:
     """One TPE-sampled configuration for `arm`.
 
@@ -697,7 +677,7 @@ def suggest(
     if arm.startswith("ibprobit"):
         return _suggest_ibprobit(
             trial, search_eps=(arm == "ibprobit"), steps=steps,
-            batch_size=batch_size, layer_decay=layer_decay)
+            batch_size=batch_size)
 
     params: dict[str, Any] = {
         # See FIXED_BATCH_SIZE, and _suggest_ibprobit on why it is a constant

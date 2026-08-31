@@ -369,6 +369,7 @@ def make_objective(
     batch_size: int = space.FIXED_BATCH_SIZE,
     eval_quantum: int = protocol.EVAL_QUANTUM,
     layer_decay: float = protocol.LAYER_DECAY_OFF,
+    layer_decay_span: float = protocol.LAYER_DECAY_SPAN_OFF,
 ) -> Callable[[optuna.Trial], float]:
     """The optuna objective closure for one arm's study.
 
@@ -383,19 +384,19 @@ def make_objective(
         # max_samples, not the default: the beta axes are drawn in horizon
         # units and converted at this trial's step count, so a shortened smoke
         # budget must convert against ITS budget rather than the campaign's.
-        # layer_decay goes IN, not on afterwards: it widens IBProbit's trunk
-        # rate box (space.ibprobit_trunk_lr_box), so a study that ran with LLRD
-        # and one that did not are searching different spaces. Setting it after
-        # the draw would leave the box at the no-LLRD ceiling that the
-        # small100k campaign pinned 8 of 8 top trials against.
         params = space.suggest(trial, arm, max_samples=max_samples,
-                               batch_size=batch_size, layer_decay=layer_decay)
+                               batch_size=batch_size)
         # Campaign-level settings ride in through params, which trial_config
         # splats LAST -- so they override its defaults without it needing to
         # know about them.
         params["eval_quantum"] = eval_quantum
         if layer_decay != protocol.LAYER_DECAY_OFF:
             params["layer_decay"] = layer_decay
+        # The SPAN is what transfers across backbones -- a per-block decay
+        # means a different trunk shape at every depth. Passed through to the
+        # script, which resolves it against the loaded backbone's real depth.
+        if layer_decay_span != protocol.LAYER_DECAY_SPAN_OFF:
+            params["layer_decay_span"] = layer_decay_span
         if model is not None:
             params["model"] = model
         config = trial_config(
@@ -403,6 +404,7 @@ def make_objective(
         trial.set_user_attr("max_samples", max_samples)
         trial.set_user_attr("eval_quantum", eval_quantum)
         trial.set_user_attr("layer_decay", layer_decay)
+        trial.set_user_attr("layer_decay_span", layer_decay_span)
         trial.set_user_attr("model", config["model"])
         trial.set_user_attr("micro_batch_size", config["micro_batch_size"])
         trial.set_user_attr("effective_batch", config["batch_size"])
@@ -519,6 +521,12 @@ def build_argparser() -> argparse.ArgumentParser:
                         "patience clock are counted in EVALUATIONS, so this "
                         "sets whether they can fire at all: max_samples / "
                         "quantum must exceed warmup + patience.")
+    p.add_argument("--layer-decay-span", type=float,
+                   default=protocol.LAYER_DECAY_SPAN_OFF,
+                   help="Campaign-level LLRD span: the fraction of the top "
+                        "block's rate the embeddings receive, resolved at each "
+                        "backbone's real depth. Use this rather than "
+                        "--layer-decay when a campaign spans backbones.")
     p.add_argument("--layer-decay", type=float,
                    default=protocol.LAYER_DECAY_OFF,
                    help="Layer-wise LR decay for the trunk, applied to every "
@@ -581,6 +589,7 @@ def main() -> None:
             batch_size=args.batch_size,
             eval_quantum=args.eval_quantum,
             layer_decay=args.layer_decay,
+            layer_decay_span=args.layer_decay_span,
         ),
         n_trials=args.n_trials,
         # Scoped to `Exception`, deliberately NOT `BaseException`:

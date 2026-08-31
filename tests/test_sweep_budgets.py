@@ -60,3 +60,38 @@ def test_seeds_default_to_the_ten_the_figures_are_specified_on(name, monkeypatch
     assert mod._seeds() == list(range(137, 147))
     monkeypatch.setenv("BLLARSE_SWEEP_SEEDS", "137 138")
     assert mod._seeds() == [137, 138]
+
+
+def test_every_sweep_declares_the_same_tuning_campaign():
+    """Figs 1 and 2 compare arms, so one campaign has to cover all six sweeps.
+
+    A single module left on the previous campaign is the confound the whole
+    re-tune exists to remove -- and it would be invisible, since the figure
+    would still plot three arms with no gap in the data.
+    """
+    campaigns = {
+        name: importlib.import_module(name).CAMPAIGN for name in MODULES
+    }
+    assert len(set(campaigns.values())) == 1, campaigns
+
+
+@pytest.mark.parametrize("name", MODULES)
+def test_every_config_writes_under_its_own_campaign(name, monkeypatch):
+    """The campaign is a directory, not an environment variable someone types.
+
+    dump_root/group_id/uid carries no hyperparameters, so re-running a sweep
+    after a re-tune overwrites the previous campaign's dumps in place. The
+    campaign subdirectory is what keeps win5 readable while win2 is written.
+    """
+    monkeypatch.setenv("BLLARSE_EVAL_DUMP_ROOT", "/scratch/dumps")
+    mod = importlib.reload(importlib.import_module(name))
+    for cfg in mod.create_configs():
+        assert cfg["dump_root"] == f"/scratch/dumps/{mod.CAMPAIGN}", name
+
+
+@pytest.mark.parametrize("name", MODULES)
+def test_the_campaign_root_falls_back_without_the_env_var(name, monkeypatch):
+    """Forgetting the variable must not merge campaigns -- only relocate them."""
+    monkeypatch.delenv("BLLARSE_EVAL_DUMP_ROOT", raising=False)
+    mod = importlib.reload(importlib.import_module(name))
+    assert mod.DUMP_ROOT == f"eval_dumps/{mod.CAMPAIGN}"

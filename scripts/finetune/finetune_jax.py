@@ -198,6 +198,31 @@ def _scaled(schedule, scale: float):
     return scale * schedule
 
 
+def _resolve_layer_decay(args, depth: int) -> float:
+    """`--layer-decay`, or `--layer-decay-span` converted at the REAL depth.
+
+    Resolved here rather than in the launcher because this is where the depth
+    is authoritative -- it comes off the loaded backbone. A depth table in the
+    launcher would be one more thing to keep in sync with the checkpoints, and
+    getting it wrong is silent: the run trains, it just damps the trunk by a
+    factor nobody chose.
+    """
+    span_on = args.layer_decay_span != protocol.LAYER_DECAY_SPAN_OFF
+    decay_on = args.layer_decay != protocol.LAYER_DECAY_OFF
+    if span_on and decay_on:
+        raise SystemExit(
+            "[finetune] --layer-decay and --layer-decay-span are mutually "
+            "exclusive: they set the same quantity, one per block and one "
+            "across the whole trunk. Pass exactly one."
+        )
+    if not span_on:
+        return args.layer_decay
+    decay = protocol.layer_decay_for_span(args.layer_decay_span, depth)
+    print(f"[finetune] LLRD span {args.layer_decay_span:.4g} over {depth} "
+          f"blocks -> per-block decay {decay:.4f}.", flush=True)
+    return decay
+
+
 def _trunk_block_of(path, depth: int) -> int | None:
     """Which transformer block a trunk leaf belongs to, from its pytree path.
 
@@ -344,6 +369,9 @@ def build_argparser() -> argparse.ArgumentParser:
                         "embeddings are damped hardest. 1.0, the default, is "
                         "off and reproduces every reported run. Standard for "
                         "transformer fine-tuning; 0.65-0.75 is usual for a ViT.")
+    p.add_argument("--layer-decay-span", type=float,
+                   default=protocol.LAYER_DECAY_SPAN_OFF,
+                   help="Layer-wise LR decay expressed as the SPAN: the fraction of the top block's rate that the EMBEDDINGS receive. Resolved against this backbone's actual depth, so one value is comparable across the dinov3 ladder -- unlike --layer-decay, whose per-block factor means 0.75^12 on a 12-block trunk but 0.75^32 on a 32-block one. Mutually exclusive with --layer-decay. 1.0 is off.")
     p.add_argument("--lr-decay-start", type=float, default=1.0,
                    help="Fraction of the run at which the linear LR decay "
                         "BEGINS (Warmup-Stable-Decay): 0.25 holds the peak to "
@@ -712,8 +740,12 @@ def _train(args, on_dump=None, run=None) -> None:
 
     # Only needed when LLRD is on; a stub backbone in a contract test has no
     # `.blocks` and must not be forced to grow one.
-    trunk_depth = (len(backbone.blocks[0].blocks)
-                   if args.layer_decay != protocol.LAYER_DECAY_OFF else 0)
+    # Read unconditionally now: the span has to be resolved against the real
+    # depth before we know whether LLRD is on at all. The stub-backbone guard
+    # the old conditional provided moves into the getattr chain.
+    _blocks = getattr(backbone, "blocks", None)
+    trunk_depth = len(_blocks[0].blocks) if _blocks is not None else 0
+    args.layer_decay = _resolve_layer_decay(args, trunk_depth)
 
     # Warmup-Stable-Decay. `--lr-decay-start 1.0` (the default) returns the scalar
     # unchanged, so every reported run so far is reproduced exactly.

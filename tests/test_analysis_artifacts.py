@@ -68,22 +68,42 @@ def test_the_plotting_scripts_accept_an_mlflow_source():
         )
 
 
-def test_fig2_draws_one_divider_per_arm_change():
+def test_fig2_divides_arm_groups_and_only_when_there_are_groups():
     """The divider was hardcoded at x=1.5 -- right for the two arms the figure
     had when it was written, wrong the moment IBProbit made it three. Derived
-    from SERIES, it tracks however many arms the figure grows to."""
+    from SERIES, it tracks however many arms the figure grows to.
+
+    It divides GROUPS, not bars. Since Fig 2 dropped entropy and native and
+    reports MSP alone, every x position is its own arm, and a rule between each
+    adjacent pair would separate nothing while adding two lines per panel. The
+    dividers return the moment any arm contributes a second entry -- another
+    score, or a second campaign -- which is exactly when a reader could
+    misattribute one arm's bar to its neighbour."""
     import sys
     root = Path(__file__).resolve().parents[1] / "scripts" / "plotting"
     sys.path.insert(0, str(root))
     import plot_fig2_draft
 
     arms = [s[0] for s in plot_fig2_draft.SERIES]
-    expected = sum(1 for a, b in zip(arms, arms[1:]) if a != b)
+    grouped = len(set(arms)) < len(arms)
+    expected = sum(1 for a, b in zip(arms, arms[1:]) if a != b) if grouped else 0
     boundaries = plot_fig2_draft._arm_boundaries()
     assert len(boundaries) == expected, (
-        f"{len(boundaries)} dividers for {len(set(arms))} arms in SERIES"
+        f"{len(boundaries)} dividers for {len(arms)} entries over "
+        f"{len(set(arms))} arms in SERIES"
     )
     # Each boundary must fall between two entries of different arms.
     for b in boundaries:
         left, right = arms[int(b - 0.5)], arms[int(b + 0.5)]
         assert left != right, f"divider at {b} sits inside arm {left!r}"
+
+    # And the grouped case still divides, whatever SERIES happens to hold today.
+    original = plot_fig2_draft.SERIES
+    try:
+        plot_fig2_draft.SERIES = [
+            ("adamw_ce", "ts_msp", "", ""), ("adamw_ce", "msp", "", ""),
+            ("vbll", "msp", "", ""),
+        ]
+        assert plot_fig2_draft._arm_boundaries() == [1.5]
+    finally:
+        plot_fig2_draft.SERIES = original

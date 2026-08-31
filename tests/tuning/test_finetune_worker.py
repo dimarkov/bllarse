@@ -389,25 +389,27 @@ def test_worker_refuses_a_quantum_that_disables_the_pruner(monkeypatch, capsys):
         fw.main()
 
 
-def test_the_objective_draws_with_the_campaigns_layer_decay(monkeypatch):
-    """LLRD must reach `space.suggest`, not merely the config after the draw.
+def test_the_span_reaches_the_scripts_config(monkeypatch):
+    """A campaign spanning backbones must transfer the SPAN, not the factor.
 
-    It widens IBProbit's trunk-rate box, so setting it afterwards would leave
-    the draw at the no-LLRD ceiling -- the one the `small100k` campaign pinned
-    8 of 8 top trials against, making the box rather than the objective pick
-    the rate.
+    `--layer-decay` is per-block, so one value is a different trunk shape at
+    every depth: 0.75 damps the embeddings to 3.2e-2 over 12 blocks but 1.0e-4
+    over 32. The span is resolved against the loaded backbone's real depth
+    inside the training script, so it has to survive as far as the config.
     """
-    seen = {}
+    captured = {}
 
-    def fake_suggest(trial, arm, **kwargs):
-        seen.update(kwargs)
-        return {"batch_size": kwargs["batch_size"], "lr": 1e-5,
-                "weight_decay": 1e-6, "q_init": 1e-4,
-                "num_update_iters": 128, "beta1": 0.9, "beta2": 0.999}
+    def fake_trial_config(arm, *, params, **kw):
+        captured.update(params)
+        return {"model": "dinov3_small", "micro_batch_size": 128, **params}
 
-    monkeypatch.setattr(fw.space, "suggest", fake_suggest)
+    monkeypatch.setattr(fw, "trial_config", fake_trial_config)
+    monkeypatch.setattr(fw.space, "suggest",
+                        lambda trial, arm, **kw: {"batch_size": 128})
+    monkeypatch.setattr(fw.objective_mod, "evaluate",
+                        lambda *a, **k: (_ for _ in ()).throw(_Stop()))
     objective = fw.make_objective(
-        "ibprobit_noeps", dump_root=None, group_id="t", layer_decay=0.75)
+        "ce", dump_root=None, group_id="t", layer_decay_span=0.0317)
 
     class _Trial:
         number = 0
@@ -416,12 +418,11 @@ def test_the_objective_draws_with_the_campaigns_layer_decay(monkeypatch):
         def report(self, *a): pass
         def should_prune(self): return False
 
-    # The draw is all this asserts on; stop before the run.
-    monkeypatch.setattr(fw.objective_mod, "evaluate",
-                        lambda *a, **k: (_ for _ in ()).throw(_Stop()))
     with pytest.raises(_Stop):
         objective(_Trial())
-    assert seen["layer_decay"] == 0.75
+    assert captured["layer_decay_span"] == 0.0317
+    # The per-block factor must NOT also be set: the scripts refuse both.
+    assert "layer_decay" not in captured
 
 
 class _Stop(Exception):

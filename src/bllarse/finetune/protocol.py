@@ -239,6 +239,41 @@ def accum_plan(target_batch: int, micro_batch: int) -> tuple[int, int, int]:
 # Late-run drift in the top blocks is not what this instrument targets.
 LAYER_DECAY_OFF = 1.0
 
+# LLRD's SPAN: what the bottom of the trunk gets relative to the top block.
+# `--layer-decay` is a PER-BLOCK factor, so a fixed value means something
+# different at every depth -- 0.75 puts the embeddings at 0.75^12 = 3.2e-2 on
+# a 12-block trunk, 1.0e-3 at 24 blocks and 1.0e-4 at 32. Carrying one number
+# up the dinov3 ladder would silently freeze the embeddings on the deeper
+# backbones: 316x more damping on huge than the value validated on small.
+#
+# The transferable quantity is therefore the span, not the factor. 0.75^12 is
+# the span the small campaign actually ran at, written as the expression that
+# produced it rather than as 0.0317 so the provenance survives.
+LAYER_DECAY_SPAN = 0.75 ** 12
+# The span that means "no decay". Distinct from LAYER_DECAY_OFF only in what it
+# names, but they are different quantities and collapsing them reads as a bug.
+LAYER_DECAY_SPAN_OFF = 1.0
+
+
+def layer_decay_for_span(span: float, depth: int) -> float:
+    """Per-block decay putting the trunk's BOTTOM at `span` x the top's rate.
+
+    Inverts `llrd_scale`'s `decay^(depth-1-i)` at the deepest damping the trunk
+    applies. `llrd_scale` gives a NON-BLOCK parameter (patch embedding, cls
+    token, positional embeddings) `decay^depth`, one step below block 0, so the
+    span is measured there -- that is the parameter the damping is really
+    about, and keying on block 0 instead would leave the embeddings drifting by
+    a factor of `decay` across the ladder.
+    """
+    if span <= 0.0 or span > 1.0:
+        raise ValueError(
+            f"layer decay span must be in (0, 1], got {span}. It is the "
+            f"fraction of the TOP block's rate that the embeddings receive."
+        )
+    if depth < 1:
+        raise ValueError(f"depth must be at least 1, got {depth}")
+    return float(span ** (1.0 / depth))
+
 
 def llrd_scale(block: int | None, depth: int, decay: float) -> float:
     """LR multiplier for a parameter in `block` of a `depth`-layer trunk.

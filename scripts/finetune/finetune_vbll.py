@@ -330,6 +330,9 @@ def build_argparser() -> argparse.ArgumentParser:
                         "decay^(depth-1-i), so the top layer is 1.0 and the "
                         "embeddings are damped hardest. 1.0, the default, is "
                         "off and reproduces every reported run.")
+    p.add_argument("--layer-decay-span", type=float,
+                   default=protocol.LAYER_DECAY_SPAN_OFF,
+                   help="Layer-wise LR decay expressed as the SPAN: the fraction of the top block's rate that the EMBEDDINGS receive. Resolved against this backbone's actual depth, so one value is comparable across the dinov3 ladder -- unlike --layer-decay, whose per-block factor means 0.75^12 on a 12-block trunk but 0.75^32 on a 32-block one. Mutually exclusive with --layer-decay. 1.0 is off.")
     p.add_argument("--lr-decay-start", type=float, default=1.0,
                    help="Fraction of the run at which the linear LR decay "
                         "BEGINS (Warmup-Stable-Decay): 0.25 holds the peak to "
@@ -383,6 +386,29 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 _TORCH_LAYER_RE = re.compile(r"(?:^|\.)(?:layers?|blocks?)\.(\d+)\.")
+
+
+def _resolve_layer_decay(args, depth: int) -> float:
+    """`--layer-decay`, or `--layer-decay-span` converted at the REAL depth.
+
+    Same contract as the JAX arms' helper, and resolved in the same place and
+    for the same reason: the depth comes off the loaded backbone, so a launcher
+    depth table could drift from the checkpoints silently.
+    """
+    span_on = args.layer_decay_span != protocol.LAYER_DECAY_SPAN_OFF
+    decay_on = args.layer_decay != protocol.LAYER_DECAY_OFF
+    if span_on and decay_on:
+        raise SystemExit(
+            "[vbll-ft] --layer-decay and --layer-decay-span are mutually "
+            "exclusive: they set the same quantity, one per block and one "
+            "across the whole trunk. Pass exactly one."
+        )
+    if not span_on:
+        return args.layer_decay
+    decay = protocol.layer_decay_for_span(args.layer_decay_span, depth)
+    print(f"[vbll-ft] LLRD span {args.layer_decay_span:.4g} over {depth} "
+          f"layers -> per-block decay {decay:.4f}.", flush=True)
+    return decay
 
 
 def _trunk_lr_groups(model, base_lr, weight_decay, decay):
@@ -548,6 +574,10 @@ def _train(args, on_dump=None, run=None) -> None:
     # Two param groups, two rates. weight_decay 0 on the head: see --weight-decay.
     # betas are set on the optimizer rather than per group: they are an
     # averaging horizon in STEPS, and both groups take the same steps.
+    # transformers reports the trunk depth on the config, which is the same
+    # number _trunk_lr_groups validates the parameter names against.
+    args.layer_decay = _resolve_layer_decay(
+        args, int(model.config.num_hidden_layers))
     trunk_groups = _trunk_lr_groups(
         model, args.lr, args.weight_decay, args.layer_decay)
     optimizer = torch.optim.AdamW(

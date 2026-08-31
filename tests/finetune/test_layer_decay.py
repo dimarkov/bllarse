@@ -146,3 +146,67 @@ def test_the_ce_arm_tuple_shape_also_builds_and_steps():
 
     updates, _ = opt.update(grads, state, params)
     assert updates is not None
+
+
+# --- The span, which is what transfers across backbones ---------------------
+
+
+def test_the_span_is_invariant_across_the_dinov3_ladder():
+    """One number, three depths, the same trunk shape.
+
+    This is the defect the span exists to prevent: `--layer-decay 0.75` carried
+    from dinov3_small to dinov3_huge puts the embeddings at 0.75^32 = 1.0e-4
+    instead of 0.75^12 = 3.2e-2 -- 316x more damping, frozen in all but name,
+    and nothing in the code would object.
+    """
+    span = protocol.LAYER_DECAY_SPAN
+    for depth in (12, 24, 32):
+        decay = protocol.layer_decay_for_span(span, depth)
+        assert decay ** depth == pytest.approx(span, rel=1e-9)
+
+
+def test_it_reproduces_the_validated_small_campaign_exactly():
+    # The small campaign ran 0.75 over 12 blocks, so the span form must return
+    # that value unchanged or every earlier run becomes unreproducible.
+    assert protocol.layer_decay_for_span(
+        protocol.LAYER_DECAY_SPAN, 12) == pytest.approx(0.75, rel=1e-12)
+
+
+def test_the_deeper_backbones_need_a_weaker_per_block_factor():
+    # Stated as the direction, not just the arithmetic: more blocks compound
+    # the same span, so each block must decay LESS.
+    d12 = protocol.layer_decay_for_span(protocol.LAYER_DECAY_SPAN, 12)
+    d24 = protocol.layer_decay_for_span(protocol.LAYER_DECAY_SPAN, 24)
+    d32 = protocol.layer_decay_for_span(protocol.LAYER_DECAY_SPAN, 32)
+    assert d12 < d24 < d32 < 1.0
+    assert d24 == pytest.approx(0.8660, abs=5e-5)
+    assert d32 == pytest.approx(0.8977, abs=5e-5)
+
+
+def test_a_span_of_one_is_no_decay_at_any_depth():
+    for depth in (12, 24, 32):
+        assert protocol.layer_decay_for_span(
+            protocol.LAYER_DECAY_SPAN_OFF, depth) == protocol.LAYER_DECAY_OFF
+
+
+@pytest.mark.parametrize("span", [0.0, -0.1, 1.5])
+def test_a_span_outside_the_unit_interval_is_refused(span):
+    # It is a FRACTION of the top block's rate. A value above 1 would mean the
+    # embeddings train faster than the head, which is the opposite of LLRD.
+    with pytest.raises(ValueError, match="span"):
+        protocol.layer_decay_for_span(span, 12)
+
+
+def test_the_span_matches_what_llrd_scale_gives_the_embeddings():
+    """The span is measured at the NON-BLOCK params, not at block 0.
+
+    `llrd_scale(None, ...)` is `decay^depth` -- one step below block 0 -- and
+    that is the parameter the damping is really about. Keying the span on
+    block 0 instead would let the embeddings drift by a factor of `decay`
+    across the ladder, which is precisely the bug being fixed.
+    """
+    span = protocol.LAYER_DECAY_SPAN
+    for depth in (12, 24, 32):
+        decay = protocol.layer_decay_for_span(span, depth)
+        assert protocol.llrd_scale(None, depth, decay) == pytest.approx(span)
+        assert protocol.llrd_scale(depth - 1, depth, decay) == pytest.approx(1.0)

@@ -107,11 +107,42 @@ DEFAULT_MIN_RELATIVE_IMPROVEMENT = 1e-4
 # better on test at every backbone -- by ranking it 88th of 100. At a fixed
 # width of 5 the same config ranks 6th, inside a top-10 spread of 0.001.
 #
-# 5, measured: width 1 is the unsmoothed minimum and keeps the oxford_pets
-# pathology; 2 already removes it; 2-30 all behave alike on both cases; 50
-# starts eroding real minima again. 5 sits in the middle of the flat region and
-# can never exceed even the shortest trajectory seen (71).
-DEFAULT_SMOOTH_WINDOW = 5
+# 2, measured -- and this constant was 5 until a full campaign at each width
+# showed that "2-30 all behave alike" was wrong.
+#
+# The original claim came from re-scoring two stored trajectories offline, which
+# only asks which width RANKS a fixed set of trials differently. It cannot see
+# the width steering the SEARCH: TPE samples where its posterior says the
+# optimum is, so a width that flattens the region around the true optimum sends
+# every later trial somewhere else, and the study never revisits it. Ranking
+# stability is not search stability, and only the second one matters.
+#
+# Run end to end at both widths, the two disagree, and asymmetrically by arm:
+#
+#   IBProbit (closed-form update, no optimiser)
+#     w=1 vs w=2   the same operating point. q_init 5.37e-3 vs 5.77e-3 on
+#                  cifar10; Fig 1 NLL within 0.003 at every dataset; Fig 2
+#                  FPR@95 within 0.005 at every pair.
+#     w=5          q_init collapses to the box floor, 1.005e-6 -- 5,700x below
+#                  the w=2 pick, and confirmed on an independent draw (win5b,
+#                  1.026e-6, top-10 all at the floor). Fig 2 FPR@95 on
+#                  cifar10-vs-SVHN 0.0261 against 0.0081 at w=2.
+#
+#   AdamW+CE and VBLL (gradient-trained, and the arms the smoothing is FOR)
+#     w=1          keeps the noise-mining: oxford_pets lr 0.0182, val NLL
+#                  0.2366 against 0.2163 at w=2. VBLL/dtd 0.5485 vs 0.5042.
+#     w>=2         removes it.
+#
+# So the widths are not interchangeable, and w=2 is the only one that satisfies
+# both constraints: large enough to stop a lone dip carrying a trial (which is
+# all the lr-bearing arms need), small enough not to average away a real dip
+# that a flat-curved arm depends on. Why the asymmetry exists is the point --
+# IBProbit's val curve has no optimiser noise to mine, so widening the window
+# can only destroy signal for it, while for the gradient arms it removes a bias.
+#
+# 50 still erodes real minima; that part was right. And 2 can never exceed even
+# the shortest trajectory seen (71).
+DEFAULT_SMOOTH_WINDOW = 2
 
 
 def best_window_mean(values: Sequence[float], window: int) -> float:

@@ -145,6 +145,7 @@ def final_config(
     lr_decay_start: float = 1.0,
     lr_decay_to: float = 0.5,
     layer_decay: float = protocol.LAYER_DECAY_OFF,
+    layer_decay_span: float = protocol.LAYER_DECAY_SPAN_OFF,
 ) -> dict[str, Any]:
     """The final campaign's config for `arm`, transferred from a tuned trial.
 
@@ -246,6 +247,11 @@ def final_config(
     # --set refuses a key the config lacks, so a decay that only appeared when
     # already enabled could never be turned on -- or OFF -- through it.
     config["layer_decay"] = float(layer_decay)
+    # Both are emitted, and the scripts refuse to receive both as non-default.
+    # A study tuned by span therefore transfers by span -- which is the only
+    # form that stays meaningful if the final run uses a different backbone
+    # from the one the search ran on.
+    config["layer_decay_span"] = float(layer_decay_span)
     config["enable_mlflow"] = enable_mlflow
     config["mlflow_experiment"] = mlflow_experiment
     if dump_every_k_evals is not None:
@@ -312,4 +318,7 @@ def best_config(study: Any, arm: str, **kwargs: Any) -> dict[str, Any]:
     # anything the search ever scored.
     kwargs.setdefault("layer_decay", float(
         trial.user_attrs.get("layer_decay", protocol.LAYER_DECAY_OFF)))
+    kwargs.setdefault("layer_decay_span", float(
+        trial.user_attrs.get("layer_decay_span",
+                             protocol.LAYER_DECAY_SPAN_OFF)))
     return final_config(arm, trial.params, effective_batch=int(batch), **kwargs)
