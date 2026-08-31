@@ -116,3 +116,24 @@ def test_it_configures_a_persistent_compilation_cache(text):
     # chunk), so one cache entry serves the whole campaign.
     assert "JAX_COMPILATION_CACHE_DIR" in text
     assert "mkdir -p" in text
+
+
+def test_the_job_forwards_the_layer_decay_span():
+    """A campaign spanning backbones passes a span, not a per-block factor.
+
+    Without this the span reaches the launcher and stops there, and the run
+    trains with no LLRD at all -- which looks like a successful campaign and
+    answers a different question.
+    """
+    body = SCRIPT.read_text()
+    assert "BLLARSE_FT_LAYER_DECAY_SPAN" in body
+    assert "--layer-decay-span" in body
+
+
+def test_span_and_per_block_decay_are_forwarded_independently():
+    # They are mutually exclusive at the script, so the job must not collapse
+    # one into the other or a caller setting only the span would get both.
+    body = SCRIPT.read_text()
+    span_at = body.index("--layer-decay-span")
+    decay_at = body.index('--layer-decay "')
+    assert span_at != decay_at

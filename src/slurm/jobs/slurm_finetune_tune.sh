@@ -181,6 +181,11 @@ fi
 if [[ -n "${BLLARSE_FT_EVAL_QUANTUM:-}" ]]; then
   worker_args+=(--eval-quantum "$BLLARSE_FT_EVAL_QUANTUM")
 fi
+if [[ -n "${BLLARSE_FT_LAYER_DECAY_SPAN:-}" ]]; then
+  # The SPAN, resolved by the training script against the backbone it loaded.
+  # Prefer this over a per-block decay for any campaign that spans backbones.
+  worker_args+=(--layer-decay-span "$BLLARSE_FT_LAYER_DECAY_SPAN")
+fi
 if [[ -n "${BLLARSE_FT_LAYER_DECAY:-}" ]]; then
   worker_args+=(--layer-decay "$BLLARSE_FT_LAYER_DECAY")
 fi
