@@ -198,7 +198,17 @@ check_backbone() {
   # JAX_PLATFORMS=cpu: this runs on a LOGIN node with no GPU, and initialising
   # the CUDA backend there aborts with a core dump rather than falling back.
   # The check only has to load weights, so the backend is irrelevant to it.
-  if HF_HOME="${BLLARSE_HF_HOME:-$HOME/.cache/huggingface}" \
+  # Thread caps, because this runs on a LOGIN node. XLA's CPU compiler sizes
+  # its pool from nproc -- 104 here -- and on the deeper backbones that trips
+  # the node's per-user thread limit: `LLVM ERROR: pthread_create failed:
+  # Resource temporarily unavailable`. dinov3_small squeaks under it and
+  # dinov3_large does not, so without this the guard passes on the backbone
+  # nobody needed it for and blocks the two that matter -- reporting a missing
+  # checkpoint when the weights are in fact cached. The check only loads
+  # weights, so one thread is plenty.
+  if OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+     XLA_FLAGS="--xla_force_host_platform_device_count=1" \
+     HF_HOME="${BLLARSE_HF_HOME:-$HOME/.cache/huggingface}" \
      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 JAX_PLATFORMS=cpu \
      PYTHONPATH="${repo_root}/src:${repo_root}/scripts/dinov3" \
      "$interp" -c "
