@@ -547,11 +547,18 @@ def test_layer_decay_crosses_from_user_attrs_into_the_config():
     the final run trains every block at 1.0x on hyperparameters selected under a
     0.032x-1.0x trunk: on dinov3_small at decay 0.75 the embeddings move 31x
     faster than anything the search ever scored.
+
+    It crosses as a SPAN, not as the per-block factor it was recorded as:
+    0.75 per block is 0.75^depth, and only the span means the same thing
+    on a trunk of a different depth. The quantity must survive the
+    transfer; its representation is allowed to change, and here it has to.
     """
     trial = FakeTrial(CE_BEST, effective_batch=512,
                       max_samples=TUNE_SAMPLES, layer_decay=0.75)
     config = fc.best_config(FakeStudy(trial), "ce")
-    assert config["layer_decay"] == pytest.approx(0.75)
+    depth = fs.trunk_depth(fs.TUNING_MODEL)
+    assert config["layer_decay_span"] == pytest.approx(0.75 ** depth)
+    assert config["layer_decay"] == protocol.LAYER_DECAY_OFF
 
 
 def test_a_study_tuned_without_llrd_transfers_it_off():
@@ -576,5 +583,68 @@ def test_layer_decay_reaches_the_emitted_flag():
     trial = FakeTrial(CE_BEST, effective_batch=512,
                       max_samples=TUNE_SAMPLES, layer_decay=0.75)
     argv = adapters.config_to_argv(fc.best_config(FakeStudy(trial), "ce"))
-    assert "--layer-decay" in argv
-    assert argv[argv.index("--layer-decay") + 1] == "0.75"
+    assert "--layer-decay-span" in argv
+    depth = fs.trunk_depth(fs.TUNING_MODEL)
+    assert float(argv[argv.index("--layer-decay-span") + 1]) == (
+        pytest.approx(0.75 ** depth))
+    # Both flags are emitted, but only one may be ON: finetune_jax refuses
+    # the pair, so the per-block flag has to arrive at its OFF value.
+    assert float(argv[argv.index("--layer-decay") + 1]) == (
+        protocol.LAYER_DECAY_OFF)
+
+
+# --- Legacy per-block decay must not cross a depth boundary -----------------
+
+
+class _LegacyTrial:
+    """A trial from before the span existed: per-block decay, no span."""
+    params = {"lr": 1e-5, "weight_decay": 1e-6, "q_init": 1e-4,
+              "num_update_iters": 512, "beta1_horizons": 148.0,
+              "beta2_horizons": 12.0}
+    user_attrs = {"effective_batch": 128, "max_samples": 100_000,
+                  "layer_decay": 0.75, "model": "dinov3_small"}
+
+
+class _SpanTrial:
+    params = dict(_LegacyTrial.params)
+    user_attrs = {"effective_batch": 128, "max_samples": 100_000,
+                  "layer_decay_span": 0.0316763515, "model": "dinov3_small"}
+
+
+class _Study:
+    def __init__(self, trial):
+        self.best_trial = trial
+
+
+def test_a_legacy_per_block_decay_is_converted_to_a_span():
+    """0.75 per block is a SPAN of 0.75^12, and only the span transfers.
+
+    Replayed unchanged on dinov3_huge (32 blocks) the same 0.75 would be a span
+    of 1.0e-4 -- 316x more damping, embeddings frozen in all but name, and
+    nothing raises. The conversion goes through the depth of the model the
+    trial was TUNED at, which the trial records.
+    """
+    cfg = fc.best_config(_Study(_LegacyTrial()), "ibprobit_noeps")
+    assert cfg["layer_decay"] == protocol.LAYER_DECAY_OFF
+    assert cfg["layer_decay_span"] == pytest.approx(0.75 ** 12)
+
+
+def test_a_trial_that_already_carries_a_span_passes_it_through():
+    cfg = fc.best_config(_Study(_SpanTrial()), "ibprobit_noeps")
+    assert cfg["layer_decay_span"] == pytest.approx(0.0316763515)
+    assert cfg["layer_decay"] == protocol.LAYER_DECAY_OFF
+
+
+def test_the_two_paths_agree_at_the_depth_they_were_tuned_at():
+    # The whole point: a legacy trial and a span trial describing the SAME run
+    # must produce the same final config.
+    legacy = fc.best_config(_Study(_LegacyTrial()), "ibprobit_noeps")
+    span = fc.best_config(_Study(_SpanTrial()), "ibprobit_noeps")
+    assert legacy["layer_decay_span"] == pytest.approx(span["layer_decay_span"])
+
+
+def test_an_unknown_backbone_is_refused_rather_than_guessed():
+    class Unknown(_LegacyTrial):
+        user_attrs = dict(_LegacyTrial.user_attrs, model="dinov3_gigantic")
+    with pytest.raises(KeyError, match="no trunk depth recorded"):
+        fc.best_config(_Study(Unknown()), "ibprobit_noeps")

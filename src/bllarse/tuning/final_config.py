@@ -316,9 +316,25 @@ def best_config(study: Any, arm: str, **kwargs: Any) -> dict[str, Any]:
     # at 1.0x -- on hyperparameters selected under a 0.032x-1.0x trunk. On
     # dinov3_small at 0.75 that is the embeddings moving 31x faster than
     # anything the search ever scored.
+    #
+    # A trial records ONE of the two. New trials carry `layer_decay_span`, which
+    # is depth-agnostic and transfers as-is. Trials from before 2026-08-31 carry
+    # only `layer_decay`, a PER-BLOCK factor, and that number does not survive a
+    # change of backbone: 0.75 is a span of 0.032 on a 12-block trunk and of
+    # 1.0e-4 on a 32-block one. Emitting it unchanged for a final run on a
+    # deeper model would train the embeddings 316x slower than anything the
+    # search ever scored -- and nothing would error.
+    #
+    # So a legacy per-block factor is converted through the depth of the model
+    # it was TUNED at, which the trial records.
+    span = trial.user_attrs.get("layer_decay_span")
+    decay = trial.user_attrs.get("layer_decay")
+    if span is None and decay is not None and float(decay) != protocol.LAYER_DECAY_OFF:
+        tuned_at = trial.user_attrs.get("model", space.TUNING_MODEL)
+        span = float(decay) ** space.trunk_depth(tuned_at)
+        decay = protocol.LAYER_DECAY_OFF
     kwargs.setdefault("layer_decay", float(
-        trial.user_attrs.get("layer_decay", protocol.LAYER_DECAY_OFF)))
+        protocol.LAYER_DECAY_OFF if decay is None else decay))
     kwargs.setdefault("layer_decay_span", float(
-        trial.user_attrs.get("layer_decay_span",
-                             protocol.LAYER_DECAY_SPAN_OFF)))
+        protocol.LAYER_DECAY_SPAN_OFF if span is None else span))
     return final_config(arm, trial.params, effective_batch=int(batch), **kwargs)

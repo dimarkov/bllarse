@@ -275,6 +275,39 @@ MICRO_BATCH: dict[str, dict[str, int]] = {
     "dinov3_huge": {"ce": 32, "ibprobit": 32, "vbll": 32},
 }
 
+# Trunk depth, in transformer blocks. Needed for exactly one thing: converting
+# a LEGACY per-block layer decay into the depth-agnostic SPAN that transfers.
+#
+# Trials from before 2026-08-31 recorded `layer_decay` (a per-block factor) and
+# no span, because the span did not exist yet. A per-block 0.75 means 0.75^12 at
+# depth 12 and 0.75^32 at depth 32 -- 316x more damping -- so replaying such a
+# trial's config on a different backbone silently trains a different model than
+# the one that was scored. `final_config.best_config` converts through this
+# table instead.
+#
+# Read off the backbones themselves; `submit_finetune_tune.sh`'s pre-flight
+# prints the same numbers ("OK dinov3_small 12 blocks") on every launch, which
+# is the check that keeps this table honest. It is NOT consulted at training
+# time -- finetune_jax reads the depth from the trunk it actually loaded.
+TRUNK_DEPTH: dict[str, int] = {
+    "dinov3_small": 12,
+    "dinov3_big": 12,
+    "dinov3_large": 24,
+    "dinov3_huge": 32,
+}
+
+
+def trunk_depth(model: str) -> int:
+    """The block count for `model`, or a refusal naming what is missing."""
+    try:
+        return TRUNK_DEPTH[model]
+    except KeyError:
+        raise KeyError(
+            f"no trunk depth recorded for {model!r}; known: "
+            f"{sorted(TRUNK_DEPTH)}. Add it from the launcher's pre-flight "
+            f"line ('OK <model> <n> blocks')."
+        ) from None
+
 # Pinned, not searched -- the ONE head axis the probing campaign transfers as a
 # value. Its per-dataset optima spanned 0.076 to 0.204, a 2.7x range across
 # five datasets; every other head knob spanned 30x to 2500x, which is wider
