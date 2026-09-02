@@ -302,7 +302,7 @@ for arm in $BLLARSE_FT_ARMS; do
   # so a budget without its batch searches a different space than it records.
   for var in BLLARSE_FT_MAX_SAMPLES BLLARSE_FT_MODEL BLLARSE_FT_BATCH \
              BLLARSE_FT_EVAL_QUANTUM BLLARSE_FT_LAYER_DECAY \
-             BLLARSE_FT_LAYER_DECAY_SPAN \
+             BLLARSE_FT_LAYER_DECAY_SPAN BLLARSE_FT_TRIALS_PER_PROC \
              BLLARSE_FT_PATIENCE; do
     [[ -n "${!var:-}" ]] && exports+=",${var}=${!var}"
   done

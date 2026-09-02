@@ -225,3 +225,14 @@ def test_the_dataset_check_reads_the_path_from_the_registry():
     assert "DATASET_CONFIGS" in TEXT
     assert "hf_path" in TEXT
     assert "ILSVRC/imagenet-1k" not in TEXT
+
+
+def test_it_forwards_the_per_process_trial_chunk():
+    """The size of the fresh-process chunk is a campaign setting, not a default.
+
+    The job script defaults it to 10, which is right for the ~22 min trials the
+    small rungs measured; a rung whose trials run hours wants a smaller chunk,
+    and a launcher that cannot set it would have to edit the job script to say
+    so.
+    """
+    assert "BLLARSE_FT_TRIALS_PER_PROC" in TEXT
