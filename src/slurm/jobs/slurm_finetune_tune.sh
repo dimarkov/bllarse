@@ -139,10 +139,10 @@ echo "[ft-tune] worker=${SLURM_ARRAY_TASK_ID:-0} arm=${BLLARSE_FT_ARM}" \
 # the 2M sample budget binds instead, and those call for opposite corrections.
 worker_args=(
   --arm "$BLLARSE_FT_ARM"
-  --n-trials "$BLLARSE_FT_TRIALS"
   --storage-dir "$storage_dir"
   --patience "${BLLARSE_FT_PATIENCE:-20}"
 )
+# --n-trials is NOT here: it is a per-CHUNK count now, appended at the bottom.
 # The depth the STUDY should reach, invariant to the prune rate. Without it the
 # first campaign searched the arms to depths nobody chose: the same 10 trials
 # per worker landed at 36 completions on ibprobit_noeps and 16 on vbll, because
@@ -190,4 +190,75 @@ if [[ -n "${BLLARSE_FT_LAYER_DECAY:-}" ]]; then
   worker_args+=(--layer-decay "$BLLARSE_FT_LAYER_DECAY")
 fi
 
-exec srun "$BLLARSE_FT_VENV" -m bllarse.tuning.finetune_worker "${worker_args[@]}"
+# ONE PROCESS PER CHUNK of trials, not one process for the whole worker.
+#
+# Every trial in a campaign asks for exactly the same memory -- the micro batch
+# is pinned (design A8) and the eval chunk is fixed -- so a trial that cannot
+# allocate at #32 when #1 could is not a bigger trial. The arena changed, not
+# the demand. That is measured, not assumed: on ft_ce_small100k all six workers
+# died, on six DIFFERENT nodes (ravg1017/1022/1096/...), at staggered wall-clock
+# times two hours apart, after 32, 33 and 39 trials each -- every one of them
+# failing on the same 6.55 GiB in jit_ce_micro_grad. A node-level or
+# cluster-level cause cannot produce that pattern; a per-process one does. It
+# cost 28 of that arm's 273 trials, and Optuna recorded most of them as
+# "no evaluation ran", which reads like a config bug rather than an OOM.
+#
+# A fresh process gets a fresh BFC arena. The compilation cache above is
+# persistent and shared, so the restart pays a process start (~20 s) rather
+# than a recompile: at a ~22 min median trial, chunking at 10 costs ~0.4% to
+# retire a failure mode that cost ~10% of the study.
+#
+# Deliberately NOT the other two candidates: XLA_PYTHON_CLIENT_ALLOCATOR=platform
+# collides with CUDA-graph capture (see the XLA_FLAGS comment above, which
+# measured a 2.2x tax for disabling command buffers), and raising
+# XLA_PYTHON_CLIENT_MEM_FRACTION only buys headroom -- it delays a leak instead
+# of clearing it, and cannot tell the two apart.
+chunk="${BLLARSE_FT_TRIALS_PER_PROC:-10}"
+remaining="$BLLARSE_FT_TRIALS"
+failed_chunks=0
+chunk_log="$(mktemp)"
+trap 'rm -f "$chunk_log"' EXIT
+
+while (( remaining > 0 )); do
+  n=$(( remaining < chunk ? remaining : chunk ))
+  echo "[ft-tune] chunk of $n trials in a fresh process" \
+       "($remaining of $BLLARSE_FT_TRIALS left on this worker)"
+
+  # tee, not a redirect: a trial runs ~22 min and PYTHONUNBUFFERED above exists
+  # so the log is live. PIPESTATUS, not $?, because $? is tee's.
+  set +e
+  srun "$BLLARSE_FT_VENV" -m bllarse.tuning.finetune_worker \
+       "${worker_args[@]}" --n-trials "$n" 2>&1 | tee "$chunk_log"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  # The study reached its depth while this worker was mid-budget. Release the
+  # GPU instead of starting chunks that would each pay a process start to
+  # discover the same thing. The token is printed by finetune_worker.main and
+  # exists FOR this grep -- keep the two in step.
+  if grep -q "TARGET-MET" "$chunk_log"; then
+    echo "[ft-tune] study is at its target depth; releasing the GPU."
+    break
+  fi
+
+  if (( rc != 0 )); then
+    failed_chunks=$(( failed_chunks + 1 ))
+    if (( failed_chunks >= 2 )); then
+      # Two fresh arenas in a row cannot both be fragmented. Something is
+      # actually wrong with the arm, and abort_on_consecutive_failures has
+      # already burned a run of trials proving it -- stop rather than spend
+      # the rest of the budget confirming it a third time.
+      echo "[ft-tune] ERROR: two consecutive chunks failed (rc=$rc);" \
+           "this is not fragmentation." >&2
+      exit "$rc"
+    fi
+    echo "[ft-tune] chunk failed (rc=$rc); restarting once in a fresh process." >&2
+  else
+    failed_chunks=0
+  fi
+
+  # Decremented by the chunk SIZE even when the chunk died early. The worker
+  # cap is a bound on GPU time, not a quota to be made up; --target-complete
+  # governs how deep the study actually goes.
+  remaining=$(( remaining - n ))
+done

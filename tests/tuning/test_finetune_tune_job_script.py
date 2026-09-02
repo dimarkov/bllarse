@@ -137,3 +137,57 @@ def test_span_and_per_block_decay_are_forwarded_independently():
     span_at = body.index("--layer-decay-span")
     decay_at = body.index('--layer-decay "')
     assert span_at != decay_at
+
+
+# --- The arena that fragments across a long campaign ------------------------
+
+
+def test_it_runs_the_worker_in_chunks_rather_than_one_long_process(text):
+    """The OOM that cost 28 of ft_ce_small100k's 273 trials.
+
+    Every trial in a campaign asks for identical memory -- the micro batch is
+    pinned and the eval chunk is fixed -- so a trial that cannot allocate at #32
+    when #1 could is a fragmented arena, not a bigger trial. All six workers of
+    that study died, on six different nodes, at wall-clock times two hours
+    apart, after 32/33/39 trials, on the same 6.55 GiB in jit_ce_micro_grad.
+    Only a per-process cause fits that pattern, and only a fresh process clears
+    it.
+    """
+    assert "BLLARSE_FT_TRIALS_PER_PROC" in text
+    # The whole worker budget must NOT reach one process any more.
+    assert '--n-trials "$BLLARSE_FT_TRIALS"' not in text
+    assert '--n-trials "$n"' in text
+    assert "while (( remaining > 0 )); do" in text
+
+
+def test_the_chunk_loop_cannot_be_an_exec(text):
+    # `exec` replaces the shell: with it there is no loop to come back to, and
+    # the restart silently becomes a no-op.
+    assert "exec srun" not in text
+
+
+def test_it_reads_the_chunk_exit_code_from_pipestatus(text):
+    # The worker is piped through tee to keep the log live during a ~22 min
+    # trial, so `$?` is tee's status and would report every failed chunk as a
+    # success.
+    assert "PIPESTATUS[0]" in text
+
+
+def test_it_stops_starting_chunks_once_the_study_is_at_depth(text):
+    """Otherwise every remaining chunk pays a process start to learn nothing.
+
+    The token is printed by finetune_worker.main; the two are coupled on
+    purpose and there is a test on the worker side naming this one.
+    """
+    assert 'grep -q "TARGET-MET"' in text
+    assert "break" in text
+
+
+def test_two_consecutive_failed_chunks_end_the_job(text):
+    """A restart is the remedy for fragmentation, not for a broken arm.
+
+    Two fresh arenas in a row cannot both be fragmented, and
+    abort_on_consecutive_failures has already burned a run of trials proving
+    it, so the budget must not be spent confirming it a third time.
+    """
+    assert "failed_chunks >= 2" in text

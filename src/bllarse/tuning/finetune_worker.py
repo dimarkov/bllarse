@@ -566,8 +566,14 @@ def main() -> None:
     if args.target_complete is not None:
         already = n_completed(study)
         if already >= args.target_complete:
-            print(f"[ft-tune] {study.study_name}: {already} completed "
-                  f">= target {args.target_complete}, nothing to do.")
+            # TARGET-MET is a machine token, not decoration: the SLURM job
+            # script runs this worker in CHUNKS of trials -- a fresh process per
+            # chunk, to clear the arena that fragments across a long campaign --
+            # and greps for it to stop starting chunks that would each pay a
+            # process start to rediscover the study is done. Keep the two in
+            # step; slurm_finetune_tune.sh names this line.
+            print(f"[ft-tune] TARGET-MET {study.study_name}: {already} "
+                  f"completed >= target {args.target_complete}, nothing to do.")
             return
         print(f"[ft-tune] {study.study_name}: {already} completed, "
               f"target {args.target_complete}, cap {args.n_trials} this worker.")

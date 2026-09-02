@@ -427,3 +427,20 @@ def test_the_span_reaches_the_scripts_config(monkeypatch):
 
 class _Stop(Exception):
     pass
+
+
+def test_the_target_met_line_carries_the_token_the_job_script_greps():
+    """A machine token, not decoration -- and coupled across two files.
+
+    The SLURM job script runs this worker in chunks (a fresh process per chunk,
+    to clear the arena that fragments across a long campaign) and greps this
+    line to stop starting chunks once the study is at depth. Renaming the
+    message without the script would leave a worker paying a process start per
+    remaining chunk to rediscover it has nothing to do.
+    """
+    src = Path(fw.__file__).read_text()
+    assert "TARGET-MET" in src
+
+    job = (Path(__file__).resolve().parents[2]
+           / "src/slurm/jobs/slurm_finetune_tune.sh").read_text()
+    assert "TARGET-MET" in job
