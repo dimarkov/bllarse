@@ -73,7 +73,22 @@ export BLLARSE_FT_TRIALS=60
 export BLLARSE_FT_TRIALS_PER_PROC=10
 export BLLARSE_FT_VENV="/ptmp/${USER}/venv_ft/bin/python"
 export BLLARSE_FT_VBLL_VENV="/ptmp/${USER}/venv_vbll_ft/bin/python"
-export BLLARSE_EVAL_DUMP_ROOT="/ptmp/${USER}/eval_dumps"
+# NO BLLARSE_EVAL_DUMP_ROOT, deliberately. A tuning trial does not need its
+# dumps: `finetune_worker.on_dump` computes the objective from the in-loop
+# scalars and says in its own comment that it does NOT read the value back off
+# the dump (the run evaluates val only, and a dump round-trips through fp16).
+# Optuna keeps the full per-trial val_nll trajectory in `intermediate_values`,
+# so the curves survive in the journal either way. The only consumer of the
+# files is scripts/plotting/plot_tuning_optima.py, a stopgap for "the final
+# campaign has not run yet" that is in no figure of the results plan.
+#
+# What they cost is real: /raven/ptmp filled cluster-wide on 2026-09-03 and 27
+# trials across five studies died inside a single hour with
+# OSError(28, 'No space left on device') -- always in on_dump, never in the
+# training step. At the top rungs a lost trial is ~2.8 h.
+#
+# Set BLLARSE_EVAL_DUMP_ROOT in the environment to turn them back on for a
+# campaign that actually wants them; submit_finetune_tune.sh still forwards it.
 export BLLARSE_HF_HOME="/ptmp/${USER}/hf_cache"
 export BLLARSE_FT_SHARDS="/ptmp/${USER}/shards"
 

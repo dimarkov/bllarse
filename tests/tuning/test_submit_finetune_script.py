@@ -236,3 +236,25 @@ def test_it_forwards_the_per_process_trial_chunk():
     so.
     """
     assert "BLLARSE_FT_TRIALS_PER_PROC" in TEXT
+
+
+def test_the_ladder_launcher_does_not_write_tuning_dumps():
+    """A tuning trial's dumps are unread, and on a full filesystem they are fatal.
+
+    finetune_worker computes the objective from the in-loop scalars and says so
+    -- it never reads the value back off the dump -- and Optuna keeps each
+    trial's whole val_nll trajectory in `intermediate_values`. On 2026-09-03,
+    with /raven/ptmp full cluster-wide, 27 trials across five studies died in
+    one hour with OSError(28) raised inside on_dump, none of them in a training
+    step.
+
+    The variable is still FORWARDED by the submit script, so a campaign that
+    wants the files can set it; the launcher simply does not.
+    """
+    launcher = (Path(__file__).resolve().parents[2]
+                / "src/slurm/launch_ladder.sh").read_text()
+    active = "\n".join(line for line in launcher.splitlines()
+                       if not line.lstrip().startswith("#"))
+    assert "BLLARSE_EVAL_DUMP_ROOT" not in active
+    # ... but the plumbing that would carry it must still exist.
+    assert "BLLARSE_EVAL_DUMP_ROOT" in TEXT
