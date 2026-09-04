@@ -272,7 +272,34 @@ MICRO_BATCH: dict[str, dict[str, int]] = {
     # which is the check that matters: the micro batch is a MEMORY artefact
     # and must not move the arithmetic. A gap larger than accumulation-order
     # noise would mean it does.
-    "dinov3_huge": {"ce": 32, "ibprobit": 32, "vbll": 32},
+    #
+    # The JAX arms are 16, not 32, MEASURED 2026-09-04 by running the real
+    # training script on an A100-40GB rather than the probe (which builds a
+    # two-group optimizer and has no --layer-decay-span, so it no longer
+    # measures what the run executes):
+    #
+    #   micro 32, LLRD on  -> OOM, 13.77 GiB in jit_ce_micro_grad
+    #   micro 32, LLRD OFF -> OOM, 13.77 GiB -- the SAME failure
+    #   micro 16, LLRD on  -> runs, 76.60 img/s
+    #   micro  8, LLRD on  -> runs, 61.51 img/s
+    #
+    # The LLRD-off control is why 32 is retired rather than made conditional:
+    # it was the obvious suspect (33 optax groups on a 32-block trunk) and it
+    # is not the cause. 32 simply does not fit on this card.
+    #
+    # 16 over 8 because it is 25% faster and the arithmetic is identical --
+    # val_nll 6.3554 against 6.3555 on the same data, which is the check that
+    # matters: the micro batch is a MEMORY artefact and must not move the
+    # numbers. Accumulation absorbs the change (512 = 32 x 16), so the FLOPs
+    # per optimizer step are unchanged; only the launch count moves.
+    #
+    # UNEXPLAINED, and worth a bisect when the cluster is quiet: MLflow records
+    # the ftfinal huge campaign -- 3 arms x 5 seeds, 4 full epochs -- running at
+    # micro 32 / batch 512 with layer_decay=None, on this same hardware. That
+    # configuration is exactly the LLRD-off control above, and it now OOMs. If
+    # something regressed, dinov3_large's 32 may be nearer its edge than it
+    # looks.
+    "dinov3_huge": {"ce": 16, "ibprobit": 16, "vbll": 32},
 }
 
 # Trunk depth, in transformer blocks. Needed for exactly one thing: converting

@@ -101,11 +101,22 @@ def test_the_pinned_micro_batch_matches_the_full_step_measurement():
     # That distinction cost a campaign launch once: an isolated micro-grad
     # measurement reported 64 for the JAX arms and the real loop OOMed at 32.
     #
-    # JAX arms: 32, 64 OOMs. Cross-checks against micro=16 having run on a
-    # 32 GB card -- ~13.5 GB of fixed state plus activations scaling about
-    # linearly means 16 fits 32 GB and 32 fits 40 GB while 64 does not.
-    assert fs.MICRO_BATCH["dinov3_huge"]["ce"] == 32
-    assert fs.MICRO_BATCH["dinov3_huge"]["ibprobit"] == 32
+    # The JAX arms on dinov3_huge are 16, and the 32 they used to carry was an
+    # EXTRAPOLATION, not a measurement: "16 fits a 32 GB card, ~13.5 GB of
+    # fixed state plus roughly linear activations, so 32 fits 40 GB". Run
+    # directly on the 40 GB card on 2026-09-04 it does not:
+    #
+    #   micro 32, LLRD on  -> OOM, 13.77 GiB in jit_ce_micro_grad
+    #   micro 32, LLRD OFF -> OOM, 13.77 GiB -- the SAME failure, which is what
+    #                         rules LLRD out as the cause
+    #   micro 16, LLRD on  -> runs, 76.60 img/s
+    #   micro  8, LLRD on  -> runs, 61.51 img/s
+    #
+    # 320 trials of huge400k died on that extrapolation before anyone ran the
+    # step it predicted. 16 over 8 because it is 25% faster and the arithmetic
+    # is identical: val_nll 6.3554 against 6.3555 on the same data.
+    assert fs.MICRO_BATCH["dinov3_huge"]["ce"] == 16
+    assert fs.MICRO_BATCH["dinov3_huge"]["ibprobit"] == 16
     # vbll: 64 on the same A100, measured the same way (132.1 img/s against
     # 130.0 at 32 and 87.6 at 16). Twice the JAX value because PyTorch frees
     # activations eagerly as the backward consumes them, where the JAX arms
