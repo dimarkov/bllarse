@@ -57,13 +57,19 @@ export BLLARSE_FT_EVAL_QUANTUM=2048
 # the same factor rather than by the same per-block ratio. A rung may override
 # it; 1.0 is the span that means "no LLRD at all".
 DEFAULT_SPAN=0.0316763515
-export BLLARSE_FT_TARGET_COMPLETE=90
-# 16 x 60 = 960 trial SLOTS per arm to buy 90 COMPLETED trials, because the
-# pruner takes most of them: the small rung completed 24% of CE's trials and
-# 17% of VBLL's, so 90 completions need ~370 and ~520 starts respectively. A
-# 320-slot budget would have stalled VBLL at roughly half depth and looked like
-# a finished campaign. Workers past the target exit on TARGET-MET without
-# taking a trial, so the slack is free.
+export BLLARSE_FT_TARGET_COMPLETE=50
+# 50, down from 90. `tuning-search-saturates-at-n40` measured the incumbent
+# stopping improving by ~40 completions on every arm of the last campaign, so 90
+# was roughly 2x over-provisioned. The saving pays for the pruner warmup moving
+# from 10 evaluations to 30% of the run (finetune_worker.PRUNER_WARMUP_FRACTION),
+# which triples what a pruned trial costs: 50 completions at the new warmup is
+# close to the same GPU-hours as 90 at the old one. The two constants were
+# changed together and should move together.
+#
+# 16 x 60 = 960 trial SLOTS per arm remains the cap, not the plan: the pruner
+# takes most trials (the small rung completed 24% of CE's and 17% of VBLL's),
+# and workers past the target exit on TARGET-MET without taking a trial, so
+# leaving the slack in place costs nothing and covers a worse prune rate.
 export BLLARSE_FT_WORKERS=16
 export BLLARSE_FT_THROTTLE=6
 export BLLARSE_FT_TRIALS=60
@@ -127,8 +133,26 @@ rung_small512() { CAMPAIGN=small400kb512 MODEL=dinov3_small BATCH=512 ARMS='ce i
 # every other respect, so the pair isolates it. SPAN=1.0 is LLRD off.
 rung_smallnollrd() { CAMPAIGN=small100knollrd MODEL=dinov3_small BATCH=128 ARMS='ce ibprobit_noeps' SAMPLES=100000 SPAN=1.0; }
 rung_big()      { CAMPAIGN=big200k       MODEL=dinov3_big   BATCH=256 ARMS="$ALL_ARMS"; }
-rung_large()    { CAMPAIGN=large400k     MODEL=dinov3_large BATCH=512 ARMS="$ALL_ARMS"; }
-rung_huge()     { CAMPAIGN=huge400k      MODEL=dinov3_huge  BATCH=512 ARMS="$ALL_ARMS"; }
+# v2, 2026-09-09: NEW STUDY NAMES, not a resume. `open_study` passes
+# load_if_exists=True, so reusing `large400k` would either raise on the changed
+# num_update_iters distribution or -- worse -- silently mix trials scored by two
+# different objectives. Four things changed and every one of them redefines what
+# a trial MEANS, so the old journals stay frozen as history:
+#
+#   1. q_init now transfers by protocol.transfer's q0 ~ T^-2 rule instead of by
+#      identity. The tuned value is unchanged; what it becomes at the reported
+#      horizon is not. This is the fix for the search picking q ~ 1.3e-3, which
+#      is two decades high at 2 epochs.
+#   2. num_update_iters is PINNED at 256 rather than searched over five rungs --
+#      measured to be within 0.001 val_nll of 128 once q is right, and collapsed
+#      to a single value across the last campaign's 20 best trials anyway.
+#   3. The pruner's warmup is 30% of the run, not a flat 10 evaluations (0.8% of
+#      samples), which was selecting FOR the early-dip-then-climb signature of a
+#      too-large q0.
+#   4. The objective is the mean of the last 5 evaluations, not the running
+#      argmin, so a config has to still be good at the end to win.
+rung_large()    { CAMPAIGN=large400kv2   MODEL=dinov3_large BATCH=512 ARMS="$ALL_ARMS"; }
+rung_huge()     { CAMPAIGN=huge400kv2    MODEL=dinov3_huge  BATCH=512 ARMS="$ALL_ARMS"; }
 
 launch() {
   local rung="$1"

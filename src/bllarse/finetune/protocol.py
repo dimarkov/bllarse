@@ -508,8 +508,9 @@ def transfer(
     """Rescale one tuned config to a new (batch, duration) operating point.
 
     Scales `lr`, `head_lr` and `weight_decay` by sqrt(m_B / m_D), `eps` by its
-    inverse, sets `beta1`/`beta2` from `betas_for`, and sets `batch_size` to
-    `to_batch`. Every other key passes through untouched.
+    inverse, sets `beta1`/`beta2` from `betas_for`, scales `q_init` by
+    (from_steps / to_steps)^2, and sets `batch_size` to `to_batch`. Every other
+    key passes through untouched.
 
     `head_lr_ratio` is deliberately among the untouched: trunk and head rates
     take the SAME factor on the batch axis, the duration axis and (under
@@ -559,6 +560,38 @@ def transfer(
         betas=betas,
         from_steps=steps_for_samples(from_samples, from_batch),
     )
+
+    # The DURATION axis for q0, which the batch guard above deliberately left
+    # open. MEASURED 2026-09-08/09: a 7-point q_init grid (one decade apart,
+    # 1.29e-7 .. 1.29e-2) run at three horizons on dinov3_large with every
+    # other coordinate frozen puts the optimum at
+    #
+    #   781 steps -> 1.29e-4     2502 -> 1.29e-5     5004 -> 1.29e-6
+    #
+    # i.e. one decade down per 3.2x of horizon. Fitting p in q0 ~ T^-p gives
+    # p = 1.98 at the middle point; p = 1 predicts 4.03e-5 there against a
+    # measured 1.29e-5, and the curve at that value is 0.008 val_nll worse, so
+    # p = 1 is excluded. p = 2 predicts 3.15e-6 at 5004, which falls between the
+    # two best grid points there (0.4273 and 0.4285, indistinguishable).
+    #
+    # The Kalman reading predicts the exponent rather than fitting it: for a
+    # random walk plus observation the steady state gives P ~ sqrt(QR), so the
+    # effective memory is L ~ 1/sqrt(q0), and holding memory at a fixed fraction
+    # of the run gives q0 ~ 1/T^2 directly. alpha ~ 1/T equivalently.
+    #
+    # Why this is not optional. q_init was the last tuned coordinate still
+    # transferring by IDENTITY, and the cost of that was the campaign's headline
+    # negative result: the 4-epoch runs used q ~ 5.35e-5 at T = 10008, where the
+    # rule puts the optimum at 7.9e-7 -- 68x high, inside the regime where the
+    # val curve peaks at ~45% of the run and then climbs. At the corrected value
+    # IBProbit leads both baselines on test NLL at large/2ep instead of trailing
+    # them. See the `qgrid` and `qsweep` dump groups.
+    if "q_init" in out:
+        out["q_init"] = out["q_init"] * (
+            steps_for_samples(from_samples, from_batch)
+            / steps_for_samples(to_samples, to_batch)
+        ) ** 2
+
     out["batch_size"] = to_batch
     return out
 

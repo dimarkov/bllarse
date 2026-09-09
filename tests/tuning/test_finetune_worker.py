@@ -188,7 +188,24 @@ def test_pruner_engages_far_earlier_than_the_probing_one():
     # 20 was a fifth of ~80 probing trials; at ~30 trials it would barely
     # engage, and pruning is where the saving is at ~6 h a trial.
     assert fw.PRUNER_STARTUP_TRIALS == 5
-    assert fw.PRUNER_WARMUP_EVALS == 10
+
+
+def test_the_pruner_warmup_is_a_fraction_of_the_run_not_a_flat_count():
+    # A flat 10 was 5% of the large rung's evaluations and 0.8% of its samples,
+    # and it is ANTI-informative on this head: the two trials in the
+    # horizon-transfer test whose argmin fell at eval 11 of 78 were the worst
+    # two at the endpoint, because an early dip then a climb is what a
+    # too-large q0 does. A fraction survives a change of eval_quantum.
+    assert 0.2 <= fw.PRUNER_WARMUP_FRACTION <= 0.5
+    # It must still leave room for the pruner to fire at all.
+    assert fw.PRUNER_WARMUP_FRACTION * space.eval_count() < space.eval_count()
+
+
+def test_the_objective_averages_a_tail_rather_than_taking_the_argmin():
+    # The running argmin rewards a config that dips low and then leaves, which
+    # is exactly what q0 two decades high does on this head.
+    assert fw.TAIL_EVALS >= 3
+    assert fw.TAIL_EVALS < space.eval_count()
 
 
 def test_patience_is_on_and_can_actually_fire():

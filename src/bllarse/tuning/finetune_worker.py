@@ -9,8 +9,10 @@ ImageNet-1k only.
 """
 
 import argparse
+import collections
 import math
 import os
+import statistics
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -107,7 +109,26 @@ SCRIPTS = {
 # 5, not probing's 20. Twenty was a fifth of ~80 probing trials; at ~30 trials
 # it would barely engage, and pruning is where the saving is at ~6 h a trial.
 PRUNER_STARTUP_TRIALS = 5
-PRUNER_WARMUP_EVALS = 10
+
+# A FRACTION of the trial's evaluations, resolved against the campaign's actual
+# eval count in `main`, replacing a flat 10.
+#
+# Ten was 5% of the large rung's 195 evaluations and 0.8% of its samples, and
+# the campaign diagnosis showed the pruner firing at exactly the median eval 10
+# for every arm -- so nine trials in ten were judged on the first 0.8% of their
+# trajectory. That is not merely uninformative, it is ANTI-informative on this
+# head: in the horizon-transfer test (job 30075352) the two trials whose 2-epoch
+# argmin fell at eval 11 of 78 were the WORST two at the endpoint (0.4850 and
+# 0.4900 against 0.4259 for the best), because an early dip followed by a climb
+# is the signature of a too-large q0. Pruning on eval 10 therefore SELECTS for
+# the failure mode this campaign exists to avoid, which is a large part of why
+# TPE collapsed onto q ~ 1.3e-3 and stayed there.
+#
+# 0.30 rather than 0.5: a pruned trial now costs ~30% of a full one instead of
+# ~8%, roughly tripling the price of a prune, and the campaign pays for that by
+# targeting 50 completions instead of 90 (see launch_ladder.sh). The two changes
+# are close to cost-neutral together and must move together.
+PRUNER_WARMUP_FRACTION = 0.30
 
 # Consecutive evaluations with no relative improvement in val_nll (the
 # threshold is objective.DEFAULT_MIN_RELATIVE_IMPROVEMENT, now 1e-4).
@@ -138,6 +159,13 @@ PRUNER_WARMUP_EVALS = 10
 # what was too tight; see DEFAULT_MIN_RELATIVE_IMPROVEMENT.
 PATIENCE = 20
 WARMUP_EVALS = 10
+
+# Evaluations averaged to score a trial. Five, because the per-eval noise on
+# val_nll is ~0.004 sd at this rung and the mean of five brings that to ~0.0018
+# -- below the separation the search has to resolve -- while still being short
+# enough that a trial stopped by patience is scored on its plateau rather than
+# on its approach to it.
+TAIL_EVALS = 5
 
 # Every trial evaluates val ONLY. The objective is val_nll, and forwarding the
 # test partition at every evaluation would cost as much again for a number
@@ -218,7 +246,13 @@ def study_name(arm: str, campaign: str | None = None) -> str:
     return base if campaign is None else f"{base}_{campaign}"
 
 
-def open_study(arm: str, storage_dir: Any, campaign: str | None = None) -> optuna.Study:
+def open_study(
+    arm: str,
+    storage_dir: Any,
+    campaign: str | None = None,
+    *,
+    warmup_evals: int,
+) -> optuna.Study:
     """Load or create this (arm, campaign)'s study.
 
     JournalStorage on JournalFileBackend, not SQLite: SQLite over GPFS with
@@ -236,7 +270,7 @@ def open_study(arm: str, storage_dir: Any, campaign: str | None = None) -> optun
         sampler=TPESampler(),
         pruner=MedianPruner(
             n_startup_trials=PRUNER_STARTUP_TRIALS,
-            n_warmup_steps=PRUNER_WARMUP_EVALS,
+            n_warmup_steps=warmup_evals,
         ),
         load_if_exists=True,
     )
@@ -413,12 +447,23 @@ def make_objective(
         # else in the trial distinguishes the two.
         trial.set_user_attr("train_shards", config.get("train_shards", ""))
 
-        # The objective IS this minimum -- see objective.evaluate's `score`
-        # note. Tracked here rather than read back off the dump because the
-        # run evaluates val only, so there is no test dump for run_curve to
-        # read, and because the in-loop value is fp32 while a dump round-trips
+        # Tracked here rather than read back off the dump because the run
+        # evaluates val only, so there is no test dump for run_curve to read,
+        # and because the in-loop value is fp32 while a dump round-trips
         # through fp16.
+        #
+        # The OBJECTIVE is `tail`, not `best`. `best` is the running argmin, and
+        # it rewards a config that dips low early and then leaves -- which is
+        # exactly what a too-large q0 does on this head: at 2 epochs every
+        # q >= 1.29e-4 peaks at ~45% of the run and climbs, while every
+        # q <= 1.29e-5 is monotone to the endpoint. Scoring the argmin makes
+        # those two look equivalent, and the reported run then early-stops at a
+        # point the search never had to defend.
+        #
+        # `best` is still recorded as a user attr, so the two are comparable on
+        # the existing journals and no history is lost.
         seen = {"total": 0, "argmin": 0, "best": math.inf}
+        tail: collections.deque[float] = collections.deque(maxlen=TAIL_EVALS)
 
         def on_dump(
             eval_index: int, step: int, samples_seen: int,
@@ -428,8 +473,13 @@ def make_objective(
             value = float(scalars["val_nll"])
             # `isfinite`, not a bare `<`: a nan adopted as the best would make
             # every later comparison False and latch the argmin forever.
-            if math.isfinite(value) and value < seen["best"]:
-                seen["best"], seen["argmin"] = value, eval_index
+            if math.isfinite(value):
+                # Non-finite values are dropped rather than appended: a nan in
+                # the window would make the mean nan and rank a diverged trial
+                # as incomparable rather than bad.
+                tail.append(value)
+                if value < seen["best"]:
+                    seen["best"], seen["argmin"] = value, eval_index
             # Reported on the EVAL INDEX, never the optimizer step. Trials vary
             # batch_size, so raw steps would rarely collide and MedianPruner
             # would silently never have a cohort. The eval index is uniformly
@@ -455,7 +505,11 @@ def make_objective(
             keep_dumps=keep_dumps,
             seeds=(space.TUNING_SEED,),
             scripts=SCRIPTS,
-            score=lambda root, group, uids: seen["best"],
+            # An empty tail means every evaluation was non-finite: infinity is
+            # the right score for that, and matches what `best` would have been.
+            score=lambda root, group, uids: (
+                statistics.fmean(tail) if tail else math.inf
+            ),
         )
 
         trial.set_user_attr("patience_stopped", bool(stopped_at))
@@ -464,6 +518,9 @@ def make_objective(
             {str(seed): index for seed, index in stopped_at.items()},
         )
         trial.set_user_attr("argmin_eval", seen["argmin"])
+        # The old objective, kept so this campaign's trials stay comparable
+        # with the journals that scored on it.
+        trial.set_user_attr("best_val_nll", seen["best"])
         trial.set_user_attr("total_evals", seen["total"])
         # A trial whose argmin IS its last evaluation never converged: it was
         # still improving when the budget ran out. Many of these means
@@ -557,7 +614,15 @@ def main() -> None:
             f"{args.patience}). Lower --eval-quantum, or --patience."
         )
 
-    study = open_study(args.arm, args.storage_dir, args.campaign)
+    # The pruner's warmup is a FRACTION of this campaign's evaluations, so a
+    # rung that changes eval_quantum or max_samples does not silently change
+    # how much of a trial the pruner has seen before it may fire.
+    warmup = max(1, round(PRUNER_WARMUP_FRACTION * n_evals))
+    print(f"[ft-tune] pruner warmup {warmup} of {n_evals} evaluations "
+          f"({PRUNER_WARMUP_FRACTION:.0%}); objective = mean of the last "
+          f"{TAIL_EVALS}", flush=True)
+    study = open_study(
+        args.arm, args.storage_dir, args.campaign, warmup_evals=warmup)
     group_id = f"fttune_{study_name(args.arm, args.campaign)}"
 
     # Checked BEFORE the first trial, so re-running a finished submission costs

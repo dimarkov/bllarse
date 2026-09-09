@@ -199,16 +199,42 @@ def test_unrecognised_keys_pass_through_untouched():
 def test_it_refuses_to_move_q_init_across_a_batch_change():
     """q0 = alpha^2 / B is IBProbit's OWN batch relation.
 
-    Two rules claim the same axis and there is no evidence for which wins, so a
-    batch change on a config carrying q_init raises. A duration-only transfer
-    is unaffected, which is the case that actually runs.
+    Two rules claim the BATCH axis and there is no evidence for which wins, so
+    a batch change on a config carrying q_init still raises. The duration axis
+    is a separate question and is now answered -- see the test below.
     """
     with_q = {**TUNED, "q_init": 3.72e-5}
-    assert _to_final(with_q)["q_init"] == 3.72e-5  # duration only: fine
     with pytest.raises(ValueError, match="q_init"):
         protocol.transfer(
             with_q, from_samples=TUNE_SAMPLES, from_batch=512,
             to_samples=TUNE_SAMPLES, to_batch=1024)
+
+
+def test_it_scales_q_init_by_the_inverse_square_of_the_horizon():
+    """q0 ~ T^-2, measured at three horizons on dinov3_large.
+
+    A 7-point grid one decade apart put the optimum at 1.29e-4 / 1.29e-5 /
+    1.29e-6 at 781 / 2502 / 5004 steps -- one decade per 3.2x. Before this rule
+    q_init transferred by IDENTITY, which left the 4-epoch campaign running ~68x
+    above its horizon's optimum.
+    """
+    with_q = {**TUNED, "q_init": 1.292e-4}
+    out = _to_final(with_q)
+    from_steps = protocol.steps_for_samples(TUNE_SAMPLES, 512)
+    to_steps = protocol.steps_for_samples(FOUR_EPOCH_SAMPLES, 512)
+    assert out["q_init"] == pytest.approx(
+        1.292e-4 * (from_steps / to_steps) ** 2)
+    # The direction matters more than the constant: a longer run wants LESS
+    # process noise, because the head has more steps to drift over.
+    assert out["q_init"] < with_q["q_init"]
+
+
+def test_the_q_rule_is_an_identity_when_the_duration_does_not_change():
+    with_q = {**TUNED, "q_init": 3.72e-5}
+    out = protocol.transfer(
+        with_q, from_samples=TUNE_SAMPLES, from_batch=512,
+        to_samples=TUNE_SAMPLES, to_batch=512)
+    assert out["q_init"] == pytest.approx(3.72e-5)
 
 
 @pytest.mark.parametrize("kwargs", [

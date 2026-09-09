@@ -182,9 +182,9 @@ def test_both_ibprobit_arms_share_one_micro_batch(monkeypatch):
     ("ce", {"lr", "weight_decay", "head_lr_ratio", "beta1", "beta2"}),
     ("vbll", {"lr", "weight_decay", "head_lr_ratio", "kl_ratio",
               "prior_scale", "beta1", "beta2"}),
-    ("ibprobit", {"lr", "weight_decay", "q_init", "num_update_iters",
+    ("ibprobit", {"lr", "weight_decay", "q_init",
                   "eps_init", "beta1", "beta2"}),
-    ("ibprobit_noeps", {"lr", "weight_decay", "q_init", "num_update_iters",
+    ("ibprobit_noeps", {"lr", "weight_decay", "q_init",
                         "beta1", "beta2"}),
 ])
 def test_each_arm_searches_exactly_its_own_axes(arm, expected):
@@ -193,9 +193,12 @@ def test_each_arm_searches_exactly_its_own_axes(arm, expected):
     # `expected` names the RETURNED keys, which are the training scripts'
     # flags. Two of them are searched under a different name -- see SEARCHED.
     assert set(trial.axes) == {SEARCHED.get(name, name) for name in expected}
-    # batch_size is emitted but not SEARCHED, so params carries exactly one
-    # key the axes do not.
-    assert set(params) == expected | {"batch_size"}
+    # batch_size is emitted but not SEARCHED; the ibprobit arms also carry a
+    # pinned num_update_iters. Both are params the axes deliberately lack.
+    pinned = {"batch_size"}
+    if arm.startswith("ibprobit"):
+        pinned.add("num_update_iters")
+    assert set(params) == expected | pinned
 
 
 @pytest.mark.parametrize("arm", fs.ARMS)
@@ -307,18 +310,26 @@ def test_the_pinned_and_searched_eps_stay_distinguishable():
     assert fs.IBPROBIT_NOEPS_INIT < fs.EPS_INIT_BOX[0] / 1e3
 
 
-def test_cavi_ladder_starts_at_the_px_operating_point():
-    # 32 and 64 are dropped: PX matches ~1000 plain iterations at ~128, so
-    # rungs below it measure an unconverged head rather than the method.
-    assert fs.IBPROBIT_UPDATE_ITERS[0] == 128
+def test_the_cavi_iterations_are_pinned_not_searched():
+    # Was a five-rung ladder; pinned 2026-09-09. The q grid run at both 128 and
+    # 256 (job 30079741) put them within 0.001 val_nll at every q in the good
+    # regime, so the axis was buying nothing there -- and the first campaign
+    # collapsed it to one value across all 20 of its best trials anyway.
+    assert fs.IBPROBIT_UPDATE_ITERS == 256
+    trial = RecordingTrial()
+    fs.suggest(trial, "ibprobit")
+    # Pinned means ABSENT from the search space, not a one-element categorical:
+    # a sampled axis with one value is still a dimension TPE models.
+    assert "num_update_iters" not in trial.axes
 
 
-def test_the_cavi_ladder_extends_past_where_it_last_pinned():
-    # 256 was selected in 5 of the first campaign's top 6 ibprobit trials --
-    # the same pinned-to-its-ceiling signal that moved this ladder up once
-    # already (probing pinned at 192 in 4 of 5 studies). A ladder whose top
-    # rung keeps winning has not been given room to lose.
-    assert max(fs.IBPROBIT_UPDATE_ITERS) > 256
+def test_the_pinned_cavi_value_is_at_or_above_the_px_operating_point():
+    # PX matches ~1000 plain iterations at ~128, so a pin below that would
+    # measure an unconverged head rather than the method. 256 is deliberately
+    # above it: in the bad-q regime the extra passes degrade gracefully
+    # (0.5566 at q=1.29e-2) where 128 blows up (1.2838), which keeps TPE's
+    # surrogate from being distorted by trials that are merely mis-seeded.
+    assert fs.IBPROBIT_UPDATE_ITERS >= 128
 
 
 def test_learning_rate_is_searched_as_trunk_rate_and_ratio():

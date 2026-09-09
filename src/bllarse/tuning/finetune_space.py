@@ -391,7 +391,34 @@ EPS_INIT_BOX = (1e-8, 1e-1)
 # regulariser through the number of assimilation passes. Rungs above 256
 # separate "the ladder is still too low" from "the pin is an artefact of where
 # it stopped".
-IBPROBIT_UPDATE_ITERS = (128, 192, 256, 384, 512)
+# PINNED at 256, not searched. The ladder rung above asked whether the extra
+# iterations past the ~128 PX operating point buy a better-fitted head or act as
+# a regulariser. MEASURED 2026-09-08/09, and the answer is NEITHER: they REPAIR A
+# WRONG q0, and once q0 is right they do essentially nothing.
+#
+# The q grid at the tuning horizon, run at both 128 and 256 (job 30079741):
+#
+#   q_init     nui=128   nui=256      q_init     nui=128   nui=256
+#   1.29e-07   0.48420   0.48510      1.29e-03   0.48910   0.49010
+#   1.29e-06   0.48180   0.48280      4.09e-03   0.68610   0.53910
+#   1.29e-05   0.47770   0.47750      1.29e-02   1.28380   0.55660
+#   1.29e-04   0.47450   0.47380
+#
+# At every q in the good regime the two are within 0.001 -- a wash. In the bad
+# regime 256 degrades gracefully where 128 blows up (1.284 -> 0.557). The same
+# thing explains the 2-epoch nui sweep, where 256 beat 128 by 0.069 val_nll:
+# that sweep ran at the tuned q of 1.292e-3, which is two decades high.
+#
+# So 256 is chosen for the SEARCH, not for the optimum. `no_learn_q` is on, so
+# TPE will visit bad q, and at nui=128 those trials return catastrophic values
+# (1.28 against a 0.47 optimum) that distort the surrogate far out of proportion
+# to how bad the config is. 256 keeps the objective landscape smooth. It is free:
+# across the 8-point large sweep, wall-clock over nui 16..512 was 7:52 to 8:37
+# with no monotone trend, i.e. inside node-to-node noise.
+#
+# Searching it was also costing an axis for nothing -- the first campaign
+# collapsed it to a single value across every one of its 20 best trials.
+IBPROBIT_UPDATE_ITERS = 256
 
 # Narrowed from probing's [1e-6, 1e-1] to bracket its measured optima
 # (2.4e-5 to 4.2e-3) by roughly a decade either side. q0 = alpha^2 / B, so this
@@ -710,10 +737,14 @@ def _suggest_ibprobit(
         # be re-measured rather than narrowed on noise.
         "weight_decay": _suggest_per_sqrt_batch(
             trial, "weight_decay", TRUNK_WD_BOX, batch_size),
+        # q_init is searched at the TUNING horizon and moved to the reported
+        # one by protocol.transfer's q0 ~ T^-2 rule, the same way lr and the
+        # betas are. Before that rule existed this axis transferred by identity
+        # and the tuned value was ~68x too high at 4 epochs.
         "q_init": trial.suggest_float("q_init", *Q_INIT_BOX, log=True),
-        "num_update_iters": trial.suggest_categorical(
-            "num_update_iters", list(IBPROBIT_UPDATE_ITERS)
-        ),
+        # Constant, NOT suggest_categorical over a one-element list -- a sampled
+        # axis with one value still becomes a dimension TPE models and reports.
+        "num_update_iters": IBPROBIT_UPDATE_ITERS,
     }
     params["beta1"], params["beta2"] = _suggest_betas(trial, steps)
     if search_eps:
