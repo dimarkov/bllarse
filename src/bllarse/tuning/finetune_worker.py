@@ -251,14 +251,24 @@ def open_study(
     storage_dir: Any,
     campaign: str | None = None,
     *,
-    warmup_evals: int,
+    warmup_evals: int | None = None,
 ) -> optuna.Study:
     """Load or create this (arm, campaign)'s study.
 
     JournalStorage on JournalFileBackend, not SQLite: SQLite over GPFS with
     concurrent writers is unreliable, and the journal backend is built for
     network filesystems.
+
+    `warmup_evals` defaults to the fraction resolved against the ladder's
+    uniform evaluation count. The default exists for READERS -- `final_config`
+    opens a study only to reach `best_trial`, and the pruner is a runtime object
+    that is never written to the journal, so its configuration cannot affect
+    what a reader sees. A worker passes the value explicitly, resolved against
+    the campaign's own eval count rather than the ladder default.
     """
+    if warmup_evals is None:
+        warmup_evals = max(
+            1, round(PRUNER_WARMUP_FRACTION * space.eval_count()))
     directory = Path(storage_dir)
     directory.mkdir(parents=True, exist_ok=True)
     name = study_name(arm, campaign)

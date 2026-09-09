@@ -201,6 +201,14 @@ def test_the_pruner_warmup_is_a_fraction_of_the_run_not_a_flat_count():
     assert fw.PRUNER_WARMUP_FRACTION * space.eval_count() < space.eval_count()
 
 
+def test_open_study_is_usable_without_a_warmup_for_readers(tmp_path):
+    # final_config opens a study only to reach best_trial. The pruner is a
+    # runtime object and is never written to the journal, so a reader must not
+    # be forced to invent an eval count it does not have.
+    study = fw.open_study("ce", tmp_path, "large400kv2")
+    assert study.study_name == "ft_ce_large400kv2"
+
+
 def test_the_objective_averages_a_tail_rather_than_taking_the_argmin():
     # The running argmin rewards a config that dips low and then leaves, which
     # is exactly what q0 two decades high does on this head.
