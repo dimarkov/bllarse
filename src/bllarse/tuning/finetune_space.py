@@ -742,9 +742,17 @@ def _suggest_ibprobit(
         # betas are. Before that rule existed this axis transferred by identity
         # and the tuned value was ~68x too high at 4 epochs.
         "q_init": trial.suggest_float("q_init", *Q_INIT_BOX, log=True),
-        # Constant, NOT suggest_categorical over a one-element list -- a sampled
-        # axis with one value still becomes a dimension TPE models and reports.
-        "num_update_iters": IBPROBIT_UPDATE_ITERS,
+        # num_update_iters is NOT emitted here. It is pinned, and a pinned value
+        # must arrive through finetune_worker.IBPROBIT_FIXED rather than through
+        # `params`: `params` reaches the tuning run but never reaches
+        # `trial.params`, so `final_config` -- which rebuilds from
+        # `trial.params` -- would silently drop it and let finetune_jax fall
+        # back to its own default of 128. That is a run reported at 128 whose
+        # hyperparameters were selected at 256. IBPROBIT_FIXED is applied by
+        # `trial_config`, which BOTH paths go through, so it is the only place a
+        # pinned value propagates to tuning and reporting alike. Same class of
+        # bug as the LLRD span, which final_config carries explicitly for
+        # exactly this reason.
     }
     params["beta1"], params["beta2"] = _suggest_betas(trial, steps)
     if search_eps:

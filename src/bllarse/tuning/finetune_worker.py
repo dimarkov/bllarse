@@ -231,6 +231,12 @@ VBLL_FIXED = {
 IBPROBIT_FIXED = {
     "px": True,
     "no_learn_q": True,
+    # Pinned at the space's constant, and pinned HERE rather than in
+    # `space.suggest`, because this dict is what `trial_config` applies and
+    # `trial_config` is on both the tuning path and the `final_config` path. A
+    # value returned from `suggest` reaches the tuning run only: it never enters
+    # `trial.params`, so the reported run would rebuild without it.
+    "num_update_iters": space.IBPROBIT_UPDATE_ITERS,
 }
 
 

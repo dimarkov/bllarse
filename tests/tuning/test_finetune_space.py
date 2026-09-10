@@ -193,12 +193,12 @@ def test_each_arm_searches_exactly_its_own_axes(arm, expected):
     # `expected` names the RETURNED keys, which are the training scripts'
     # flags. Two of them are searched under a different name -- see SEARCHED.
     assert set(trial.axes) == {SEARCHED.get(name, name) for name in expected}
-    # batch_size is emitted but not SEARCHED; the ibprobit arms also carry a
-    # pinned num_update_iters. Both are params the axes deliberately lack.
-    pinned = {"batch_size"}
-    if arm.startswith("ibprobit"):
-        pinned.add("num_update_iters")
-    assert set(params) == expected | pinned
+    # batch_size is emitted but not SEARCHED, so params carries exactly one key
+    # the axes do not. The ibprobit arms' pinned num_update_iters is NOT here:
+    # it arrives through finetune_worker.IBPROBIT_FIXED, because a value
+    # returned from `suggest` never reaches `trial.params` and so would be lost
+    # when final_config rebuilds the reported run.
+    assert set(params) == expected | {"batch_size"}
 
 
 @pytest.mark.parametrize("arm", fs.ARMS)
@@ -317,10 +317,15 @@ def test_the_cavi_iterations_are_pinned_not_searched():
     # collapsed it to one value across all 20 of its best trials anyway.
     assert fs.IBPROBIT_UPDATE_ITERS == 256
     trial = RecordingTrial()
-    fs.suggest(trial, "ibprobit")
+    params = fs.suggest(trial, "ibprobit")
     # Pinned means ABSENT from the search space, not a one-element categorical:
     # a sampled axis with one value is still a dimension TPE models.
     assert "num_update_iters" not in trial.axes
+    # And absent from the RETURNED params too. A value returned here reaches the
+    # tuning run but never `trial.params`, so `final_config` would rebuild
+    # without it -- reporting at finetune_jax's default of 128 a config selected
+    # at 256. It arrives instead through finetune_worker.IBPROBIT_FIXED.
+    assert "num_update_iters" not in params
 
 
 def test_the_pinned_cavi_value_is_at_or_above_the_px_operating_point():

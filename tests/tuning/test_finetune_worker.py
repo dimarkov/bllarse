@@ -201,6 +201,23 @@ def test_the_pruner_warmup_is_a_fraction_of_the_run_not_a_flat_count():
     assert fw.PRUNER_WARMUP_FRACTION * space.eval_count() < space.eval_count()
 
 
+def test_the_pinned_cavi_iterations_reach_the_REPORTED_config():
+    """A pinned value must survive the tuning -> final_config round trip.
+
+    `space.suggest` returning it is not enough: its return value reaches the
+    tuning run but never `trial.params`, and `final_config` rebuilds from
+    `trial.params`. Pinning it only in the search space meant every reported
+    IBProbit run fell back to finetune_jax's default of 128 while its
+    hyperparameters had been selected at 256. IBPROBIT_FIXED is applied by
+    `trial_config`, which both paths go through.
+    """
+    assert fw.IBPROBIT_FIXED["num_update_iters"] == space.IBPROBIT_UPDATE_ITERS
+    for arm in ("ibprobit", "ibprobit_noeps"):
+        cfg = fw.trial_config(arm, params={"lr": 1e-4, "batch_size": 512},
+                              max_samples=399872)
+        assert cfg["num_update_iters"] == 256, arm
+
+
 def test_open_study_is_usable_without_a_warmup_for_readers(tmp_path):
     # final_config opens a study only to reach best_trial. The pruner is a
     # runtime object and is never written to the journal, so a reader must not
