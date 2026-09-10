@@ -152,7 +152,23 @@ rung_big()      { CAMPAIGN=big200k       MODEL=dinov3_big   BATCH=256 ARMS="$ALL
 #   4. The objective is the mean of the last 5 evaluations, not the running
 #      argmin, so a config has to still be good at the end to win.
 rung_large()    { CAMPAIGN=large400kv2   MODEL=dinov3_large BATCH=512 ARMS="$ALL_ARMS"; }
-rung_huge()     { CAMPAIGN=huge400kv2    MODEL=dinov3_huge  BATCH=512 ARMS="$ALL_ARMS"; }
+# IBProbit ONLY at huge, on the same evidence that dropped CE from the large v2
+# campaign: a rung is re-tuned when its search is measurably broken, not by
+# default. Measured on the huge400k journals -- CE resolves every axis inside
+# 2.1x over 61 completions, VBLL inside 1.4x over 59. Neither needs re-running,
+# and re-running them at target 50 would hand the BASELINES a weaker search than
+# the method they are compared against.
+#
+# IBProbit does need it, and the qcheck run is why. Applying the q0 ~ T^-2 rule
+# to its tuned trial took test NLL 0.3935 -> 0.3761 at 2 epochs with no new
+# search, but the curve still peaks at eval 35 of 78 where dinov3_large at its
+# best q is flat to the endpoint. So the rule is right and the ANCHOR it starts
+# from is not: huge's q_init was selected by the old argmin objective, which
+# rewards exactly the early-dip-then-climb a too-large q0 produces. A 3-point
+# sweep at 2 epochs would find the better value but could not tell that apart
+# from the exponent needing a width term, because testing an exponent needs an
+# unbiased optimum at TWO horizons. This campaign supplies the 781-step one.
+rung_huge()     { CAMPAIGN=huge400kv2    MODEL=dinov3_huge  BATCH=512 ARMS='ibprobit_noeps'; }
 
 launch() {
   local rung="$1"
