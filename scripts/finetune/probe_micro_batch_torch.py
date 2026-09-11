@@ -112,13 +112,35 @@ def main(args):
         head(eval_feats.float())
     torch.cuda.synchronize()
 
-    peak_gib = torch.cuda.max_memory_allocated() / 2**30
+    # RESERVED, not allocated -- and the distinction decides whether this
+    # number may be plotted beside the JAX arms at all.
+    #
+    # `max_memory_allocated` counts bytes in LIVE TENSORS. It excludes blocks
+    # the caching allocator holds but has not handed out, excludes
+    # fragmentation, and excludes the CUDA context. The JAX arms report XLA's
+    # `peak_bytes_in_use`, which is the allocator's own peak -- so comparing the
+    # two is comparing "what the model asked for" against "what the allocator
+    # held", and it understates the torch arm by whatever the caching allocator
+    # was sitting on. Measured on dinov3_huge at micro-batch 32 the mismatch
+    # read as VBLL using 5.35 GiB less than IBProbit, which is not a fact about
+    # either method.
+    #
+    # `max_memory_reserved` is the comparable quantity: total bytes the caching
+    # allocator obtained from the driver. Both are recorded, because the gap
+    # between them is real information about fragmentation, but `peak_gib` --
+    # the key Fig 7 plots -- is the one that can sit on the same axis as XLA's.
+    reserved_gib = torch.cuda.max_memory_reserved() / 2**30
+    allocated_gib = torch.cuda.max_memory_allocated() / 2**30
+    peak_gib = reserved_gib
     print(f"[probe-torch] arm=vbll model={args.model} micro_batch={micro} "
-          f"peak {peak_gib:.2f} GiB")
+          f"peak {peak_gib:.2f} GiB reserved "
+          f"({allocated_gib:.2f} GiB allocated)")
     if args.json_out:
         Path(args.json_out).write_text(json.dumps({
             "model": args.model, "arm": "vbll", "micro_batch": micro,
-            "peak_gib": peak_gib, "device": name, "bf16": bool(args.bf16),
+            "peak_gib": peak_gib, "peak_allocated_gib": allocated_gib,
+            "peak_metric": "torch.cuda.max_memory_reserved",
+            "device": name, "bf16": bool(args.bf16),
             "img_size": args.img_size, "eval_chunk": args.eval_chunk,
         }, indent=1))
         print(f"[probe-torch] wrote {args.json_out}")
