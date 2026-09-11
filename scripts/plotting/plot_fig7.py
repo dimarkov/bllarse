@@ -94,6 +94,18 @@ def _mean_curve(data, uids, pass_key="id"):
              **{m: per_metric[m][x] for m in per_metric}} for x in xs]
 
 
+def _is_truncated(data, uid, pass_key) -> bool:
+    """Was this run's val minimum its LAST evaluation?
+
+    thresholds.early_stop calls that `at_last_step`: the curve had not turned
+    when the budget ran out, so the run says nothing about where its optimum is.
+    """
+    rows = final_json.rows(data, uid, pass_key)
+    if not rows:
+        return False
+    return bool(thresholds.early_stop(rows).at_last_step)
+
+
 def pick_targets(data, fraction, reference="early_stop"):
     """Targets from the strongest of the CE variants, at its reference point.
 
@@ -128,6 +140,20 @@ def pick_targets(data, fraction, reference="early_stop"):
     print(f"[fig7] baseline {name} at {reference} "
           f"({chosen['samples_seen']:,} samples): acc={chosen['acc']:.4f} "
           f"nll={chosen['nll']:.4f} brier={chosen['brier']:.4f}")
+    # A reference taken from a curve that was still improving when the budget
+    # ran out is not the baseline's operating point, it is where the baseline
+    # happened to be cut off -- and every bar on this figure is timed against
+    # it, so a target that is too loose moves all of them, and not by the same
+    # amount. Loud, because nothing else on the figure shows it.
+    if reference == "early_stop":
+        truncated = [uid for uid in final_json.uids_by_arm(data, "id").get("ce", {}).values()
+                     if _is_truncated(data, uid, "id")]
+        if truncated:
+            print(f"[fig7] WARNING: the baseline's own curve is TRUNCATED on "
+                  f"{len(truncated)} seed(s) -- its minimum is the last "
+                  f"evaluation, so this target is an artefact of where the run "
+                  f"stopped. Every multiple below will move once the runs are "
+                  f"complete.")
     print(f"[fig7] targets at {fraction:g}: acc>={targets.acc:.4f} "
           f"nll<={targets.nll:.4f} brier<={targets.brier:.4f}")
     return targets, name
