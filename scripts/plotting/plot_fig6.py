@@ -97,7 +97,7 @@ def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
     axes[0][0].legend(frameon=False, fontsize=8, loc="best")
     if tuning_budget:
         # Bottom-left panel: the top-left one carries the legend.
-        axes[-1][0].annotate(f"tuning\n{tuning_budget / 1e6:.0f}M",
+        axes[-1][0].annotate(f"tuning\n{final_json.format_samples(tuning_budget)}",
                              xy=(tuning_budget, 0.97),
                              xycoords=("data", "axes fraction"),
                              xytext=(3, 0), textcoords="offset points",
@@ -117,8 +117,7 @@ def main():
     p.add_argument("--scores", required=True)
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig6_shift")
-    p.add_argument("--tuning-budget", type=float,
-                   default=float(final_json.tuning_budget()),
+    p.add_argument("--tuning-budget", type=float, default=None,
                    help="Samples the hyperparameter search scored trials at, "
                         "marked with a dashed rule. 0 to omit.")
     p.add_argument("--linear-x", action="store_true")
@@ -126,6 +125,9 @@ def main():
 
     data = final_json.load(args.scores)
     print(f"[fig6] {final_json.provenance(data)}")
+    if not args.tuning_budget:
+        print("[fig6] no --tuning-budget: the selection-budget rule is OMITTED. "
+              "See plot_fig5 for why there is no default.")
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),

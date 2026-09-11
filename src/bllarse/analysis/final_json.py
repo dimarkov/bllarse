@@ -69,14 +69,36 @@ METRICS = [
     ("brier", "Brier ↓", True, False),
 ]
 
-# Where the hyperparameter search actually looked. Every config on Figs 5-7 was
-# selected at `protocol.MAX_SAMPLES` and transferred to 4 epochs by the AdamW
-# SDE rule, so everything to the RIGHT of this line is the transfer's
-# extrapolation rather than a tuned operating point -- which is the first thing
-# to check when a curve turns after it.
-def tuning_budget() -> int:
-    from bllarse.finetune import protocol
-    return protocol.MAX_SAMPLES
+# Where the hyperparameter search actually looked. Everything to the RIGHT of
+# this line is the transfer extrapolating past its selection budget rather than
+# a tuned operating point -- the first thing to check when a curve turns after
+# it. Which makes a WRONG line worse than no line, and there is no honest
+# default: the budget is a property of the STUDY a config came from, and none of
+# it survives into the scored JSON (which carries model, group_id and per-step
+# metrics) or into the dumps.
+#
+# It used to return protocol.MAX_SAMPLES unconditionally. That is right only for
+# the campaigns tuned at a fixed 1M samples; the dinov3 LADDER holds STEPS at
+# 781 and lets samples follow the rung's batch, so at dinov3_large it is
+# 781 x 512 = 399,872 and the constant overstated it by 2.5x -- drawing the
+# extrapolation boundary a decade and a half into territory that was in fact
+# searched. Callers now pass the value they know; None draws no line.
+def tuning_budget() -> int | None:
+    """No default. Pass --tuning-budget, or get no annotation."""
+    return None
+
+
+def format_samples(n: float) -> str:
+    """Axis-style sample count: 399872 -> '400k', 5004000 -> '5.0M'.
+
+    The previous `f"{n / 1e6:.0f}M"` rendered every per-rung budget as "0M".
+    """
+    n = float(n)
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M".replace(".0M", "M")
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return f"{n:.0f}"
 
 # OOD panel order. Matches finetune.imagenet.OOD_KEYS; R and A cover only 200 of
 # the 1000 classes and are evaluated under the subset mask, which the caption

@@ -3,10 +3,16 @@
 
     python scripts/plotting/plot_fig5.py --scores /ptmp/$USER/large_all.json
 
-Four rows -- accuracy, ECE, NLL, Brier -- against samples seen, for AdamW+CE,
-AdamW+CE+TS, VBLL and IBProbit, with a band over seeds. The claim is about the
-CURVES, not the endpoints: IBProbit is expected to reach usable calibration far
-earlier than CE, with the gap largest early.
+Three rows -- accuracy, NLL, Brier -- against samples seen, for AdamW+CE+TS,
+VBLL and IBProbit, with a band over seeds. The claim is about the CURVES, not
+the endpoints: IBProbit is expected to reach usable calibration far earlier than
+CE, with the gap largest early.
+
+ECE is scored but NOT drawn (final_json.METRICS): NLL and Brier are proper
+scoring rules that already carry the calibration claim, while ECE's value
+depends on a binning choice the figure would not show. Raw AdamW+CE is likewise
+scored but not drawn -- CE+TS is the baseline being compared against, and on the
+accuracy row the two are identical and would overplot.
 
 The eval set is the 80% of ImageNet's official validation split that
 `imagenet.pinned_eval_split` reserves as `test`; the other 20% is the `val`
@@ -80,7 +86,8 @@ def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
     if tuning_budget:
         # On the LAST panel, not the first: the first carries the legend, and
         # the two overprint there.
-        axes[-1].annotate(f"tuning budget\n{tuning_budget / 1e6:.0f}M samples",
+        axes[-1].annotate(
+            f"tuning budget\n{final_json.format_samples(tuning_budget)} samples",
                           xy=(tuning_budget, 0.97),
                           xycoords=("data", "axes fraction"),
                           xytext=(4, 0), textcoords="offset points",
@@ -100,8 +107,7 @@ def main():
                    help="score_final.py output JSON.")
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig5_sample_efficiency")
-    p.add_argument("--tuning-budget", type=float,
-                   default=float(final_json.tuning_budget()),
+    p.add_argument("--tuning-budget", type=float, default=None,
                    help="Samples the hyperparameter search scored trials at, "
                         "marked with a dashed rule. 0 to omit.")
     p.add_argument("--linear-x", action="store_true",
@@ -111,6 +117,11 @@ def main():
 
     data = final_json.load(args.scores)
     print(f"[fig5] {final_json.provenance(data)}")
+    if not args.tuning_budget:
+        print("[fig5] no --tuning-budget: the selection-budget rule is OMITTED. "
+              "It is a property of the study each config came from and is not "
+              "recoverable from the scores, and a rule in the wrong place "
+              "misreads exactly what it exists to mark.")
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),
