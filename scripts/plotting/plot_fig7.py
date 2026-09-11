@@ -7,7 +7,14 @@ The claim is *faster to calibrated*, not just faster to accurate, so the x-axis
 is cost and the bar is the cost of reaching a target that includes calibration.
 
 Threshold protocol (results-plan 0.4, implemented in analysis.thresholds, fixed
-before any of these numbers were looked at):
+before any of these numbers were looked at). An earlier version of this figure
+took the target from IBProbit's own optimum instead, on the argument that the
+question is "how long does each arm take to reach the quality IBProbit
+converges to". That is self-referential in a way 0.4 exists to prevent: the
+target moves with the proposed method's quality, so the same rule understated
+IBProbit when its process noise was mis-scaled and would flatter it now that it
+is not. The target comes from the baseline; only the BAR NORMALISATION is
+relative to IBProbit, and that rescales every bar equally.
 
   - the target is JOINT on accuracy, NLL and Brier -- the first step where all
     three are at or better than target, never the first step where one is;
@@ -126,59 +133,15 @@ def pick_targets(data, fraction, reference="early_stop"):
     return targets, name
 
 
-def val_nll_target(data, fraction, baseline_arm, point="optimum"):
-    """The val-NLL every arm is timed against, and where the baseline hit it.
 
-    The reference is `baseline_arm`'s val NLL at `point`, taken from its
-    seed-mean curve so one lucky seed cannot set the bar:
+def joint_crossings(data, targets):
+    """[(label, colour, arm, {seed: (Crossing, row)})] under results-plan 0.4.
 
-    * "optimum" -- its MINIMUM, the best that arm ever achieves on the
-      selection split, i.e. the model a practitioner would deploy.
-    * "endpoint" -- its value at the LAST evaluation. The right reference when
-      the question is "how long do the others need to match what this arm
-      finishes at", and the honest one when an arm degrades past its own
-      optimum: its endpoint is what a fixed-budget run without early stopping
-      would actually hand you.
-
-    The target is that value / fraction, the same looser-is-larger convention
-    `make_targets` uses for lower-is-better metrics.
-
-    Deliberately IBProbit's own optimum rather than a CE-derived one. The
-    question this panel answers is "how long does each arm take to reach the
-    quality IBProbit converges to", so the reference has to be that quality;
-    deriving it from CE would answer a question about CE's endpoint instead,
-    and CE's endpoint is not the operating point anyone deploys.
-    """
-    uids = final_json.uids_by_arm(data, "id").get(baseline_arm)
-    if not uids:
-        raise SystemExit(f"[fig7] no {baseline_arm!r} runs in the scored JSON")
-    curve = _mean_curve(data, uids, "id")
-    if not curve or "val_nll" not in curve[0]:
-        raise SystemExit(
-            "[fig7] the scored curves carry no val_nll; re-score with a "
-            "score_final that emits it.")
-    if point == "endpoint":
-        best = max(curve, key=lambda r: r["samples_seen"])
-    elif point == "optimum":
-        best = min(curve, key=lambda r: r["val_nll"])
-    else:
-        raise SystemExit(f"[fig7] --reference-point must be optimum|endpoint, "
-                         f"got {point!r}")
-    target = best["val_nll"] / fraction
-    print(f"[fig7] reference {baseline_arm} at its {point}: "
-          f"val_nll={best['val_nll']:.4f} at {best['samples_seen']:,} samples "
-          f"(test acc there {best['acc']:.4f})")
-    print(f"[fig7] target: val_nll <= {target:.4f} "
-          f"({fraction:g}x the reference, looser)")
-    return target, best
-
-
-def val_crossings(data, target):
-    """[(label, colour, arm, {seed: (Crossing, row)})] in ARMS order.
-
-    The row is carried alongside the crossing so the caller can report what
-    TEST accuracy the run had at the point its VAL nll crossed. Selection on
-    val, reporting on test.
+    The crossing is JOINT -- the first step at which accuracy, NLL and Brier are
+    all at or better than target -- and PER SEED, never the crossing of the
+    seed-mean curve, which would let one fast seed manufacture a crossing no
+    individual run achieved. A run that never meets all three comes back
+    censored and is drawn as such.
     """
     entries = []
     for (arm, pass_key), label, colour, _marker in final_json.ARMS:
@@ -188,12 +151,13 @@ def val_crossings(data, target):
         per_seed = {}
         for seed, uid in uids.items():
             rows = final_json.rows(data, uid, pass_key)
-            crossing = thresholds.first_crossing_metric(rows, "val_nll", target)
+            crossing = thresholds.first_crossing(rows, targets)
             row = next((r for r in rows
                         if r["samples_seen"] == crossing.samples_seen), None)
             per_seed[seed] = (crossing, row)
         entries.append((label, colour, arm, per_seed))
     return entries
+
 
 
 def crossings(data, targets):
@@ -363,39 +327,6 @@ def panel_relative(ax, entries, timelines, baseline_arm, title):
     ax.set_axisbelow(True)
 
 
-def panel_memory(ax, values, title, ylabel, empty_note):
-    """One measured scalar per arm -- peak memory, which has no seed spread."""
-    if not values:
-        ax.set_title(title, fontsize=10)
-        ax.text(0.5, 0.5, empty_note, ha="center", va="center", fontsize=8,
-                color="#777", transform=ax.transAxes, wrap=True)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        return
-    # Peak memory is a property of the TRAINING run, and TS is post hoc -- so
-    # the CE entry is keyed on the arm, not on which pass is plotted elsewhere.
-    seen, labelled = set(), []
-    for (arm, _pass), label, colour, _m in final_json.ARMS:
-        if arm in seen or arm not in values:
-            continue
-        seen.add(arm)
-        peak, micro = values[arm]
-        labelled.append((f"{label.split(' (')[0]}\nmicro {micro}" if micro
-                         else label, colour, peak))
-    ax.bar(range(len(labelled)), [v for _, _, v in labelled], width=0.6,
-           color=[c for _, c, _ in labelled], alpha=0.75, zorder=2)
-    for i, (_lab, _c, v) in enumerate(labelled):
-        ax.annotate(f"{v:.2f}", xy=(i, v), xytext=(0, 3),
-                    textcoords="offset points", ha="center", va="bottom",
-                    fontsize=8)
-    ax.set_ylim(0, max(v for _, _, v in labelled) * 1.15)
-    ax.set_xticks(range(len(labelled)))
-    ax.set_xticklabels([lab for lab, _, _ in labelled], fontsize=7)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title, fontsize=10)
-    ax.grid(alpha=0.25, lw=0.6, axis="y")
-    ax.set_axisbelow(True)
-
 
 def _elapsed_at(timeline, samples):
     """Wall-clock seconds at `samples`, from a measured [(samples, s)] list.
@@ -412,10 +343,10 @@ def _elapsed_at(timeline, samples):
     return timeline[-1][1]
 
 
-def make_figure(data, out_path, *, target, reference_row, fraction,
-                baseline_arm, point, wallclock, memory):
-    fig, axes = plt.subplots(1, 2, figsize=(8.8, 4.2))
-    entries = val_crossings(data, target)
+def make_figure(data, out_path, *, targets, baseline_name, fraction,
+                reference, normalise_by, wallclock):
+    fig, ax = plt.subplots(1, 1, figsize=(5.2, 4.2))
+    entries = joint_crossings(data, targets)
 
     # {(arm, seed): [(samples, elapsed_s)]} -- a MEASURED timeline per run, so
     # the panel reads the clock at the crossing instead of assuming throughput
@@ -426,15 +357,14 @@ def make_figure(data, out_path, *, target, reference_row, fraction,
     if not timelines:
         raise SystemExit("[fig7] --wallclock is required: this panel is a time")
 
-    panel_relative(axes[0], entries, timelines, baseline_arm,
-                   "a — time to reach the target val NLL")
-    panel_memory(axes[1], memory, "b — peak memory (per arm, not per seed)",
-                 "GiB", "no --memory given;\nrun probe_micro_batch.py")
+    panel_relative(ax, entries, timelines, normalise_by,
+                   "time to the joint calibration target")
     fig.suptitle(
-        f"Fig 7 — time to val NLL ≤ {target:.4f} "
-        f"({fraction:g}× {baseline_arm}'s {point} val NLL, "
-        f"{reference_row['val_nll']:.4f}), relative to {baseline_arm}\n"
-        + final_json.provenance(data), fontsize=9, y=1.03)
+        f"Fig 7 — wall clock to acc ≥ {targets.acc:.4f}, NLL ≤ {targets.nll:.4f}, "
+        f"Brier ≤ {targets.brier:.4f}\n"
+        f"({fraction:g}× {baseline_name} at its {reference}), "
+        f"relative to {normalise_by}\n"
+        + final_json.provenance(data), fontsize=9, y=1.04)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight", dpi=150)
     plt.close(fig)
@@ -448,53 +378,32 @@ def main():
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig7_compute_to_threshold")
     p.add_argument("--fraction", type=float, default=0.95)
-    p.add_argument("--reference-point", default="optimum",
-                   choices=["optimum", "endpoint"],
-                   help="Which point of the baseline arm sets the target: its "
-                        "val-NLL minimum, or its last evaluation. `endpoint` "
-                        "answers 'how long do the others need to match what "
-                        "this arm finishes at'.")
-    p.add_argument("--baseline-arm", default="ibprobit",
-                   help="Whose best val NLL sets the target, and what the "
-                        "times are relative to. Its bar is 1.0 by "
-                        "construction.")
+    p.add_argument("--reference", default="early_stop",
+                   choices=["early_stop", "endpoint"],
+                   help="Which point of the STRONGEST CE variant sets the "
+                        "target: its val-NLL early-stopping point, or its last "
+                        "evaluation.")
+    p.add_argument("--normalise-by", default="ibprobit",
+                   help="Display only: whose time the bars are expressed as a "
+                        "multiple of. This does NOT set the target -- "
+                        "results-plan 0.4 fixes that at the strongest baseline "
+                        "-- and changing it rescales every bar equally.")
     p.add_argument("--wallclock", default=None,
                    help="scripts/analysis/wallclock_from_dumps.py output: a "
                         "measured (samples, elapsed) timeline per run.")
-    p.add_argument("--memory", nargs="*", default=None,
-                   help="probe_micro_batch{,_torch}.py --json-out files, one "
-                        "per arm.")
     args = p.parse_args()
 
     data = final_json.load(args.scores)
     print(f"[fig7] {final_json.provenance(data)}")
-    target, reference_row = val_nll_target(data, args.fraction,
-                                          args.baseline_arm,
-                                          args.reference_point)
+    targets, baseline_name = pick_targets(data, args.fraction, args.reference)
     wallclock = json.loads(Path(args.wallclock).read_text()) if args.wallclock else {}
-    memory = {}
-    for path in args.memory or ():
-        probe = json.loads(Path(path).read_text())
-        if probe.get("model") != data.get("model"):
-            # Peak memory measured on a different backbone answers a different
-            # question, and silently mixing them would make panel c a
-            # comparison of model sizes wearing arm labels.
-            raise SystemExit(
-                f"[fig7] {path} is model={probe.get('model')!r} but the scores "
-                f"are model={data.get('model')!r}")
-        # The micro batch rides along because the arms do NOT share one --
-        # vbll runs 64 where ce and ibprobit run 32 -- and a memory bar without
-        # it invites the reader to attribute a batch difference to the method.
-        # Batch is matched at the EFFECTIVE level (512) via accumulation.
-        memory[probe["arm"]] = (probe["peak_gib"], probe.get("micro_batch"))
 
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
         make_figure(data, os.path.join(args.out_dir, f"{args.name}.{ext}"),
-                    target=target, reference_row=reference_row,
-                    fraction=args.fraction, baseline_arm=args.baseline_arm,
-                    point=args.reference_point,
-                    wallclock=wallclock, memory=memory)
+                    targets=targets, baseline_name=baseline_name,
+                    fraction=args.fraction, reference=args.reference,
+                    normalise_by=args.normalise_by, wallclock=wallclock)
 
 
 if __name__ == "__main__":

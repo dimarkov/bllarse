@@ -127,9 +127,19 @@ def test_the_module_still_exports_what_the_figure_scripts_import():
     suite stayed green and only rendering a figure showed it. These four names
     are the module's contract with those scripts.
     """
-    for name in ("ARMS", "METRICS", "OOD_SETS", "tuning_budget"):
+    for name in ("ARMS", "METRICS", "OOD_SETS", "tuning_budget",
+                 "format_samples"):
         assert hasattr(final_json, name), f"final_json.{name} is gone"
 
     assert [m[0] for m in final_json.METRICS] == ["acc", "nll", "brier"]
     assert len(final_json.OOD_SETS) == 4
-    assert final_json.tuning_budget() > 0
+    # None, DELIBERATELY: the selection budget is a property of the study a
+    # config came from and reaches neither the scored JSON nor the dumps. It
+    # used to return protocol.MAX_SAMPLES, which is right only for the
+    # fixed-1M campaigns and overstated the per-rung ladder's 399,872 by 2.5x
+    # -- drawing the extrapolation boundary inside territory that was searched.
+    assert final_json.tuning_budget() is None
+    # and the label formatter that replaced `f"{n/1e6:.0f}M"`, which rendered
+    # every per-rung budget as "0M".
+    assert final_json.format_samples(399872) == "400k"
+    assert final_json.format_samples(2_562_334) == "2.6M"
