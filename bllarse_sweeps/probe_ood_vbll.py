@@ -11,11 +11,22 @@ model with score function; reporting only the shared one would never test the
 epistemic-term claim. Both, labelled.
 """
 
+import os
 from itertools import product
 
+from bllarse.evaldump import campaign_root
 from bllarse.tools.adapters import run_script_from_config
 
 GROUP_ID = "probe_vbll_fig2"
+
+# The tuning campaign these TUNED values came from, and therefore the
+# subdirectory the dumps go in. Declared beside the numbers it describes
+# because the two MUST move together: re-tuning changes TUNED, and a re-run
+# under the previous campaign's root would overwrite the earlier campaign's
+# dumps -- same group_id, same uid, different hyperparameters, no error. Flip
+# this in the same edit that replaces TUNED. See evaldump.campaign_root.
+CAMPAIGN = "win2"
+DUMP_ROOT = campaign_root(CAMPAIGN)
 
 # Matches the AdamW arm: dinov3_huge only, because it is the only TUNED
 # backbone. Features for all four rungs exist; see the AdamW arm's note.
@@ -27,7 +38,20 @@ PAIRS = [
     ("cifar10", 10, "cifar100"),
     ("cifar100", 100, "svhn"),
 ]
-SEEDS = list(range(137, 147))
+def _seeds():
+    """The reported seeds, overridable for a staged rollout.
+
+    `BLLARSE_SWEEP_SEEDS="137 138"` runs a two-seed slice first; a later
+    submission with the remaining eight ADDS to the same group_id, because each
+    run's uid carries its seed and nothing keys on the seed count.
+
+    Unset reproduces all ten -- the value the figures are specified on.
+    """
+    raw = os.environ.get("BLLARSE_SWEEP_SEEDS", "").split()
+    return [int(s) for s in raw] if raw else list(range(137, 147))
+
+
+SEEDS = _seeds()
 
 # tune_vbll_<dataset>_kl_ratio, best trial by val_nll. `epochs` carries the
 # campaign's fixed 30,000-step budget at that trial's batch size.
@@ -44,21 +68,12 @@ SEEDS = list(range(137, 147))
 # in two of these three pairs, so if the native-score results look odd this is
 # the first thing to re-tune under a wider box.
 TUNED = {
-    "cifar10": dict(
-        batch_size=256, learning_rate=0.00485855327360665,
-        weight_decay=0.010999459744888555, kl_ratio=0.002248606747831535,
-        prior_scale=806.1389096047113, wishart_scale=0.037175448221093595,
-        epochs=154
-    ),
-    "cifar100": dict(
-        batch_size=512, learning_rate=0.006253432594518148,
-        weight_decay=0.09039853860172353, kl_ratio=6.625111879332074e-07,
-        prior_scale=0.12821306950802192, wishart_scale=0.0028061939766293254,
-        epochs=310
-    ),
+    "cifar10": dict(batch_size=1024, learning_rate=0.014199224084588319, weight_decay=0.002541292245333371, kl_ratio=0.00395546379800891, prior_scale=0.1244772177142675, wishart_scale=0.37123517198062456, epochs=625),  # win2, 89 trials, 30000 steps
+    "cifar100": dict(batch_size=512, learning_rate=0.0017891011901586562, weight_decay=0.07754943204905308, kl_ratio=9.854065829990097e-06, prior_scale=6.15774616459221, wishart_scale=6.941868478640677, epochs=310),  # win2, 102 trials, 30070 steps
 }
 
 BASE = dict(
+    dump_root=DUMP_ROOT,
     enable_mlflow=True,
     mlflow_experiment="bllarse-probing",
     report_every=10,

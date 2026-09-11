@@ -10,11 +10,22 @@ samples40 tuning campaign rather than shared defaults: batch size alone spans
 off its own optimum and the comparison against VBLL would measure the defaults.
 """
 
+import os
 from itertools import product
 
+from bllarse.evaldump import campaign_root
 from bllarse.tools.adapters import run_script_from_config
 
 GROUP_ID = "probe_adamw_ce_fig2"
+
+# The tuning campaign these TUNED values came from, and therefore the
+# subdirectory the dumps go in. Declared beside the numbers it describes
+# because the two MUST move together: re-tuning changes TUNED, and a re-run
+# under the previous campaign's root would overwrite the earlier campaign's
+# dumps -- same group_id, same uid, different hyperparameters, no error. Flip
+# this in the same edit that replaces TUNED. See evaldump.campaign_root.
+CAMPAIGN = "win2"
+DUMP_ROOT = campaign_root(CAMPAIGN)
 
 # Only dinov3_huge, because it is the only TUNED backbone -- not for want of
 # features: the full 4-backbone x 9-dataset cache exists on Raven. space.py
@@ -29,22 +40,30 @@ PAIRS = [
     ("cifar10", 10, "cifar100"),
     ("cifar100", 100, "svhn"),
 ]
-SEEDS = list(range(137, 147))
+def _seeds():
+    """The reported seeds, overridable for a staged rollout.
+
+    `BLLARSE_SWEEP_SEEDS="137 138"` runs a two-seed slice first; a later
+    submission with the remaining eight ADDS to the same group_id, because each
+    run's uid carries its seed and nothing keys on the seed count.
+
+    Unset reproduces all ten -- the value the figures are specified on.
+    """
+    raw = os.environ.get("BLLARSE_SWEEP_SEEDS", "").split()
+    return [int(s) for s in raw] if raw else list(range(137, 147))
+
+
+SEEDS = _seeds()
 
 # adamw_ce_<dataset>_samples40, best trial by val_nll. `epochs` carries the campaign's
 # fixed 30,000-step budget at that trial's batch size; it is not a free knob.
 TUNED = {
-    "cifar10": dict(
-        batch_size=128, learning_rate=0.0034581670852852956,
-        weight_decay=0.09462300712138334, epochs=77
-    ),
-    "cifar100": dict(
-        batch_size=256, learning_rate=0.0019153485721736003,
-        weight_decay=0.0004941138658043405, epochs=154
-    ),
+    "cifar10": dict(batch_size=512, learning_rate=0.014570293902991813, weight_decay=0.07198300389818668, epochs=310),  # win2, 79 trials, 30070 steps
+    "cifar100": dict(batch_size=512, learning_rate=0.0016688334907619896, weight_decay=0.00013159281599845325, epochs=310),  # win2, 101 trials, 30070 steps
 }
 
 BASE = dict(
+    dump_root=DUMP_ROOT,
     enable_mlflow=True,
     mlflow_experiment="bllarse-probing",
     arm="adamw_ce",

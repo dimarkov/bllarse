@@ -29,11 +29,22 @@ never written, and the values live in TUNED below. Fig 1's datasets and Fig 2's
 are disjoint, so nothing is duplicated by holding them here.)
 """
 
+import os
 from itertools import product
 
+from bllarse.evaldump import campaign_root
 from bllarse.tools.adapters import run_script_from_config
 
 GROUP_ID = "probe_adamw_ce_fig1"
+
+# The tuning campaign these TUNED values came from, and therefore the
+# subdirectory the dumps go in. Declared beside the numbers it describes
+# because the two MUST move together: re-tuning changes TUNED, and a re-run
+# under the previous campaign's root would overwrite the earlier campaign's
+# dumps -- same group_id, same uid, different hyperparameters, no error. Flip
+# this in the same edit that replaces TUNED. See evaldump.campaign_root.
+CAMPAIGN = "win2"
+DUMP_ROOT = campaign_root(CAMPAIGN)
 
 MODELS = ["dinov3_small", "dinov3_big", "dinov3_large", "dinov3_huge"]
 DATASETS = {
@@ -43,42 +54,47 @@ DATASETS = {
     "stanford_cars": (196, 512),
     "dtd": (47, 512),
 }
-SEEDS = list(range(137, 147))  # 10 seeds
+def _seeds():
+    """The reported seeds, overridable for a staged rollout.
 
-# adamw_ce_<dataset>_samples40, best trial by val_nll. `epochs` expresses the
-# campaign's fixed 30,000-step budget at that trial's batch size -- it is a
-# restatement of the budget, not an independent knob, so epochs and batch_size
-# must be changed together or not at all.
+    `BLLARSE_SWEEP_SEEDS="137 138"` runs a two-seed slice first; a later
+    submission with the remaining eight ADDS to the same group_id, because each
+    run's uid carries its seed and nothing keys on the seed count. So the
+    campaign can be validated cheaply and then completed, rather than committed
+    to in one 197 GPU-hour block.
+
+    Unset reproduces all ten -- the value the figures are specified on.
+    """
+    raw = os.environ.get("BLLARSE_SWEEP_SEEDS", "").split()
+    return [int(s) for s in raw] if raw else list(range(137, 147))
+
+
+SEEDS = _seeds()
+
+
+# Best trial per dataset from the SMOOTHED tuning campaigns (windowed
+# val_nll objective, see tuning.objective.DEFAULT_SMOOTH_FRACTION), not the
+# earlier samples40 single-point-minimum campaign -- which selected unstable
+# high-lr configurations (audit A.13). Per-entry source is noted inline;
+# `smoothed2` is the re-run with the pruner aligned to the objective.
 #
-# Tuned at dinov3_huge only and applied across all four rungs. space.py accepts
-# this deliberately (the backbones emit 384/768/1024/1280-dim features, so a
-# config optimal at one is not guaranteed optimal at another) on the grounds
-# that the paper's arguments centre on huge. It has to be stated in the paper
-# rather than buried -- the non-huge rungs are not independently tuned.
+# `epochs` restates the fixed 30,000-step budget AT THAT TRIAL'S BATCH SIZE.
+# It is not an independent knob: batch and epochs must change together, and
+# several batches did change here. Recomputed by budgets.epochs_for_steps and
+# checked by tests/test_sweep_budgets.py, never by hand.
+#
+# Tuned at dinov3_huge only and applied across all four rungs -- stated in
+# the paper rather than buried; the non-huge rungs are not independently tuned.
 TUNED = {
-    "oxford_pets": dict(
-        batch_size=64, learning_rate=0.018152101741656677,
-        weight_decay=0.008278246675974297, epochs=527
-    ),
-    "food101": dict(
-        batch_size=512, learning_rate=0.002826281219835646,
-        weight_decay=7.725356544062722e-05, epochs=205
-    ),
-    "flowers102": dict(
-        batch_size=256, learning_rate=0.019652435709019516,
-        weight_decay=1.0092039298773214e-05, epochs=10000
-    ),
-    "stanford_cars": dict(
-        batch_size=64, learning_rate=0.0020402667218283985,
-        weight_decay=1.5563704047949982e-05, epochs=237
-    ),
-    "dtd": dict(
-        batch_size=64, learning_rate=0.0035828430208080723,
-        weight_decay=1.8311539230944342e-05, epochs=518
-    ),
+    "oxford_pets": dict(batch_size=64, learning_rate=0.003949689430975156, weight_decay=2.640766599613012e-05, epochs=527),  # win2, 102 trials, 30039 steps
+    "food101": dict(batch_size=512, learning_rate=0.0011318003515322155, weight_decay=0.00022270768247029422, epochs=205),  # win2, 100 trials, 30135 steps
+    "flowers102": dict(batch_size=256, learning_rate=0.021022436227844634, weight_decay=0.0016820134637137957, epochs=10000),  # win2, 103 trials, 30000 steps
+    "stanford_cars": dict(batch_size=64, learning_rate=0.0010102482092427694, weight_decay=1.5982106955727333e-05, epochs=237),  # win2, 102 trials, 30099 steps
+    "dtd": dict(batch_size=64, learning_rate=0.002165822230859914, weight_decay=0.0010307788585123925, epochs=518),  # win2, 100 trials, 30044 steps
 }
 
 BASE = dict(
+    dump_root=DUMP_ROOT,
     enable_mlflow=True,
     mlflow_experiment="bllarse-probing",
     arm="adamw_ce",

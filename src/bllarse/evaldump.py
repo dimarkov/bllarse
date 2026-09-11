@@ -33,6 +33,36 @@ def dump_dir(root, group_id: str, uid: str) -> Path:
     return Path(root) / group_id / uid
 
 
+def campaign_root(campaign: str, root=None) -> str:
+    """The dump root for one TUNING CAMPAIGN, under the campaign-free root.
+
+    A dump's path is root/group_id/uid, and none of those three carries the
+    hyperparameters the run used. `group_id` is a property of the SWEEP
+    ("probe_adamw_ce_fig1") and `uid` of the cell (model, dataset, seed), so
+    re-running the same sweep with a re-tuned TUNED block writes a DIFFERENT
+    configuration to exactly the same files. Nothing errors; the figures simply
+    start reporting a mixture, or the earlier campaign is gone.
+
+    That was live: the win5 dumps behind the current Figs 1 and 2 sit under
+    `eval_dumps_win5` only because the submitter happened to export
+    BLLARSE_EVAL_DUMP_ROOT that way, and the win2 re-run with the variable
+    unset or stale would have landed on top of them.
+
+    So the campaign is appended HERE rather than typed into an environment
+    variable at submit time: BLLARSE_EVAL_DUMP_ROOT names the campaign-free
+    root and each sweep declares which campaign its numbers came from, next to
+    the numbers. Forgetting the variable can no longer merge two campaigns --
+    it can only put both under ./eval_dumps/<campaign>.
+
+    Analysis is unaffected and stays campaign-agnostic: it is pointed at one
+    campaign with `--dump-root eval_dumps/win5`, exactly as before.
+    """
+    base = root if root is not None else os.environ.get(
+        "BLLARSE_EVAL_DUMP_ROOT", "eval_dumps"
+    )
+    return os.path.join(base, campaign)
+
+
 def write_dump(
     root,
     group_id: str,

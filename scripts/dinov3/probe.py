@@ -212,11 +212,15 @@ def _derive_quantum(n_train: int, batch_size: int) -> int:
     return cap if cap >= batch_size and cap % batch_size == 0 else batch_size
 
 
-def _write_best(args, best, last_eval_index):
+def _write_best(args, best, last_eval_index, n_evals):
     """Write the buffered argmin-val_nll evaluation. The run's ONLY disk write.
 
-    Called from a `finally`, so it runs whether the loop finished its budget or
-    was stopped by an EarlyConvergence raised out of `on_dump`.
+    Called from a `finally`, so it runs whether the loop finished its budget,
+    was stopped by an EarlyConvergence raised out of `on_dump`, or DIED. That
+    last case is why `n_evals` (the scheduled count) is written alongside
+    `last_eval_index` (the count that actually ran): a crashed run still writes
+    a dump here, and without those two numbers it is indistinguishable from a
+    completed one. See evaldump.write_dump.
 
     `best` is None for TWO reasons that need telling apart, because they call
     for opposite responses. Either no evaluation ran at all (a budget shorter
@@ -251,12 +255,19 @@ def _write_best(args, best, last_eval_index):
             # a converged optimum from a budget that ran out -- which is the
             # signal tuning.budgets uses to decide the budget is too small.
             at_last_eval=best["eval_index"] == last_eval_index,
+            eval_index=best["eval_index"],
+            evals_run=last_eval_index,
+            evals_planned=n_evals,
         )
+    truncated = best["eval_index"] == last_eval_index
+    died = last_eval_index < n_evals
     print(
         f"[probe] {args.uid}: best val_nll={best['val_nll']:.4f} at step "
-        f"{best['step']} (eval {best['eval_index']} of {last_eval_index}, "
-        f"epoch {best['epoch']}, {best['samples_seen']} samples)"
-        f"{' AT LAST EVAL -- truncated, not converged' if best['eval_index'] == last_eval_index else ''}"
+        f"{best['step']} (eval {best['eval_index']} of {last_eval_index} run, "
+        f"{n_evals} scheduled, epoch {best['epoch']}, "
+        f"{best['samples_seen']} samples)"
+        f"{' AT LAST EVAL -- truncated, not converged' if truncated else ''}"
+        f"{' INCOMPLETE -- the run did not reach the end of its budget' if died else ''}"
         f"; wrote {len(best['splits'])} dumps",
         flush=True,
     )
@@ -327,9 +338,13 @@ def main(args, on_dump=None):
         optimizer = optax.adamw(args.learning_rate, weight_decay=args.weight_decay)
         opt_state = optimizer.init(eqx.filter(head, eqx.is_array))
 
-    # Loaded once, before the loop: the OOD set is dumped at EVERY eval step
-    # (see the write below), and re-reading the feature file per dump would cost
-    # more than the forward pass it feeds.
+    # Loaded once, before the loop. NOT because the OOD set is dumped at every
+    # eval step -- it is not, and this comment used to say so. The OOD forward
+    # pass runs only when an evaluation IMPROVES on the running val_nll argmin,
+    # and only the last such payload is ever written (see `_write_best`). It is
+    # hoisted because "on every improvement" is still many times per run, and
+    # re-reading the feature file each time would cost more than the forward
+    # pass it feeds.
     ood_f = ood_l = None
     if args.ood_dataset:
         ood_f, ood_l = load_cached_features(
@@ -390,6 +405,12 @@ def main(args, on_dump=None):
         # so the rest was written and then deleted unread.
         best: dict[str, Any] | None = None
         eval_index = 0
+        # The val_nll curve, scalars only. `best` keeps ONE evaluation because
+        # logits are large; this keeps every evaluation because floats are not,
+        # so questions about the stopping rule stay answerable without a re-run.
+        # See evaldump.write_trajectory.
+        curve: dict[str, list] = {"eval_index": [], "step": [],
+                                  "samples_seen": [], "val_nll": []}
 
         # Hoisted: fancy indexing copies, and at up to 30,000 evaluations a
         # per-eval copy of the val block would cost more than the forward pass
@@ -495,6 +516,11 @@ def main(args, on_dump=None):
                                 ood_scores,
                             ))
 
+                    curve["eval_index"].append(eval_index)
+                    curve["step"].append(step)
+                    curve["samples_seen"].append(samples_seen)
+                    curve["val_nll"].append(float(val_nll))
+
                     scalars = {"val_nll": float(val_nll)}
                     if eval_index % args.report_every == 0:
                         # A stride of the EVALUATION grid, so reported points
@@ -516,7 +542,15 @@ def main(args, on_dump=None):
                     if on_dump is not None:
                         on_dump(eval_index, step, samples_seen, scalars)
         finally:
-            _write_best(args, best, eval_index)
+            # Trajectory FIRST: _write_best raises when no evaluation ran, and
+            # the curve is exactly the evidence needed to see why.
+            evaldump.write_trajectory(
+                args.dump_root, args.group_id, args.uid,
+                eval_index=curve["eval_index"], step=curve["step"],
+                samples_seen=curve["samples_seen"], val_nll=curve["val_nll"],
+                arm=args.arm, seed=args.seed, evals_planned=n_evals,
+            )
+            _write_best(args, best, eval_index, n_evals)
 
 
 def build_argparser():

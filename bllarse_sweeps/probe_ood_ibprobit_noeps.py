@@ -23,13 +23,49 @@ than a third training step. The two are separated by GROUP_ID, not by --arm.
 Hyperparameters are per-ID-dataset rather than shared defaults: batch size alone
 differs between the two ID sets, so one BASE would put at least one of them off
 its own optimum and the cross-arm comparison would measure the defaults.
+
+WHY THE CAMPAIGN WAS RE-TUNED AT w=2. The CIFAR-10 entry below sat on the
+q_init box floor (1.0e-6) under win5, and that operating point is what cost
+IBProbit its detection numbers between the samples40 figures and the win5 ones.
+Four tuning studies of the same cell say the floor is a property of the
+SMOOTHING WINDOW rather than of the data or of an unlucky draw:
+
+    w=1 (samples40)  q_init 5.4e-3    rho(q_init, value) = -0.66
+    w=2 (win2)       q_init 5.8e-3    rho(q_init, value) = -0.66
+    w=5 (win5)       q_init 1.0e-6    rho(q_init, value) = +0.79
+    w=5 (win5b)      q_init 1.0e-6    rho(q_init, value) = +0.94   <- fresh draw
+
+The floor configurations are flat -- every window scores them ~0.0318 -- while
+the q ~ 5e-3 ones carry a sharp early dip that a 2-point mean still sees
+(0.0290) and a 5-point mean averages away (0.033). The window alone decides
+which family wins, and w=2 does NOT reintroduce the noise-mining the smoothing
+was added to stop: re-tuned at w=2, adamw_ce/oxford_pets lands at lr 0.00395
+against win5's 0.00341, not samples40's 0.0182.
+
+A 20-run control of this sweep's CIFAR-10 cell at the w=2 configuration
+recovered samples40's detection within 1 sd on both OOD pairs (MSP FPR@95
+0.0081 vs 0.0080 against SVHN, 0.0163 vs 0.0159 against CIFAR-100; win5 gave
+0.0261 and 0.0199), with the ID metrics unchanged. Its numbers are in
+scripts/results/fig2_w2check.json; the one-cell sweep module that produced them
+was deleted once the full w=2 campaign superseded it.
 """
 
+import os
 from itertools import product
 
+from bllarse.evaldump import campaign_root
 from bllarse.tools.adapters import run_script_from_config
 
 GROUP_ID = "probe_ibprobit_noeps_fig2"
+
+# The tuning campaign these TUNED values came from, and therefore the
+# subdirectory the dumps go in. Declared beside the numbers it describes
+# because the two MUST move together: re-tuning changes TUNED, and a re-run
+# under the previous campaign's root would overwrite the earlier campaign's
+# dumps -- same group_id, same uid, different hyperparameters, no error. Flip
+# this in the same edit that replaces TUNED. See evaldump.campaign_root.
+CAMPAIGN = "win2"
+DUMP_ROOT = campaign_root(CAMPAIGN)
 
 # Only dinov3_huge, because it is the only TUNED backbone. Fig 2 has no backbone
 # axis, so there is nothing to buy by paying 4x the compute for untuned rungs.
@@ -41,15 +77,29 @@ PAIRS = [
     ("cifar10", 10, "cifar100"),
     ("cifar100", 100, "svhn"),
 ]
-SEEDS = list(range(137, 147))
+def _seeds():
+    """The reported seeds, overridable for a staged rollout.
+
+    `BLLARSE_SWEEP_SEEDS="137 138"` runs a two-seed slice first; a later
+    submission with the remaining eight ADDS to the same group_id, because each
+    run's uid carries its seed and nothing keys on the seed count.
+
+    Unset reproduces all ten -- the value the figures are specified on.
+    """
+    raw = os.environ.get("BLLARSE_SWEEP_SEEDS", "").split()
+    return [int(s) for s in raw] if raw else list(range(137, 147))
+
+
+SEEDS = _seeds()
 
 # ibprobit_noeps_<dataset>_samples40, best trial by val_nll.
 TUNED = {
-    "cifar10": dict(batch_size=64, q_init=0.004571160669381488, num_update_iters=128, epochs=39),
-    "cifar100": dict(batch_size=256, q_init=0.0013706794216466608, num_update_iters=128, epochs=154),
+    "cifar10": dict(batch_size=64, q_init=0.005772726541613569, num_update_iters=128, epochs=39),  # win2, 102 trials, 30459 steps
+    "cifar100": dict(batch_size=128, q_init=0.0005294035477354173, num_update_iters=32, epochs=77),  # win2, 102 trials, 30030 steps
 }
 
 BASE = dict(
+    dump_root=DUMP_ROOT,
     enable_mlflow=True,
     mlflow_experiment="bllarse-probing",
     arm="ibprobit",
