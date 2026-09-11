@@ -66,6 +66,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from bllarse.finetune import imagenet
 from bllarse.analysis import final_json, thresholds  # noqa: E402
 
 BASELINES = [("ce", "id"), ("ce", "ts")]
@@ -388,8 +389,9 @@ def make_figure(data, out_path, *, targets, baseline_name, fraction,
     fig.suptitle(
         f"Fig 7 — wall clock to acc ≥ {targets.acc:.4f}, NLL ≤ {targets.nll:.4f}, "
         f"Brier ≤ {targets.brier:.4f}\n"
-        f"({fraction:g}× {baseline_name} at its {reference}), "
-        f"relative to {normalise_by}\n"
+        + (f"({fraction:g}× {baseline_name})" if " at " in baseline_name
+           else f"({fraction:g}× {baseline_name} at its {reference})")
+        + f", relative to {normalise_by}\n"
         + final_json.provenance(data), fontsize=9, y=1.04)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight", dpi=150)
@@ -404,6 +406,17 @@ def main():
     p.add_argument("--out-dir", default="scripts/figures")
     p.add_argument("--name", default="fig7_compute_to_threshold")
     p.add_argument("--fraction", type=float, default=0.95)
+    p.add_argument("--target-arm", default=None,
+                   help="Anchor the target on THIS arm's value at "
+                        "--target-epochs of training, instead of on the "
+                        "strongest baseline's early-stopping point. Pinned by "
+                        "budget rather than by the arm's own argmin, so the bar "
+                        "does not move when that arm gets better or worse -- "
+                        "which is what makes anchoring on the method under test "
+                        "legitimate here and not in results-plan 0.4's sense.")
+    p.add_argument("--target-epochs", type=float, default=1.0,
+                   help="Budget, in epochs of the training set, at which "
+                        "--target-arm's value is read.")
     p.add_argument("--reference", default="early_stop",
                    choices=["early_stop", "endpoint"],
                    help="Which point of the STRONGEST CE variant sets the "
@@ -421,7 +434,26 @@ def main():
 
     data = final_json.load(args.scores)
     print(f"[fig7] {final_json.provenance(data)}")
-    targets, baseline_name = pick_targets(data, args.fraction, args.reference)
+    if args.target_arm:
+        samples = int(round(args.target_epochs * imagenet.IMAGENET_N_TRAIN))
+        uids = final_json.uids_by_arm(data, "id").get(args.target_arm)
+        if not uids:
+            raise SystemExit(f"[fig7] no {args.target_arm!r} runs in the scores")
+        curve = _mean_curve(data, uids, "id")
+        targets, ref_row = thresholds.targets_at_samples(
+            curve, samples, args.fraction)
+        baseline_name = (f"{args.target_arm} at {args.target_epochs:g} epoch"
+                         f"{'' if args.target_epochs == 1 else 's'}")
+        print(f"[fig7] target from {args.target_arm} at "
+              f"{ref_row['samples_seen']:,} samples "
+              f"({args.target_epochs:g} epochs = {samples:,}): "
+              f"acc={ref_row['acc']:.4f} nll={ref_row['nll']:.4f} "
+              f"brier={ref_row['brier']:.4f}")
+        print(f"[fig7] targets at {args.fraction:g}: acc>={targets.acc:.4f} "
+              f"nll<={targets.nll:.4f} brier<={targets.brier:.4f}")
+    else:
+        targets, baseline_name = pick_targets(data, args.fraction,
+                                              args.reference)
     wallclock = json.loads(Path(args.wallclock).read_text()) if args.wallclock else {}
 
     os.makedirs(args.out_dir, exist_ok=True)

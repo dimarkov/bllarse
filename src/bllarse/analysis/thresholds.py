@@ -36,6 +36,41 @@ class Crossing:
     last_step: int | None
 
 
+def targets_at_samples(curve: Curve, samples: int,
+                       fraction: float = 1.0) -> tuple[Targets, Mapping[str, Any]]:
+    """Targets from whatever this curve had reached by a FIXED sample budget.
+
+    The other reference modes ask where a curve is best. This one asks where it
+    is at a stated amount of training, which is the right question for "how long
+    do the other arms need to reach what this one reaches in one epoch". It is
+    also the reason this can be anchored on the method under test without the
+    circularity `make_targets`'s docstring warns about: the reference is pinned
+    by the BUDGET, not by the arm's own argmin, so it does not move when the arm
+    gets better or worse. An arm that improves late cannot loosen its own bar.
+
+    The nearest evaluation at or before `samples` is used -- never one after, so
+    the reference is something the arm had actually achieved by that budget.
+
+    Returns the targets and the row they came from, so a caller can report what
+    the reference actually was rather than just the derived bound.
+    """
+    if not curve:
+        raise ValueError("curve is empty; cannot derive targets")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+    eligible = [row for row in curve if row["samples_seen"] <= samples]
+    if not eligible:
+        raise ValueError(
+            f"no evaluation at or before {samples:,} samples; the curve starts "
+            f"at {min(r['samples_seen'] for r in curve):,}")
+    row = max(eligible, key=lambda r: r["samples_seen"])
+    return Targets(
+        acc=row["acc"] * fraction,
+        nll=row["nll"] / fraction,
+        brier=row["brier"] / fraction,
+    ), row
+
+
 def make_targets(baseline_curve: Curve, fraction: float = 0.95,
                  reference: str = "early_stop") -> Targets:
     """Targets as a fraction of the baseline's reference value.
