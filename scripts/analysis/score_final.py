@@ -231,12 +231,20 @@ def main() -> None:
         # not the shift: renormalising over fewer classes raises the max
         # mechanically, and every R/A point would look confidently in
         # distribution.
+        # One dump per OOD split, by direct path, NOT a sweep: `iter_dumps`
+        # decompresses every archive it yields, so recovering four subsets
+        # through it would cost a third pass over the whole tree -- on a run
+        # with 200 dumps that measured 26 minutes against 7.
         subsets = {}
-        for rec in evaldump.iter_dumps(args.dump_root, args.group_id, uid,
-                                       skip_corrupt=True):
-            split = rec.meta.get("split", "")
-            if split.startswith("ood_") and split not in subsets:
-                subsets[split] = _subset_of(rec.logits)
+        for path in sorted(evaldump.dump_dir(
+                args.dump_root, args.group_id, uid).glob("step_*_ood_*.npz")):
+            split = path.stem.split("_", 2)[2]
+            if split in subsets:
+                continue
+            try:
+                subsets[split] = _subset_of(evaldump.load_dump(path).logits)
+            except Exception as exc:                      # a truncated npz
+                print(f"[score] {uid}: {path.name}: {type(exc).__name__}: {exc}")
         distinct = {None: None}
         for sub in subsets.values():
             if sub is not None:
