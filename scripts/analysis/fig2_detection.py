@@ -33,6 +33,7 @@ import statistics as st
 
 from bllarse import evaldump, metrics
 from bllarse.analysis import curves
+from bllarse.analysis.curves import completeness
 
 SHARED_SCORES = {"msp": metrics.msp_ood_score, "entropy": metrics.entropy_ood_score}
 RAW_SCORES = {"energy": metrics.energy_ood_score, "max_logit": metrics.max_logit_ood_score}
@@ -49,12 +50,22 @@ RAW_SCORES = {"energy": metrics.energy_ood_score, "max_logit": metrics.max_logit
 # looks like a typo and gets "fixed" back into a silent swap of which sweep a
 # figure reports.
 #
-# The eps-tuned sweep is retained and reported as an ablation, not plotted
-# here. Measured over 199 matched (model, dataset, seed) pairs, the two arms
-# are indistinguishable on the selection criterion -- pooled val_nll delta
-# +0.0017 +- 0.0047, with the eps-free arm better on 98 of 199 -- while
-# accuracy and Brier marginally favour dropping eps. scripts/analysis/
-# eps_ablation.py regenerates those numbers.
+# The eps-tuned sweep is retained and reported as an ablation, not plotted here.
+#
+# Do NOT copy Fig 1's "the two arms are indistinguishable" here: that was
+# measured on the Fig 1 campaign and does not hold on THIS one. Over the 20
+# matched (model, ID dataset, seed) pairs of the OOD campaign, dropping eps
+# costs test NLL by +0.00142 +- 0.00118 -- tiny, but the eps-free arm is better
+# on only 1 of 20 pairs. Meanwhile it is better on val_nll, the criterion it was
+# SELECTED on, at 17 of 20. Accuracy, ECE and Brier sit at coin-flip agreement.
+# (No temperature-scaled figure here: both arms are IBProbit, which is reported
+# raw -- see curves.TS_ARMS.)
+#
+# So the ablation's verdict is arm-consistent in magnitude and NOT in sign: the
+# eps-free head is chosen because it is the method the paper proposes and the
+# gap is ~0.001 nats, not because the two are indistinguishable here.
+# `scripts/analysis/eps_ablation.py --figure fig2` regenerates those numbers;
+# n is 20 rather than 30 because cifar10's two OOD pairs are one training.
 #
 # One caveat that belongs in the caption rather than in a comment: the eps-free
 # sweep has 199 of 200 runs. dinov3_huge/oxford_pets/seed144 produced non-finite
@@ -82,7 +93,30 @@ def uids_for(root, group_id):
     return sorted(d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)))
 
 
-def id_metrics(root, group_id, uid):
+def fitted_temperature(root, group_id, uid, arm=None):
+    """The temperature for `uid`'s TS variant, or None if the arm has none.
+
+    Fitted on the run's OWN val dump -- the ID dataset's validation split
+    (CIFAR-10's for the cifar10 pairs, CIFAR-100's for the cifar100 one), at
+    the same step the detection metrics are read from. There is no OOD-side
+    fit: SVHN has no CIFAR labels, and a deployed model carries one
+    temperature anyway.
+    """
+    if not curves.applies_temperature_scaling(arm):
+        return None
+    indexed = {}
+    for record in evaldump.iter_dumps(root, group_id, uid):
+        indexed.setdefault(record.meta["split"], {})[record.meta["step"]] = record
+    if "test" not in indexed:
+        return None
+    step = max(indexed["test"])
+    val = indexed.get("val", {}).get(step)
+    if val is None:
+        return None
+    return float(metrics.fit_temperature(val.logits, val.labels))
+
+
+def id_metrics(root, group_id, uid, arm=None):
     """In-distribution accuracy/ECE/NLL/Brier at the SAME step the OOD dump uses.
 
     AUROC and its companions are the only metrics definable on the OOD side --
@@ -91,8 +125,13 @@ def id_metrics(root, group_id, uid):
     four, results-plan 0.1 requires them on every figure, and without them a
     detection number is uninterpretable: a model that is bad in-distribution can
     still separate ID from OOD, and the AUROC alone cannot distinguish that from
-    a good model. Taken at the final step so it describes the same checkpoint
-    the detection metrics do, not a better one from earlier in training.
+    a good model. Taken at the final dumped step so it describes the same
+    checkpoint the detection metrics do, not a better one from earlier.
+
+    For the current campaign that step is ALSO the val-optimal one: probe.py and
+    probing_vbll.py write a single dump, taken at the argmin, with the OOD
+    forward pass alongside it -- so the `at_best_*` block below is a no-op. See
+    the note there.
     """
     indexed = {}
     for record in evaldump.iter_dumps(root, group_id, uid):
@@ -104,8 +143,12 @@ def id_metrics(root, group_id, uid):
     test = indexed["test"][step]
     out = dict(metrics.classification_metrics(test.logits, test.labels))
 
+    # AdamW+CE only -- see curves.TS_ARMS. VBLL and IBProbit are reported RAW:
+    # their claim is calibration by construction, and their dumped array is an
+    # already-normalized log-predictive, so dividing it by T is not the same
+    # transform that TS applies to CE's logits.
     val = indexed.get("val", {}).get(step)
-    if val is not None:
+    if val is not None and curves.applies_temperature_scaling(arm):
         temperature = metrics.fit_temperature(val.logits, val.labels)
         scaled = metrics.apply_temperature(test.logits, temperature)
         out["temperature"] = temperature
@@ -115,14 +158,26 @@ def id_metrics(root, group_id, uid):
             for k, v in metrics.classification_metrics(scaled, test.labels).items()
         })
 
+    out.update(completeness(test.meta))
+    out["dumped_step"] = step
+    out["n_dumps"] = len(indexed["test"])
+
     # The same metrics at the val-optimal step, which is the point the tuning
     # campaign actually SELECTED these hyperparameters at (its objective was
-    # min-over-dumps val_nll). The probe scripts carry no patience, so the final
-    # step can be far past that point -- and an arm that overfits without early
-    # stopping is then scored somewhere its own tuning never endorsed. The gap
-    # between these two blocks is how much that costs, per arm. Detection cannot
-    # be moved to the val-optimal step: the OOD dump is written once, at the end.
-    if indexed.get("val"):
+    # min-over-dumps val_nll). The probe scripts carry no patience, so on a
+    # TRAJECTORY dump the final step can be far past that point, and an arm that
+    # overfits is then scored somewhere its own tuning never endorsed. The gap
+    # between these two blocks is how much that costs, per arm.
+    #
+    # Guarded on there being more than one dumped step, because on this campaign
+    # there is not. The OOD dump moved into the eval loop and is now written at
+    # the argmin, so `best_step == step` identically -- and emitting `at_best_*`
+    # anyway produced two numbers that are equal by construction. The figure
+    # drew them as a "val-optimal vs final" comparison with a connector whose
+    # length was necessarily zero, which reads as the measured finding "no arm
+    # overfits" rather than "not measured". Verified across all 90 runs of the
+    # Fig 2 sweep: val_optimal_step == final_step in every one.
+    if len(indexed["test"]) > 1 and indexed.get("val"):
         best_step = min(
             indexed["val"],
             key=lambda s: metrics.nll(indexed["val"][s].logits, indexed["val"][s].labels),
@@ -179,13 +234,29 @@ def collect(root):
                     row[name] = None
                     row.setdefault("refused", {})[name] = str(exc)[:120]
 
+            # The temperature-scaled variant of each shared score, for TS_ARMS
+            # only. Fig 1 carries CE+TS as its comparator, so Fig 2 reporting
+            # CE raw would compare the two figures' CE columns at different
+            # operating points.
+            temperature = fitted_temperature(root, group_id, uid, arm)
+            if temperature is not None:
+                row["temperature"] = temperature
+                for name, fn in SHARED_SCORES.items():
+                    try:
+                        row[f"ts_{name}"] = curves.run_detection(
+                            root, group_id, uid, fn, temperature=temperature
+                        )
+                    except ValueError as exc:
+                        row[f"ts_{name}"] = None
+                        row.setdefault("refused", {})[f"ts_{name}"] = str(exc)[:120]
+
             try:
                 row["native"] = curves.run_native_detection(root, group_id, uid)
             except ValueError as exc:
                 row["native"] = None
                 row.setdefault("refused", {})["native"] = str(exc)[:120]
 
-            row["id_metrics"] = id_metrics(root, group_id, uid)
+            row["id_metrics"] = id_metrics(root, group_id, uid, arm)
 
             rows.append(row)
             print(f"[fig2] {arm:<9s} {m['id']:>8s} vs {m['ood']:<9s} seed {m['seed']}  "
@@ -208,7 +279,8 @@ def summarize(rows):
     buckets = collections.defaultdict(lambda: collections.defaultdict(list))
     for r in rows:
         pair = f"{r['id']}_vs_{r['ood']}"
-        for score in ("msp", "entropy", "energy", "max_logit", "native"):
+        for score in ("msp", "entropy", "ts_msp", "ts_entropy",
+                      "energy", "max_logit", "native"):
             if r.get(score):
                 for metric, value in r[score].items():
                     buckets[(r["arm"], pair, score)][metric].append(value)
@@ -232,13 +304,42 @@ def summarize_id(rows):
     performance does not depend on which OOD set it is later scored against, so
     keying by pair would report the same model twice and invite reading a
     difference into what is one number.
+
+    And for the same reason each (arm, ID dataset, seed) is counted ONCE. The
+    OOD set is not an input to training -- same config, same seed, same
+    trajectory -- so cifar10's two pairs are the same ten runs submitted twice,
+    not twenty. Averaging all twenty reported `n_runs: 20` for ten independent
+    seeds and put every cifar10 value into the mean twice. (Verified on the
+    campaign: for ibprobit all ten cifar10 seeds are bitwise identical across
+    the two pairs, and for adamw_ce seven of ten are, the rest differing in the
+    sixth decimal from GPU reduction order. The duplication is real, not an
+    artefact of the check.)
+
+    Deduplication is by seed rather than by value, so two runs that genuinely
+    diverged in the last decimal still collapse to one -- they are one run.
     """
     buckets = collections.defaultdict(lambda: collections.defaultdict(list))
+    seen = set()
+    duplicates = 0
     for r in rows:
         if not r.get("id_metrics"):
             continue
+        key = (r["arm"], r["id"], r["seed"])
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
         for metric, value in r["id_metrics"].items():
-            buckets[(r["arm"], r["id"])][metric].append(value)
+            # id_metrics now also carries the completeness fields, which are
+            # None on dumps too old to have them -- and st.mean chokes on None
+            # rather than skipping it. bool passes this test, which is what
+            # turns `at_last_eval` into a per-cell truncation rate.
+            if isinstance(value, (int, float)):
+                buckets[(r["arm"], r["id"])][metric].append(float(value))
+    if duplicates:
+        print(f"\n[fig2] ID control: collapsed {duplicates} duplicate "
+              f"(arm, ID dataset, seed) run(s) -- an ID dataset that appears in "
+              f"two pairs is trained once, not twice")
 
     out = {}
     for (arm, dataset), metric_values in sorted(buckets.items()):
@@ -256,6 +357,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dump-root", default=os.environ.get("BLLARSE_EVAL_DUMP_ROOT", "eval_dumps"))
     p.add_argument("--out", default="fig2_detection.json")
+    p.add_argument("--publish", nargs="?", const="fig2_detection", default=None,
+                   metavar="NAME",
+                   help="Publish the JSON as an MLflow artifact under NAME "
+                        "so plotting can fetch it with --json mlflow:NAME. "
+                        "This is what lets figures be rebuilt off-cluster; "
+                        "without it the JSON only exists beside the dumps.")
     args = p.parse_args()
 
     rows = collect(args.dump_root)
@@ -292,29 +399,52 @@ def main():
               + "".join(f"{s[m]['mean']:>9.4f}" for m in ("acc", "ece", "nll", "brier"))
               + f"{s.get('temperature', {}).get('mean', float('nan')):>7.3f}")
 
-    print("\nSame runs at the VAL-OPTIMAL step -- where the tuning campaign "
-          "selected these configs.")
-    print("A large gap means the arm overfits without early stopping, which the "
-          "probe scripts do not do.")
-    print(f"{'arm':<10s} {'dataset':<12s} {'acc':>9s} {'ECE':>9s} {'NLL':>9s} "
-          f"{'Brier':>9s} {'dNLL':>9s} {'step':>14s}")
-    print("-" * 88)
-    for key, s in id_summary.items():
-        arm, dataset = key.split("|")
-        if "at_best_nll" not in s:
-            continue
-        d_nll = s["nll"]["mean"] - s["at_best_nll"]["mean"]
-        print(f"{arm:<10s} {dataset:<12s} "
-              + "".join(f"{s['at_best_' + m]['mean']:>9.4f}"
-                        for m in ("acc", "ece", "nll", "brier"))
-              + f"{d_nll:>+9.4f}"
-              + f"{int(s['val_optimal_step']['mean']):>8d}/"
-                f"{int(s['final_step']['mean']):<6d}")
+    comparable = [s for s in id_summary.values() if "at_best_nll" in s]
+    if comparable:
+        print("\nSame runs at the VAL-OPTIMAL step -- where the tuning campaign "
+              "selected these configs.")
+        print("A large gap means the arm overfits without early stopping, which "
+              "the probe scripts do not do.")
+        print(f"{'arm':<10s} {'dataset':<12s} {'acc':>9s} {'ECE':>9s} {'NLL':>9s} "
+              f"{'Brier':>9s} {'dNLL':>9s} {'step':>14s}")
+        print("-" * 88)
+        for key, s in id_summary.items():
+            arm, dataset = key.split("|")
+            if "at_best_nll" not in s:
+                continue
+            d_nll = s["nll"]["mean"] - s["at_best_nll"]["mean"]
+            print(f"{arm:<10s} {dataset:<12s} "
+                  + "".join(f"{s['at_best_' + m]['mean']:>9.4f}"
+                            for m in ("acc", "ece", "nll", "brier"))
+                  + f"{d_nll:>+9.4f}"
+                  + f"{int(s['val_optimal_step']['mean']):>8d}/"
+                    f"{int(s['final_step']['mean']):<6d}")
+    else:
+        # Said plainly rather than printed as an empty table under a header,
+        # which is how this read while the figure beside it drew the comparison
+        # as if it had happened.
+        print("\nNo val-optimal-vs-final comparison: every run wrote a single "
+              "dump, taken AT its val optimum, so the two steps coincide by "
+              "construction. Measuring the endpoint penalty needs trajectory "
+              "dumps.")
 
     with open(args.out, "w") as fh:
         json.dump({"rows": rows, "summary": summary, "id_summary": id_summary}, fh, indent=2)
     print(f"\nwrote {args.out} ({len(rows)} runs, {len(summary)} detection cells, "
           f"{len(id_summary)} ID cells)")
+
+    if args.publish:
+        # Raises rather than warning: a caller that asked to publish and then
+        # plots from a stale local JSON, believing it came from the server, is
+        # the exact failure this exists to prevent.
+        from bllarse.mlflow_utils import publish_analysis
+        run_id = publish_analysis(args.out, args.publish, tags={
+            "n_runs": len(rows),
+            "n_detection_cells": len(summary),
+            "n_id_cells": len(id_summary),
+        })
+        print(f"published as mlflow:{args.publish} (run {run_id}) -- "
+              f"plot anywhere with --json mlflow:{args.publish}")
 
 
 if __name__ == "__main__":

@@ -291,6 +291,7 @@ def _id_ood_pair(
 def run_detection(
     root, group_id: str, uid: str, score_fn: Callable[[Any], Any],
     step: int | None = None, ood_split: str = "ood",
+    temperature: float | None = None,
 ) -> dict[str, float]:
     """Detection metrics from a shared score function, at `step` (default: last).
 
@@ -302,13 +303,28 @@ def run_detection(
     `ood_split` selects which OOD dump to pair against test -- see
     `_id_ood_pair`; the default "ood" matches probe.py / probing_vbll.py.
 
+    `temperature`, when given, divides BOTH sides' logits before scoring -- the
+    detection analogue of the temperature-scaled ID metrics. One temperature,
+    fitted on the ID validation split and applied unchanged to the OOD logits,
+    because a deployed model carries one temperature and has no OOD labels to
+    fit a second on. It is NOT a no-op on a rank-based metric: with more than
+    two classes, scaling every logit gap by 1/T can reorder max-probability
+    across samples (gaps {-1,-1} and {-0.5,-3} rank one way at T=1 and the
+    other at T=0.5), so an AUROC computed this way genuinely differs.
+
+    Only pass it for arms in TS_ARMS. VBLL and IBProbit dump an
+    already-normalized log-predictive, so dividing that by T is not the
+    transform TS applies to CE's logits.
+
     This is Fig 2's PRIMARY comparison. `run_native_detection` answers the
     different question of whether each method's own epistemic quantity works.
     """
     id_record, ood_record = _id_ood_pair(root, group_id, uid, step, ood_split=ood_split)
-    return detection.detection_metrics(
-        score_fn(id_record.logits), score_fn(ood_record.logits)
-    )
+    id_logits, ood_logits = id_record.logits, ood_record.logits
+    if temperature is not None:
+        id_logits = metrics.apply_temperature(id_logits, temperature)
+        ood_logits = metrics.apply_temperature(ood_logits, temperature)
+    return detection.detection_metrics(score_fn(id_logits), score_fn(ood_logits))
 
 
 def run_native_detection(

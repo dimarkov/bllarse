@@ -1,8 +1,19 @@
 """Does IBProbit need its contamination parameter at all?
 
 Pairs `ibprobit` (eps_init tuned per dataset) against `ibprobit_noeps`
-(eps_init pinned at 1e-12, i.e. the mixture floor numerically absent) on the
-Fig 1 runs, and reports the PAIRED difference.
+(eps_init pinned at 1e-12, i.e. the mixture floor numerically absent) and
+reports the PAIRED difference.
+
+Covers BOTH campaigns: `--figure fig1` is the backbone ladder x five datasets,
+`--figure fig2` the OOD campaign on dinov3_huge. Fig 2's tuned arm existed and
+was read by nothing at all -- 30 runs of dumps whose only mention anywhere was
+the sweep file that wrote them -- so the eps claim rested on the Fig 1 campaign
+alone while the evidence for the other sat unexamined on disk.
+
+Fig 2's 30 runs are 20 trainings: cifar10 is the ID set of two OOD pairs and the
+OOD set is not an input to training, so those runs are submitted twice and
+collapse to one. Everything compared here is an in-distribution metric, so the
+pairing key is the ID dataset and the duplicates are reported, not pooled.
 
 Paired, not two independent means: the two arms share the backbone ladder, the
 five datasets and the ten reported seeds, so pairing on (model, dataset, seed)
@@ -31,6 +42,7 @@ import numpy as np  # noqa: E402
 
 from bllarse import evaldump, metrics  # noqa: E402
 from fig1_curves import UID_RE, score_run  # noqa: E402
+from fig2_detection import UID_RE as UID_RE_FIG2  # noqa: E402
 
 # 4 backbones x 5 datasets x 10 seeds. Enumerated so a run that produced NO
 # dump at all is reported as such rather than quietly shrinking the matched
@@ -39,24 +51,87 @@ MODELS = ("dinov3_small", "dinov3_big", "dinov3_large", "dinov3_huge")
 DATASETS = ("oxford_pets", "dtd", "flowers102", "stanford_cars", "food101")
 SEEDS = tuple(range(137, 147))
 
+# Fig 2 is dinov3_huge only -- it has no backbone axis, so the other three rungs
+# were never run (see bllarse_sweeps/probe_ood_adamw_ce.py).
+OOD_MODELS = ("dinov3_huge",)
+OOD_PAIRS = (("cifar10", "svhn"), ("cifar10", "cifar100"), ("cifar100", "svhn"))
+
 # The tuned arm first: deltas below are (noeps - tuned), so a POSITIVE delta on
 # a lower-is-better metric means dropping eps HURT.
 TUNED_GROUP = "probe_ibprobit_fig1"
 NOEPS_GROUP = "probe_ibprobit_noeps_fig1"
 
+
+def _fig1_expected():
+    return tuple(
+        f"{m}_{d}_seed{s}" for m in MODELS for d in DATASETS for s in SEEDS
+    )
+
+
+def _fig2_expected():
+    return tuple(
+        f"{m}_{i}_vs_{o}_seed{s}"
+        for m in OOD_MODELS for i, o in OOD_PAIRS for s in SEEDS
+    )
+
+
+# What each campaign's ablation is made of. `key` is what pairing happens on,
+# and its second slot is what `summarize` groups by -- the dataset for Fig 1,
+# the ID/OOD pair for Fig 2, so one summariser serves both.
+FIGURES = {
+    "fig1": {
+        "tuned": TUNED_GROUP,
+        "noeps": NOEPS_GROUP,
+        "uid_re": UID_RE,
+        "expected": _fig1_expected,
+        "key": lambda m: (m["model"], m["dataset"], int(m["seed"])),
+        "label": "backbone ladder x 5 datasets",
+    },
+    "fig2": {
+        "tuned": "probe_ibprobit_fig2",
+        "noeps": "probe_ibprobit_noeps_fig2",
+        "uid_re": UID_RE_FIG2,
+        "expected": _fig2_expected,
+        # Keyed on the ID DATASET, not on the ID/OOD pair. Every metric this
+        # ablation compares (nll, acc, ece, brier, and their TS variants) is an
+        # in-distribution metric, and the OOD set is not an input to training --
+        # so cifar10's two pairs are one training run submitted twice, not two.
+        #
+        # Keying on the pair made that visible and wrong: cifar10_vs_svhn and
+        # cifar10_vs_cifar100 came out byte-identical on every column, and the
+        # pooled counts read "n=30, noeps better on 2" when only 20 of those
+        # rows were independent. Same double-count as fig2_detection.summarize_id.
+        "key": lambda m: (m["model"], m["id"], int(m["seed"])),
+        "label": "2 ID datasets on dinov3_huge (3 OOD pairs, deduplicated)",
+    },
+}
+
 # Lower is better for all but acc.
-METRICS = ("val_nll", "nll", "acc", "ece", "brier", "ts_nll", "ts_ece")
-LOWER_IS_BETTER = {"val_nll", "nll", "ece", "brier", "ts_nll", "ts_ece"}
+#
+# No `ts_*`: both arms here are IBProbit, and temperature scaling is reported
+# for AdamW+CE alone (see curves.TS_ARMS). An earlier version of this list
+# carried ts_nll and ts_ece, which meant the ablation's headline "0 of 20 pairs
+# favour eps-free after temperature scaling" was a statement about a
+# temperature-scaled IBProbit -- a quantity the project does not report.
+METRICS = ("val_nll", "nll", "acc", "ece", "brier")
+LOWER_IS_BETTER = {"val_nll", "nll", "ece", "brier"}
 
 
-def collect_group(root, group_id):
-    """{(model, dataset, seed): scored} for one group."""
+def collect_group(root, group_id, uid_re=UID_RE, key_fn=None, duplicates=None):
+    """{key: scored} for one group, keyed by `key_fn` over the uid match.
+
+    `uid_re`/`key_fn` are parameters rather than module constants because the
+    two campaigns name their runs differently -- `model_dataset_seedN` against
+    `model_id_vs_ood_seedN` -- while everything downstream is identical.
+    """
+    key_fn = key_fn or FIGURES["fig1"]["key"]
     out = {}
+    duplicates = [] if duplicates is None else duplicates
     directory = os.path.join(root, group_id)
     if not os.path.isdir(directory):
         return out
     for uid in sorted(os.listdir(directory)):
-        match = UID_RE.match(uid)
+        match = uid_re.match(uid)
         if not match:
             continue
         scored = score_run(root, group_id, uid)
@@ -69,12 +144,18 @@ def collect_group(root, group_id):
             if record.meta["split"] == "val" and record.meta["step"] == scored["step"]:
                 scored["val_nll"] = float(metrics.nll(record.logits, record.labels))
                 break
-        key = (match["model"], match["dataset"], int(match["seed"]))
+        key = key_fn(match)
+        if key in out:
+            # Collapsed, not overwritten silently. Two uids mapping to one key
+            # means the same training was submitted twice (see the fig2 key),
+            # and a reader is entitled to know the pooled n is not the run count.
+            duplicates.append(uid)
+            continue
         out[key] = scored
     return out
 
 
-def missing_runs(root, group_id):
+def missing_runs(root, group_id, expected):
     """Expected uids with no dump directory at all.
 
     A diverged run raises inside _write_best before writing anything, so it
@@ -83,11 +164,7 @@ def missing_runs(root, group_id):
     """
     directory = os.path.join(root, group_id)
     present = set(os.listdir(directory)) if os.path.isdir(directory) else set()
-    return sorted(
-        f"{m}_{d}_seed{s}"
-        for m in MODELS for d in DATASETS for s in SEEDS
-        if f"{m}_{d}_seed{s}" not in present
-    )
+    return sorted(uid for uid in expected if uid not in present)
 
 
 def pair(tuned, noeps):
@@ -195,20 +272,34 @@ def main():
                    choices=["dataset", "model_dataset"],
                    help="dataset collapses the backbone ladder -- the view for "
                         "deciding which arm a figure should show.")
+    p.add_argument("--figure", default="fig1", choices=sorted(FIGURES),
+                   help="Which campaign to ablate. fig2's tuned arm was "
+                        "previously read by nothing at all.")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 
-    tuned = collect_group(args.dump_root, TUNED_GROUP)
-    noeps = collect_group(args.dump_root, NOEPS_GROUP)
+    figure = FIGURES[args.figure]
+    dupes = []
+    tuned = collect_group(args.dump_root, figure["tuned"],
+                          figure["uid_re"], figure["key"], dupes)
+    noeps = collect_group(args.dump_root, figure["noeps"],
+                          figure["uid_re"], figure["key"], dupes)
     pairs, only_tuned, only_noeps = pair(tuned, noeps)
+
+    print(f"=== eps ablation, {args.figure} ({figure['label']}) ===")
 
     print(f"tuned-eps runs scored : {len(tuned)}")
     print(f"eps=1e-12 runs scored : {len(noeps)}")
     print(f"MATCHED pairs         : {len(pairs)}")
+    if dupes:
+        print(f"collapsed duplicates  : {len(dupes)} (same training submitted "
+              f"under more than one uid; pooled n counts each ONCE)")
     print(f"unmatched (tuned only): {len(only_tuned)}")
     print(f"unmatched (noeps only): {len(only_noeps)}")
-    for label, group in (("tuned eps", TUNED_GROUP), ("eps=1e-12", NOEPS_GROUP)):
-        absent = missing_runs(args.dump_root, group)
+    expected = figure["expected"]()
+    for label, group in (("tuned eps", figure["tuned"]),
+                         ("eps=1e-12", figure["noeps"])):
+        absent = missing_runs(args.dump_root, group, expected)
         print(f"NO DUMP AT ALL ({label:9s}): {len(absent)}"
               + (f"  {absent}" if absent else ""))
     if not pairs:

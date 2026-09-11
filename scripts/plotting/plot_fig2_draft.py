@@ -37,23 +37,60 @@ METRICS = [("auroc", "AUROC ↑"), ("fpr95", "FPR@95TPR ↓"), ("aupr", "AUPR �
 # variance is likewise measured and excluded here; it belongs in the text, not
 # on this figure, because it answers a different question (see the module
 # docstring of scripts/analysis/fig2_detection.py) and is far off this scale.
+# MSP ALONE, by decision. Entropy is still computed and still in the JSON, and
+# it is the stronger detector by 0.001-0.007 AUROC for every arm -- but the ARM
+# ORDERING is identical under both scores in all six measured cases (3 pairs x
+# {samples40, win5}), so no claim rests on it and one score per arm makes the
+# x-axis just the arm.
+#
+# MSP rather than entropy because it is the score no arm can be said to be
+# disadvantaged by: VBLL's own library ships `max_predictive` -- the max of the
+# mean predictive probability, i.e. exactly MSP -- as its OOD score.
+# CE is shown TEMPERATURE-SCALED and only so, matching Fig 1, where TS is CE's
+# comparator because it is the cheap post-hoc fix available to a plain softmax
+# head. Carrying raw CE here and TS CE there would put the two figures' CE
+# columns at different operating points. VBLL and IBProbit stay raw: their
+# claim is calibration by construction and their dumps are already-normalized
+# log-predictives (curves.TS_ARMS).
 SERIES = [
-    ("adamw_ce", "msp",     "CE / MSP",       "#4C72B0"),
-    ("adamw_ce", "entropy", "CE / entropy",   "#6C8EBF"),
-    ("vbll",     "msp",     "VBLL / MSP",     "#C44E52"),
-    ("vbll",     "entropy", "VBLL / entropy", "#D98C8E"),
-    # Added with the campaign's third arm; this list had been left at two.
-    ("ibprobit", "msp",     "IBProbit / MSP",     "#8172B2"),
-    ("ibprobit", "entropy", "IBProbit / entropy", "#A093C7"),
+    ("adamw_ce", "ts_msp", "CE+TS / MSP",   "#4C72B0"),
+    ("vbll",     "msp",    "VBLL / MSP",     "#C44E52"),
+    ("ibprobit", "msp",    "IBProbit / MSP", "#8172B2"),
 ]
 
 # ID control: the four classification metrics, keyed by ID dataset. Undefined on
 # the OOD side (an SVHN digit has no correct CIFAR label), so they cannot go on
 # the detection panels -- but without them a detection number is uninterpretable.
-ID_METRICS = [("acc", "Accuracy ↑"), ("ece", "ECE ↓"), ("nll", "NLL ↓"), ("brier", "Brier ↓")]
+# ECE dropped here for the same reason as in Fig 1: NLL and Brier are proper
+# scores and already price calibration. It remains in the JSON.
+ID_METRICS = [("acc", "Accuracy ↑"), ("nll", "NLL ↓"), ("brier", "Brier ↓")]
 ID_DATASETS = [("cifar10", "CIFAR-10"), ("cifar100", "CIFAR-100")]
-ID_ARMS = [("adamw_ce", "AdamW+CE", "#4C72B0"), ("vbll", "VBLL", "#C44E52"),
-           ("ibprobit", "IBProbit", "#8172B2")]
+# (arm, label, colour, metric prefix). CE carries "ts_" so the ID control
+# describes the same operating point the detection panels do.
+ID_ARMS = [("adamw_ce", "AdamW+CE (TS)", "#4C72B0", "ts_"),
+           ("vbll", "VBLL", "#C44E52", ""),
+           ("ibprobit", "IBProbit", "#8172B2", "")]
+
+
+def _arm_boundaries():
+    """x positions between adjacent SERIES entries belonging to different arms.
+
+    One divider per arm change, however many arms SERIES grows to. The x-axis
+    is (arm x score) and the dividers are what stop a reader attributing a
+    neighbouring arm's score to the wrong method.
+    """
+    # None needed when SERIES holds one entry per arm: every x position IS an
+    # arm then, so a divider between each adjacent pair separates nothing and
+    # only adds rules to the panel. This returns to dividing as soon as any arm
+    # contributes two entries again (a second score, or a second campaign).
+    arms = [s[0] for s in SERIES]
+    if len(set(arms)) == len(arms):
+        return []
+    return [
+        i - 0.5
+        for i in range(1, len(SERIES))
+        if SERIES[i][0] != SERIES[i - 1][0]
+    ]
 
 
 def make_figure(summary, out_path):
@@ -86,8 +123,14 @@ def make_figure(summary, out_path):
                 [s[2] for s in SERIES] if i == len(METRICS) - 1 else [],
                 rotation=45, ha="right", fontsize=7,
             )
-            # Separates the arms; both offer the same two scores now.
-            ax.axvline(1.5, color="#cccccc", linewidth=0.8, linestyle="--", zorder=1)
+            # Derived from SERIES, never hardcoded. This was a single axvline
+            # at 1.5 -- correct for the two arms the figure had when it was
+            # written, and silently wrong the moment IBProbit made it three:
+            # the CE|VBLL divider stayed and the VBLL|IBProbit one was simply
+            # absent, so four of the six points read as belonging to one arm.
+            for boundary in _arm_boundaries():
+                ax.axvline(boundary, color="#cccccc", linewidth=0.8,
+                           linestyle="--", zorder=1)
             ax.grid(axis="y", alpha=0.25, linewidth=0.5)
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
@@ -109,35 +152,52 @@ def make_figure(summary, out_path):
 
 
 def make_id_figure(id_summary, out_path):
-    """The in-distribution control, at both the final and the val-optimal step.
+    """The in-distribution control for the checkpoint detection is scored on.
 
-    Two points per arm, joined: the val-optimal step is where the tuning
-    campaign selected the configuration, the final step is where the detection
-    metrics are computed. A long connector means that arm overfits without early
-    stopping, and that its detection number is being read off a checkpoint its
-    own tuning never endorsed.
+    One point per arm, with a band over seeds. Detection metrics say nothing
+    about whether a model is any good in-distribution -- a weak model can still
+    separate ID from OOD -- so results-plan 0.1 requires these four beside every
+    detection panel.
+
+    This used to draw TWO points per arm joined by a connector, hollow for the
+    val-optimal step and filled for the final step, captioned "a long connector
+    means that arm overfits without early stopping". It could never show one.
+    Each run writes a single dump, taken at its val optimum, with the OOD
+    forward pass alongside it -- so the two steps are the same step in all 90
+    runs, the connector had length zero everywhere, and the hollow markers were
+    hidden underneath the filled ones. A figure that cannot fail its own test
+    reads as having passed it.
+
+    `at_best_*` is emitted again the moment runs dump trajectories, and the
+    two-point form should come back with it -- but as something measured.
     """
+    if any("at_best_acc" in cell for cell in id_summary.values()):
+        raise NotImplementedError(
+            "id_summary carries at_best_*, which this single-point figure would "
+            "silently ignore -- reporting the endpoint alone. Either (a) the "
+            "JSON predates the fix and must be regenerated with "
+            "scripts/analysis/fig2_detection.py, which no longer emits at_best_* "
+            "for single-dump runs, or (b) the runs genuinely dumped "
+            "trajectories, the val-optimal vs final comparison is now a real "
+            "measurement, and the two-point form should be restored on purpose."
+        )
+
     fig, axes = plt.subplots(len(ID_METRICS), len(ID_DATASETS),
                              figsize=(3.0 * len(ID_DATASETS), 2.1 * len(ID_METRICS)))
 
     for j, (dataset, ds_label) in enumerate(ID_DATASETS):
         for i, (metric, metric_label) in enumerate(ID_METRICS):
             ax = axes[i, j]
-            for x, (arm, arm_label, colour) in enumerate(ID_ARMS):
+            for x, (arm, arm_label, colour, prefix) in enumerate(ID_ARMS):
                 cell = id_summary.get(f"{arm}|{dataset}")
-                if not cell or metric not in cell:
+                key = f"{prefix}{metric}"
+                if not cell or key not in cell:
                     continue
-                final = cell[metric]["mean"]
-                best = cell.get(f"at_best_{metric}", {}).get("mean")
-                if best is not None:
-                    ax.plot([x, x], [best, final], color=colour, alpha=0.35,
-                            linewidth=1.4, zorder=2)
-                    ax.scatter([x], [best], s=34, facecolors="white",
-                               edgecolors=colour, linewidths=1.4, zorder=3,
-                               label="val-optimal step" if (i == 0 and j == 0 and x == 0) else None)
-                ax.scatter([x], [final], s=58, color=colour, zorder=4,
-                           edgecolors="white", linewidths=0.8,
-                           label="final step" if (i == 0 and j == 0 and x == 0) else None)
+                ax.errorbar([x], [cell[key]["mean"]], yerr=[cell[key]["std"]],
+                            fmt="none", ecolor="#999999", elinewidth=1,
+                            capsize=3, zorder=2)
+                ax.scatter([x], [cell[key]["mean"]], s=58, color=colour,
+                           zorder=4, edgecolors="white", linewidths=0.8)
 
             ax.set_xlim(-0.6, len(ID_ARMS) - 0.4)
             ax.set_xticks(range(len(ID_ARMS)))
@@ -152,14 +212,11 @@ def make_id_figure(id_summary, out_path):
             if j == 0:
                 ax.set_ylabel(metric_label, fontsize=9)
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False,
-               fontsize=8, bbox_to_anchor=(0.5, 1.005))
     fig.suptitle(
         "DRAFT Fig 2 control — in-distribution performance of the same runs\n"
-        "hollow = val-optimal step (where the config was tuned), "
-        "filled = final step (where detection is scored)",
-        fontsize=9.5, y=1.075,
+        "scored at each run's val-optimal step, which is where the OOD dump "
+        "is taken; bands are ±1 sd over seeds",
+        fontsize=9.5, y=1.055,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.985])
     fig.savefig(out_path, bbox_inches="tight", dpi=150)
@@ -172,7 +229,13 @@ def main():
     p.add_argument("--out-dir", default="scripts/figures")
     args = p.parse_args()
 
-    with open(args.json) as fh:
+    # `mlflow:<name>` fetches the published artifact; anything else is a
+    # local path. This is what decouples plotting from the cluster that
+    # produced the dumps.
+    from bllarse.mlflow_utils import resolve_analysis_path
+    json_path = resolve_analysis_path(args.json)
+
+    with open(json_path) as fh:
         payload = json.load(fh)
     summary = payload["summary"]
     id_summary = payload.get("id_summary", {})
