@@ -100,6 +100,21 @@ def format_samples(n: float) -> str:
         return f"{n / 1e3:.0f}k"
     return f"{n:.0f}"
 
+# Fig 6 gets a fourth row that Fig 5 cannot have: there is no detection score
+# without a second distribution to detect against. MSP only, matching the
+# probing figure -- it reads the normalised predictive, so it is the one score
+# all three arms produce identically, and IBProbit's moderation reaches it
+# through the class-independent rescaling rather than being discarded.
+#
+# Higher is better, unlike every other row here, so `lower_is_better` is False
+# and the axis label carries the arrow.
+#
+# Note what this row is and is not. All four sets share ImageNet's label space,
+# so it measures whether the model can tell SHIFTED inputs from clean ones --
+# covariate shift. It is not the semantic OOD task of Fig 2 (CIFAR-10 vs SVHN,
+# disjoint labels), and the two numbers must not be read across.
+OOD_METRICS = METRICS + [("auroc", "MSP AUROC ↑", False, False)]
+
 # OOD panel order. Matches finetune.imagenet.OOD_KEYS; R and A cover only 200 of
 # the 1000 classes and are evaluated under the subset mask, which the caption
 # has to say out loud.

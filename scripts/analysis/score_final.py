@@ -32,12 +32,47 @@ import json
 import os
 import sys
 from collections import defaultdict
+
+import numpy as np
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from bllarse import evaldump, metrics  # noqa: E402
+from bllarse import detection, evaldump, metrics  # noqa: E402
 from bllarse.analysis import curves  # noqa: E402
+
+
+# The fp16-safe sentinel finetune_jax.evaluate_split writes into the classes an
+# OOD subset does not cover. Recovering the subset from the dump rather than
+# from a registry keeps the two in step: whatever was masked at eval time is
+# exactly what is masked here.
+MASK_SENTINEL = -9.0e3
+
+
+def _subset_of(logits) -> "np.ndarray | None":
+    """Columns this dump actually scores, or None when it scores all of them.
+
+    ImageNet-R and -A cover 200 of the 1000 classes and are dumped with the
+    other 800 driven to the sentinel; V2 and Sketch span all 1000 and are not
+    masked.
+    """
+    kept = ~(np.asarray(logits) <= MASK_SENTINEL).all(axis=0)
+    return None if kept.all() else np.flatnonzero(kept)
+
+
+def _msp(logits, subset=None):
+    """1 - max softmax probability, over `subset` when one is given.
+
+    Restricting by driving the other columns to the sentinel rather than by
+    slicing, so the ID reference goes through the arithmetic the OOD dump
+    already went through at eval time.
+    """
+    x = np.asarray(logits, dtype=np.float32)
+    if subset is not None:
+        keep = np.zeros(x.shape[-1], dtype=bool)
+        keep[subset] = True
+        x = np.where(keep, x, MASK_SENTINEL)
+    return np.asarray(metrics.msp_ood_score(x))
 
 
 def _seed_of(uid: str) -> int:
@@ -186,6 +221,49 @@ def main() -> None:
                 temperatures = {r["samples_seen"]: r["temperature"]
                                 for r in rows}
 
+        # DETECTION needs both sides of a pair at the same step, so collect
+        # the in-distribution MSP first. Scores, not logits: 40k floats a step
+        # against 40k x 1000 fp16, which would not fit for a whole trajectory.
+        #
+        # A masked column needs its OWN id reference -- the same 200 classes,
+        # and only the id samples whose label falls in them. Comparing a
+        # 200-class max against a 1000-class max would measure the class count,
+        # not the shift: renormalising over fewer classes raises the max
+        # mechanically, and every R/A point would look confidently in
+        # distribution.
+        subsets = {}
+        for rec in evaldump.iter_dumps(args.dump_root, args.group_id, uid,
+                                       skip_corrupt=True):
+            split = rec.meta.get("split", "")
+            if split.startswith("ood_") and split not in subsets:
+                subsets[split] = _subset_of(rec.logits)
+        distinct = {None: None}
+        for sub in subsets.values():
+            if sub is not None:
+                distinct[tuple(sub)] = sub
+
+        # Raw and temperature-scaled, because the CE+TS series is drawn from
+        # `ood_ts` and would otherwise have no detection row at all. T is the
+        # one fit on the in-distribution val split at this step -- the same
+        # scalar Fig 5 uses -- applied to BOTH sides of the pair, never refit
+        # on the shifted set.
+        id_scores = defaultdict(dict)      # {subset_key: {samples: scores}}
+        id_scores_ts = defaultdict(dict)
+        for rec in evaldump.iter_dumps(args.dump_root, args.group_id, uid,
+                                       skip_corrupt=True):
+            if rec.meta.get("split") != "test":
+                continue
+            seen_id = rec.meta["samples_seen"]
+            labels = np.asarray(rec.labels)
+            temp = temperatures.get(seen_id)
+            for key, sub in distinct.items():
+                keep = slice(None) if sub is None else np.isin(labels, sub)
+                logits = rec.logits[keep]
+                id_scores[key][seen_id] = _msp(logits, sub)
+                if temp is not None:
+                    id_scores_ts[key][seen_id] = _msp(
+                        metrics.apply_temperature(logits, temp), sub)
+
         # OOD, on its own (sparser, irregular) grid.
         for rec in evaldump.iter_dumps(args.dump_root, args.group_id, uid,
                                        skip_corrupt=True):
@@ -194,7 +272,20 @@ def main() -> None:
                 continue
             seen = rec.meta["samples_seen"]
             m = metrics.classification_metrics(rec.logits, rec.labels)
-            run["ood"][split][seen] = {k: float(v) for k, v in m.items()}
+            row = {k: float(v) for k, v in m.items()}
+
+            # MSP detection against the id split at the SAME step. MSP only,
+            # matching the probing figure: it reads the normalised predictive,
+            # so it is the one score all three arms produce identically, and
+            # IBProbit's moderation enters it through the class-independent
+            # rescaling rather than being discarded.
+            sub = subsets.get(split)
+            key = None if sub is None else tuple(sub)
+            ref = id_scores.get(key, {}).get(seen)
+            if ref is not None and len(ref):
+                det = detection.detection_metrics(ref, _msp(rec.logits, sub))
+                row.update({k: float(v) for k, v in det.items()})
+            run["ood"][split][seen] = row
 
             # The SAME T that Fig 5 uses at this step, fit on the
             # in-distribution val split and applied unchanged to the shifted
@@ -207,7 +298,13 @@ def main() -> None:
                 continue
             scaled_logits = metrics.apply_temperature(rec.logits, temperature)
             m_ts = metrics.classification_metrics(scaled_logits, rec.labels)
-            run["ood_ts"][split][seen] = {k: float(v) for k, v in m_ts.items()}
+            row_ts = {k: float(v) for k, v in m_ts.items()}
+            ref_ts = id_scores_ts.get(key, {}).get(seen)
+            if ref_ts is not None and len(ref_ts):
+                det_ts = detection.detection_metrics(
+                    ref_ts, _msp(scaled_logits, sub))
+                row_ts.update({k: float(v) for k, v in det_ts.items()})
+            run["ood_ts"][split][seen] = row_ts
 
         for field in ("ood", "ood_ts"):
             run[field] = {k: dict(sorted(v.items()))

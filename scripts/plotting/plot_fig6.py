@@ -46,7 +46,7 @@ from bllarse.analysis import final_json  # noqa: E402
 
 
 def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
-    metrics = final_json.METRICS
+    metrics = final_json.OOD_METRICS
     sets = final_json.OOD_SETS
     fig, axes = plt.subplots(len(metrics), len(sets),
                              figsize=(3.5 * len(sets), 2.7 * len(metrics)),
