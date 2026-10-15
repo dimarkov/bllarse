@@ -1,0 +1,44 @@
+{
+  "cifar10": {
+    "batch_size": 512,
+    "epochs": 310,
+    "provenance": "fixed by decision",
+    "steps": 30000
+  },
+  "cifar100": {
+    "batch_size": 512,
+    "epochs": 310,
+    "provenance": "fixed by decision",
+    "steps": 30000
+  },
+  "dtd": {
+    "batch_size": 512,
+    "epochs": 4286,
+    "provenance": "fixed by decision",
+    "steps": 30000
+  },
+  "flowers102": {
+    "batch_size": 256,
+    "epochs": 10000,
+    "provenance": "fixed by decision",
+    "steps": 30000
+  },
+  "food101": {
+    "batch_size": 512,
+    "epochs": 205,
+    "provenance": "fixed by decision",
+    "steps": 30000
+  },
+  "oxford_pets": {
+    "batch_size": 512,
+    "epochs": 4286,
+    "provenance": "fixed by decision",
+    "steps": 30000
+  },
+  "stanford_cars": {
+    "batch_size": 512,
+    "epochs": 2000,
+    "provenance": "fixed by decision",
+    "steps": 30000
+  }
+}
