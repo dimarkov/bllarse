@@ -2,11 +2,9 @@
 
 Fitting Bayesian last layers or Bayesian "heads" with sparse priors to embeddings of deep neural networks, and pruning their parameters with Bayesian model reduction.
 
-
-## Running finetuning
+## Setup
 
 We recommend using `uv` to create a virtual environment and install dependencies
-
 
 ```bash
 # (Re)create and synchronize your virtual environment:
@@ -15,70 +13,63 @@ uv sync
 
 # Activate it:
 source .venv/bin/activate
-
-# Run any Python code, e.g.:
-python scripts/finetuning.py
 ```
 
-## SLURM sweeps
+## Layout
 
-Python sweep files provide two functions:
+| Path | What it holds |
+|---|---|
+| `src/bllarse/` | The library: Bayesian heads (`losses/`), metrics and OOD detection, logit dumps, the fine-tuning protocol (`finetune/`), Optuna tuning (`tuning/`) and the analysis that turns dumps into curves (`analysis/`) |
+| `scripts/dinov3/` | Feature caching and linear probing on DINOv3 backbones |
+| `scripts/finetune/` | Full-network ImageNet-1k fine-tuning: the JAX arms (AdamW+CE, IBProbit), the PyTorch VBLL arm, and the OOD worker |
+| `scripts/vbll_pytorch/` | The VBLL baseline, built on the reference `vbll` package |
+| `bllarse_sweeps/` | The linear-probing sweeps, with the tuned hyperparameters behind Figs 1 and 2 |
+| `scripts/analysis/`, `scripts/plotting/` | Scoring dumps into JSON, Table 1, and the paper figures |
 
-```python
-def create_configs() -> list[dict]:
-    ...
+## Running a sweep configuration
 
-def run(config: dict) -> None:
-    ...
-```
-
-[`bllarse_sweeps/finetuning_demo.py`](bllarse_sweeps/finetuning_demo.py)
-is a small example using the standard finetuning entry point. From a SLURM
-login node, launch it as a GPU array:
+A sweep file defines `create_configs() -> list[dict]` and `run(config)`. Run one
+of its configurations by index:
 
 ```bash
-source .venv/bin/activate
-
-python -m bllarse.tools.run_sweep \
-  bllarse_sweeps/finetuning_demo.py \
-  --venv .venv \
-  --max-concurrent 4 \
-  --cpus-per-task 8 \
-  --job-name finetuning_demo
+python -m bllarse.tools.run_config bllarse_sweeps/probe_vbll.py 0
 ```
 
-The default job uses `scripts/start_docker_sbatch.sh` and expects an image
-named `bllarse-dev` on each allocated node. Override the image and Docker
-shared-memory allocation when needed:
+Every training script writes logit dumps; all reported metrics are computed
+from them afterwards. MLflow logging is optional: it is on when a config sets
+`enable_mlflow=True`, and it reports to whatever `MLFLOW_TRACKING_URI` points
+at.
+
+## From dumps to figures
+
+Linear probing (Figs 1 and 2):
 
 ```bash
-export BLLARSE_DOCKER_IMAGE=bllarse-dev
-export BLLARSE_DOCKER_SHM_SIZE=16g
+python scripts/analysis/fig1_curves.py --dump-root $DUMPS --out fig1_curves.json
+python scripts/plotting/plot_fig1.py --json fig1_curves.json
+
+python scripts/analysis/fig2_detection.py --dump-root $DUMPS --out fig2_detection.json
+python scripts/plotting/plot_fig2.py --json fig2_detection.json
 ```
 
-Use `--job-script src/slurm/jobs/slurm_run_config.sh` to run directly in the
-host virtual environment instead. `--dry-run` validates the sweep and prints
-the `sbatch` command without submitting it.
-
-Large sweeps can be split while preserving the original config indices:
+Full-network fine-tuning (Table 1, Figs 3-5):
 
 ```bash
-python -m bllarse.tools.run_sweep bllarse_sweeps/my_sweep.py \
-  --index-offset 0 --num-jobs 1000 --max-concurrent 50
+python scripts/analysis/score_final.py --dump-root $DUMPS --group-id $GROUP \
+    --model dinov3_huge --out scores.json
+python scripts/analysis/wallclock_from_dumps.py --dump-root $DUMPS --group-id $GROUP \
+    --model dinov3_huge --out wallclock.json
 
-python -m bllarse.tools.run_sweep bllarse_sweeps/my_sweep.py \
-  --index-offset 1000 --num-jobs 1000 --max-concurrent 50
+python scripts/analysis/table1_endpoint.py --scores scores.json
+python scripts/plotting/plot_fig3.py --scores scores.json
+python scripts/plotting/plot_fig4.py --scores scores.json
+python scripts/plotting/plot_fig5.py --scores scores.json --wallclock wallclock.json \
+    --target-arm ibprobit --target-epochs 1.0 --fraction 1.0
 ```
-
-When a selected config sets `enable_mlflow=True`, the launcher creates one
-MLflow parent run and passes its ID to every array task. Use
-`--parent-run-id <RUN_ID>` to attach another submission to an existing parent.
-Parent creation is fail-loud: if MLflow cannot create the requested parent,
-the array is not submitted.
 
 ## 🔄 Updating Git-based dependencies
 
-Some dependencies in `pyproject.toml` are installed directly from GitHub (e.g. `blrax`, `mlpox`).  
+Some dependencies in `pyproject.toml` are installed directly from GitHub (e.g. `blrax`).  
 By default, `uv sync` will use the commit pinned in your `uv.lock` file, so you won’t automatically get the latest changes from `main`.
 
 To update one of these packages to the newest commit on its branch:

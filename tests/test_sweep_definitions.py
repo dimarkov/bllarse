@@ -1,0 +1,104 @@
+import pytest
+
+from bllarse.tools.module import get_module_from_source_path
+
+SWEEPS = [
+    "bllarse_sweeps/probe_adamw_ce.py",
+    "bllarse_sweeps/probe_vbll.py",
+    "bllarse_sweeps/probe_ood_adamw_ce.py",
+    "bllarse_sweeps/probe_ood_vbll.py",
+    "bllarse_sweeps/probe_pilot_epochs.py",
+]
+
+LADDER = {"dinov3_small", "dinov3_big", "dinov3_large", "dinov3_huge"}
+
+
+@pytest.mark.parametrize("path", SWEEPS)
+def test_sweep_exposes_the_expected_contract(path):
+    mod = get_module_from_source_path(path)
+    assert callable(mod.create_configs)
+    assert callable(mod.run)
+
+
+@pytest.mark.parametrize("path", SWEEPS)
+def test_configs_are_unique_and_well_formed(path):
+    configs = get_module_from_source_path(path).create_configs()
+    assert len(configs) > 0
+    uids = [c["uid"] for c in configs]
+    assert len(uids) == len(set(uids)), "uids must be unique -- they key the dumps"
+    for c in configs:
+        assert c["model"] in LADDER, "dinov3_max is out of scope"
+        assert "group_id" in c and "seed" in c
+
+
+@pytest.mark.parametrize("path", SWEEPS)
+def test_all_configs_share_one_group_id(path):
+    configs = get_module_from_source_path(path).create_configs()
+    assert len({c["group_id"] for c in configs}) == 1
+
+
+@pytest.mark.parametrize("path", [SWEEPS[0], SWEEPS[1]])
+def test_fig1_sweep_sizes_match_the_plan(path):
+    # 4 backbones x 5 datasets x 10 seeds. imagenet1k is deliberately absent:
+    # linear probing does not cover it; it is a full-network finetuning dataset
+    # only.
+    assert len(get_module_from_source_path(path).create_configs()) == 200
+
+
+@pytest.mark.parametrize("path", [SWEEPS[0], SWEEPS[1]])
+def test_fig1_sweeps_exclude_imagenet(path):
+    for c in get_module_from_source_path(path).create_configs():
+        assert c["dataset"] != "imagenet1k"
+
+
+@pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])
+def test_fig2_sweep_sizes_match_its_backbone_list(path):
+    """|MODELS| x 3 (ID, OOD) pairs x 10 seeds.
+
+    Three pairs, not two ID datasets: CIFAR-10 appears twice, against SVHN
+    (far-OOD) and against CIFAR-100 (near-OOD).
+
+    MODELS is dinov3_huge alone because that is the only backbone tuned, and
+    Fig 2 (unlike Fig 1) has no backbone axis, so three extra untuned rungs
+    would quadruple the compute without adding an axis to the figure -- a
+    compute decision, not a data one. Deriving the count from the module's own
+    MODELS keeps the arithmetic pinned while letting the ladder be extended by
+    editing one list.
+    """
+    mod = get_module_from_source_path(path)
+    assert len(mod.create_configs()) == len(mod.MODELS) * 3 * len(mod.SEEDS)
+
+
+@pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])
+def test_fig2_arms_cover_identical_backbones_and_pairs(path):
+    """The two arms must sweep the same grid or the comparison is not matched.
+
+    Checked per-arm against a fixed expectation rather than by diffing the two
+    modules, so that editing BOTH arms in the same wrong way still fails.
+    """
+    configs = get_module_from_source_path(path).create_configs()
+    assert {c["model"] for c in configs} == {"dinov3_huge"}
+    assert {(c["dataset"], c["ood_dataset"]) for c in configs} == {
+        ("cifar10", "svhn"), ("cifar10", "cifar100"), ("cifar100", "svhn"),
+    }
+
+
+@pytest.mark.parametrize("path", [SWEEPS[2], SWEEPS[3]])
+def test_fig2_sweeps_pair_each_id_dataset_with_an_ood_dataset(path):
+    for c in get_module_from_source_path(path).create_configs():
+        assert c["ood_dataset"] in {"svhn", "cifar100"}
+        assert c["ood_dataset"] != c["dataset"]
+
+
+def test_every_probe_sweep_enables_mlflow():
+    """Guards against a sweep that quietly loses enable_mlflow, which would run
+    hundreds of unattended array tasks whose only signal is dump-file presence.
+    """
+    for name in ("probe_adamw_ce", "probe_vbll",
+                 "probe_ood_adamw_ce", "probe_ood_vbll"):
+        mod = get_module_from_source_path(f"bllarse_sweeps/{name}.py")
+        configs = mod.create_configs()
+        assert configs, name
+        for config in configs:
+            assert config.get("enable_mlflow") is True, f"{name}: {config.get('uid')}"
+            assert config.get("mlflow_experiment"), f"{name}: no experiment name"
