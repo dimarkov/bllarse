@@ -1,0 +1,554 @@
+import json
+import sys
+
+import pytest
+
+optuna = pytest.importorskip("optuna")
+
+from bllarse.tuning import space, worker
+
+
+def test_study_names_are_unique_per_arm_and_dataset():
+    """Every (arm, dataset) must get its own journal. `open_study` passes
+    `load_if_exists=True`, so two pairs colliding on a name would silently
+    share one study and TPE would model two different search spaces at once.
+
+    Derived from ARMS rather than hardcoded, so adding an arm cannot leave a
+    stale literal here that is edited without checking that the names are
+    still actually distinct.
+    """
+    names = {
+        worker.study_name(arm, ds)
+        for arm in space.ARMS
+        for ds in space.DATASETS
+    }
+    assert len(names) == len(space.ARMS) * len(space.DATASETS)
+    # `ibprobit` is a prefix of `ibprobit_noeps`, so the two arms' names must
+    # still separate once the dataset is appended.
+    assert worker.study_name("ibprobit", "dtd") != worker.study_name(
+        "ibprobit_noeps", "dtd"
+    )
+
+
+def test_the_ibprobit_trial_config_reaches_probe_pys_cli():
+    """The end the unit tests cannot see: a config that `trial_config` builds
+    but `probe.build_argparser` rejects fails the trial AFTER its GPU time is
+    spent, and `study.optimize(catch=(Exception,))` records it as an ordinary
+    failure rather than the harness fault it is.
+    """
+    from bllarse.tools import adapters
+
+    budgets = {"dtd": {"batch_size": 512, "steps": 2000, "epochs": 273}}
+    config = worker.trial_config(
+        "ibprobit", "dtd",
+        params={"batch_size": 256, "q_init": 3e-4, "eps_init": 0.02,
+                "num_update_iters": 64},
+        budgets=budgets,
+    )
+    assert config["arm"] == "ibprobit"
+    assert config["px"] is True
+
+    module = adapters.load_script_module("scripts/dinov3/probe.py")
+    args = adapters.parse_config(module, config)
+    assert args.arm == "ibprobit"
+    assert args.q_init == 3e-4
+    assert args.num_update_iters == 64
+    assert args.px is True
+    # --no-learn-q PRESENT: Q is pinned at its q0 seed for this campaign, so
+    # the search is over a static process noise. q_init is the seed the
+    # recursion would start from, so leaving it running would have the search
+    # chase a moving target within each trial. This is the assertion that
+    # catches the recursion silently being switched on.
+    assert args.no_learn_q is True
+    # kappa unset, so IBProbit's own default of 0.5 applies. Fixed by decision.
+    assert args.kappa is None
+
+
+def test_the_ibprobit_config_carries_no_optimizer_knobs():
+    """probe.py's argparser still DEFINES --learning-rate (the adamw_ce arm
+    needs it), so passing one would parse cleanly and silently suggest the arm
+    has a tuned learning rate. The config must simply not carry one."""
+    budgets = {"dtd": {"batch_size": 512, "steps": 2000, "epochs": 273}}
+    config = worker.trial_config(
+        "ibprobit", "dtd",
+        params={"batch_size": 256, "q_init": 3e-4, "eps_init": 0.02,
+                "num_update_iters": 64},
+        budgets=budgets,
+    )
+    assert "learning_rate" not in config
+    assert "weight_decay" not in config
+
+
+def test_the_adamw_ce_config_gains_no_ibprobit_knobs():
+    budgets = {"dtd": {"batch_size": 512, "steps": 2000, "epochs": 273}}
+    config = worker.trial_config(
+        "adamw_ce", "dtd",
+        params={"learning_rate": 1e-3, "weight_decay": 1e-4, "batch_size": 256},
+        budgets=budgets,
+    )
+    assert config["arm"] == "adamw_ce"
+    for knob in ("px", "q_init", "eps_init", "num_update_iters"):
+        assert knob not in config
+
+
+def test_workers_sharing_a_storage_dir_share_one_study(tmp_path):
+    """Several workers per study, one journal file per study. SQLite over GPFS
+    with concurrent writers is unreliable; the journal backend is built for
+    network filesystems, and one file per study means studies never contend."""
+    first = worker.open_study("vbll", "food101", tmp_path)
+    first.tell(first.ask(), 1.23)
+
+    second = worker.open_study("vbll", "food101", tmp_path)
+    assert len(second.trials) == 1, "the second worker must see the first's trial"
+    assert second.study_name == first.study_name
+
+
+def test_an_unnamed_campaign_reproduces_the_original_study_names():
+    """The suffix is opt-in: without a campaign the name is just arm_dataset."""
+    assert worker.study_name("vbll", "food101") == "vbll_food101"
+    assert worker.study_name("vbll", "food101", None) == "vbll_food101"
+
+
+def test_a_campaign_suffix_makes_a_separate_study(tmp_path):
+    """open_study passes load_if_exists=True, which is what lets four workers
+    share one study -- and exactly why a re-run under a CHANGED search space
+    must not reuse the name. Trials searched under a different space (say,
+    without a kl_ratio axis) would have TPE model a space that no longer
+    exists."""
+    old = worker.open_study("vbll", "food101", tmp_path)
+    old.tell(old.ask(), 1.23)
+
+    new = worker.open_study("vbll", "food101", tmp_path, "kl_ratio")
+    assert new.study_name == "vbll_food101_kl_ratio"
+    assert new.study_name != old.study_name
+    assert len(new.trials) == 0, "a new campaign must not inherit old trials"
+
+    # ...and the second worker of the NEW campaign still shares its study.
+    peer = worker.open_study("vbll", "food101", tmp_path, "kl_ratio")
+    peer.tell(peer.ask(), 0.5)
+    assert len(worker.open_study("vbll", "food101", tmp_path, "kl_ratio").trials) == 1
+
+
+def test_the_study_minimises():
+    assert worker.DIRECTION == "minimize"
+
+
+def test_suggested_batch_sizes_never_exceed_the_dataset_cap(tmp_path):
+    study = worker.open_study("adamw_ce", "dtd", tmp_path)
+    cap = space.batch_cap(space.N_TRAIN["dtd"])
+    for _ in range(20):
+        trial = study.ask()
+        params = space.suggest(trial, "adamw_ce", "dtd")
+        assert params["batch_size"] <= cap == 1024
+        study.tell(trial, 1.0)
+
+
+def test_the_trial_config_carries_the_datasets_epoch_budget(tmp_path):
+    budgets = {"dtd": {"batch_size": 512, "steps": 2000, "epochs": 273}}
+    config = worker.trial_config(
+        "vbll", "dtd",
+        params={"learning_rate": 1e-3, "weight_decay": 1e-4, "batch_size": 256,
+                "prior_scale": 1.0, "wishart_scale": 0.1},
+        budgets=budgets,
+    )
+    # 2,000 steps at the SAMPLED batch size, not the pilot's: the budget is a
+    # step budget, and epochs is only how the scripts express it.
+    # dtd is 3,760 rows: 3760 // 256 = 14 steps/epoch, ceil(2000 / 14) = 143.
+    assert config["epochs"] == 143
+    assert config["batch_size"] == 256
+    assert config["parameterization"] == "diagonal"
+    assert config["model"] == space.TUNING_MODEL
+    assert config["num_classes"] == 47
+    assert config["img_size"] == 512
+
+
+def test_a_missing_epoch_budget_raises(tmp_path):
+    with pytest.raises(KeyError, match="dtd"):
+        worker.trial_config(
+            "adamw_ce", "dtd",
+            params={"learning_rate": 1e-3, "weight_decay": 1e-4, "batch_size": 256},
+            budgets={},
+        )
+
+
+def test_main_passes_catch_to_study_optimize(tmp_path, monkeypatch):
+    """Without `catch`, a single trial's exception (e.g. a
+    CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED crash) propagates straight out of
+    study.optimize and kills the whole worker process, abandoning every trial
+    it still had left to run. worker.main() must pass Optuna's `catch`
+    argument -- covering at least Exception -- so a failing trial is recorded
+    FAILED instead and the worker moves on to the next one."""
+    budgets_path = tmp_path / "budgets.json"
+    budgets_path.write_text("{}")
+
+    captured: dict[str, object] = {}
+
+    def fake_optimize(self, func, n_trials=None, catch=(), callbacks=None, **kw):
+        captured["catch"] = catch
+        captured["callbacks"] = callbacks
+        # A real trial so main()'s closing `study.best_value` print does not
+        # itself raise on an empty study.
+        self.tell(self.ask(), 1.0)
+
+    monkeypatch.setattr(optuna.Study, "optimize", fake_optimize)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "worker",
+            "--arm", "adamw_ce",
+            "--dataset", "food101",
+            "--n-trials", "1",
+            "--storage-dir", str(tmp_path),
+            "--budgets", str(budgets_path),
+            "--no-mlflow",
+        ],
+    )
+
+    worker.main()
+
+    catch = captured["catch"]
+    assert isinstance(catch, tuple)
+    assert Exception in catch
+    # optuna.TrialPruned must NOT be caught here: Optuna handles pruning via
+    # its own separate except-clause before `catch` is ever consulted, and a
+    # prune re-caught as a plain failure would be misrecorded as FAILED instead
+    # of PRUNED. KeyboardInterrupt/SystemExit derive from BaseException, not
+    # Exception, so a scope of exactly (Exception,) already excludes them --
+    # no explicit exclusion is needed for either.
+    assert optuna.TrialPruned not in catch
+
+
+def test_a_failing_trial_does_not_abort_the_remaining_trials(tmp_path):
+    """The behaviour `catch` buys, pinned directly against a live study rather
+    than against the wiring in main(): a trial that raises must not stop the
+    ones after it, and must be recorded FAILED rather than silently vanishing
+    or crashing the run."""
+    study = worker.open_study("adamw_ce", "food101", tmp_path)
+    calls = {"n": 0}
+
+    def flaky_objective(trial: optuna.Trial) -> float:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED")
+        return 1.0
+
+    study.optimize(flaky_objective, n_trials=2, catch=(Exception,))
+
+    states = [t.state for t in study.trials]
+    assert states.count(optuna.trial.TrialState.FAIL) == 1
+    assert states.count(optuna.trial.TrialState.COMPLETE) == 1
+
+
+def test_a_study_with_no_completed_trials_reports_the_harness_fault(tmp_path):
+    """`catch` keeps the worker alive through a failing trial, which is right
+    -- but if EVERY trial fails, study.best_value raises "No trials are
+    completed yet" and that traceback becomes the last thing in the SLURM log,
+    burying the real cause far above it. A misresolved --cache-dir, for
+    instance, shows up as every trial dying on Errno 30, reported as an opaque
+    optuna error.
+    The worker must say plainly that it produced nothing, and exit non-zero so
+    the task is not mistaken for a bad-scoring configuration."""
+    study = worker.open_study("adamw_ce", "dtd", tmp_path)
+
+    def always_fails(trial: optuna.Trial) -> float:
+        raise OSError(30, "Read-only file system")
+
+    study.optimize(always_fails, n_trials=3, catch=(Exception,))
+    assert all(t.state == optuna.trial.TrialState.FAIL for t in study.trials)
+
+    with pytest.raises(SystemExit) as excinfo:
+        worker.summarize_study(study)
+    message = str(excinfo.value)
+    assert "NONE completed" in message
+    assert "3 failed" in message
+    assert "harness fault" in message
+
+
+def test_a_study_with_results_summarises_normally(tmp_path):
+    study = worker.open_study("adamw_ce", "cifar10", tmp_path)
+    study.optimize(lambda t: 0.25, n_trials=2, catch=(Exception,))
+
+    summary = worker.summarize_study(study)
+    assert "2 completed" in summary
+    assert "0.25000" in summary
+
+
+def test_a_partly_failed_study_still_summarises(tmp_path):
+    """One bad trial must NOT be escalated to a harness fault -- that is the
+    whole point of catch, and conflating the two would make a single flaky
+    trial kill an otherwise good study."""
+    study = worker.open_study("adamw_ce", "cifar100", tmp_path)
+    calls = {"n": 0}
+
+    def flaky(trial: optuna.Trial) -> float:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        return 0.5
+
+    study.optimize(flaky, n_trials=3, catch=(Exception,))
+    summary = worker.summarize_study(study)
+    assert "2 completed" in summary
+
+
+def test_a_trial_records_where_its_val_nll_bottomed_out(monkeypatch, tmp_path):
+    """argmin_eval / total_evals / truncated, on the trial itself.
+
+    Tuning dumps are deleted once the objective is computed, so the journal is
+    the only thing that outlives a trial. Without these, `patience_stopped=False`
+    is ambiguous: it cannot distinguish a trial that converged and was cut from
+    one that was still improving when the budget ran out. Those two call for
+    opposite corrections -- lower the patience, or raise the budget -- so the
+    campaign has to be able to tell them apart after the fact.
+    """
+    import optuna
+
+    curve = [0.9, 0.5, 0.3, 0.4, 0.35]     # argmin at eval 3 of 5
+
+    def fake_evaluate(arm, config, **kw):
+        on_dump = kw["on_dump"]
+        for i, v in enumerate(curve, start=1):
+            on_dump(i, i * 10, i * 1000, {"val_nll": v})
+        return min(curve)
+
+    monkeypatch.setattr(worker.objective_mod, "evaluate", fake_evaluate)
+    study = optuna.create_study(direction="minimize")
+    study.optimize(
+        worker.make_objective(
+            "ibprobit", "dtd",
+            budgets={"dtd": {"steps": 30_000}},
+            dump_root=tmp_path, group_id="g",
+        ),
+        n_trials=1,
+    )
+    attrs = study.trials[0].user_attrs
+    assert attrs["argmin_eval"] == 3
+    assert attrs["total_evals"] == 5
+    assert attrs["truncated"] is False
+
+
+def test_a_trial_still_improving_at_its_budget_is_flagged_truncated(monkeypatch, tmp_path):
+    """The signal that the STEP BUDGET is too small rather than patience too
+    large. A monotonically improving curve never plateaus, so patience never
+    fires and the run simply hits its cap."""
+    import optuna
+
+    curve = [0.9, 0.7, 0.5, 0.3, 0.1]      # argmin is the last eval
+
+    def fake_evaluate(arm, config, **kw):
+        on_dump = kw["on_dump"]
+        for i, v in enumerate(curve, start=1):
+            on_dump(i, i * 10, i * 1000, {"val_nll": v})
+        return min(curve)
+
+    monkeypatch.setattr(worker.objective_mod, "evaluate", fake_evaluate)
+    study = optuna.create_study(direction="minimize")
+    study.optimize(
+        worker.make_objective(
+            "ibprobit", "dtd",
+            budgets={"dtd": {"steps": 30_000}},
+            dump_root=tmp_path, group_id="g",
+        ),
+        n_trials=1,
+    )
+    attrs = study.trials[0].user_attrs
+    assert attrs["argmin_eval"] == attrs["total_evals"] == 5
+    assert attrs["truncated"] is True
+
+
+def test_the_noeps_arm_runs_probe_with_arm_ibprobit_not_its_study_name():
+    """probe.py's argparser accepts only {adamw_ce, ibprobit}. `ibprobit_noeps`
+    is the ibprobit head with eps pinned, not a third training step, so passing
+    the study's arm name through as --arm would abort every trial at argparse
+    -- and `study.optimize(catch=(Exception,))` would record each one as an
+    ordinary failed trial rather than a harness fault."""
+    budgets = {"dtd": {"steps": 30_000}}
+    cfg = worker.trial_config(
+        "ibprobit_noeps", "dtd",
+        params={"batch_size": 256, "q_init": 1e-3, "num_update_iters": 64},
+        budgets=budgets,
+    )
+    assert cfg["arm"] == "ibprobit"
+    assert cfg["eps_init"] == worker.space.IBPROBIT_NOEPS_INIT
+    # The rest of the ibprobit operating point must carry over unchanged, or
+    # the eps pin is confounded with px/learn_q.
+    for k, v in worker.IBPROBIT_FIXED.items():
+        assert cfg[k] == v
+
+
+def test_the_free_eps_arm_keeps_its_sampled_eps():
+    """The pin must not leak onto the eps-searched arm."""
+    cfg = worker.trial_config(
+        "ibprobit", "dtd",
+        params={"batch_size": 256, "q_init": 1e-3, "eps_init": 5e-3,
+                "num_update_iters": 64},
+        budgets={"dtd": {"steps": 30_000}},
+    )
+    assert cfg["arm"] == "ibprobit"
+    assert cfg["eps_init"] == 5e-3
+
+
+def test_every_arm_has_a_training_script():
+    """ARMS and objective.SCRIPTS must agree: an arm in one and not the other
+    gives a worker that accepts --arm and then dies inside its first trial."""
+    from bllarse.tuning import objective
+    assert set(worker.space.ARMS) == set(objective.SCRIPTS)
+
+
+def _toy_study(tmp_path, name="toy"):
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    return optuna.create_study(
+        study_name=name,
+        storage=JournalStorage(JournalFileBackend(str(tmp_path / f"{name}.log"))),
+        load_if_exists=True,
+    )
+
+
+def test_the_completed_count_ignores_pruned_and_failed_trials(tmp_path):
+    """The whole reason `--target-complete` exists. `--n-trials` counts trials
+    STARTED, and the pruner kills 8%-72% of them depending on the study, so the
+    same request yields very different completed counts per study. Only a
+    count of what SURVIVED can express "search every arm to the same depth"."""
+    study = _toy_study(tmp_path)
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 1.0)
+        if trial.number % 3 == 1:
+            raise optuna.TrialPruned()
+        if trial.number % 3 == 2:
+            raise RuntimeError("boom")
+        return x
+
+    study.optimize(objective, n_trials=9, catch=(Exception,))
+    assert len(study.trials) == 9
+    assert worker.n_completed(study) == 3
+
+
+def test_target_complete_stops_the_worker_and_counts_earlier_submissions(tmp_path):
+    """A top-up submission must be sized by where the study should END UP, not
+    by how many trials this particular job adds -- so the callback reads the
+    journal, which already holds every earlier submission's trials."""
+    study = _toy_study(tmp_path)
+    study.optimize(lambda t: t.suggest_float("x", 0.0, 1.0), n_trials=6)
+    assert worker.n_completed(study) == 6
+
+    # A generous per-worker cap: the target, not the cap, must end the run.
+    study.optimize(
+        lambda t: t.suggest_float("x", 0.0, 1.0),
+        n_trials=500,
+        callbacks=[worker.stop_at_completed(10)],
+    )
+    # Stopping is checked AFTER a trial completes, so the target is a floor.
+    # Exactly 10 for a single worker; four would overshoot by up to three.
+    assert worker.n_completed(study) == 10
+
+
+def test_target_complete_yields_to_the_per_worker_cap_when_unreachable(tmp_path):
+    """--n-trials still bounds the job. A study whose trials all get pruned
+    would otherwise sit on a GPU until its wall-clock limit, having produced
+    nothing."""
+    study = _toy_study(tmp_path)
+
+    def always_pruned(trial):
+        trial.suggest_float("x", 0.0, 1.0)
+        raise optuna.TrialPruned()
+
+    study.optimize(
+        always_pruned, n_trials=5, callbacks=[worker.stop_at_completed(100)]
+    )
+    assert worker.n_completed(study) == 0
+    assert len(study.trials) == 5
+
+
+def test_the_worker_accepts_target_complete_on_the_command_line():
+    args = worker.build_argparser().parse_args(
+        ["--arm", "vbll", "--dataset", "dtd", "--n-trials", "40",
+         "--storage-dir", "/tmp/x", "--target-complete", "100"]
+    )
+    assert args.target_complete == 100
+    # Absent means the flag is off, NOT zero -- zero would stop every worker
+    # before its first trial.
+    assert worker.build_argparser().parse_args(
+        ["--arm", "vbll", "--dataset", "dtd", "--n-trials", "40",
+         "--storage-dir", "/tmp/x"]
+    ).target_complete is None
+
+
+def test_smoothed_scoring_reproduces_the_measured_ranking_inversion():
+    """Regression test for the defect, using the shape actually measured on
+    probing/oxford_pets/dinov3_huge: the tuned lr 0.0182 oscillates (late sd
+    0.53x its median, spikes to 3.2x) and dips below a stable config that is
+    0.032 BETTER on test NLL. The single-point minimum ranks the unstable run
+    ahead; the windowed mean must not."""
+    from bllarse.tuning.objective import best_window_mean
+
+    # Stable run: holds ~0.20. Unstable: sits at ~0.24 with periodic spikes to
+    # 0.79 and occasional dips to 0.187 -- the dips are what tuning selected on.
+    stable = [0.205, 0.200, 0.198, 0.202, 0.199] * 24
+    unstable = ([0.240, 0.187, 0.790, 0.250, 0.235] * 24)
+
+    assert min(unstable) < min(stable), "the measured inversion must be present"
+    assert best_window_mean(stable, 12) < best_window_mean(unstable, 12)
+
+
+def test_the_worker_accepts_smooth_fraction_and_records_the_window(tmp_path):
+    args = worker.build_argparser().parse_args(
+        ["--arm", "adamw_ce", "--dataset", "oxford_pets", "--n-trials", "1",
+         "--storage-dir", str(tmp_path), "--smooth-window", "5"]
+    )
+    assert args.smooth_window == 5
+    # Absent means the single-point-minimum objective, not a zero-width window.
+    assert worker.build_argparser().parse_args(
+        ["--arm", "adamw_ce", "--dataset", "oxford_pets", "--n-trials", "1",
+         "--storage-dir", str(tmp_path)]
+    ).smooth_window is None
+
+
+def test_the_objective_passes_the_SAME_window_whatever_the_batch_size(tmp_path):
+    """The window is a fixed evaluation COUNT, identical for every trial.
+
+    Deriving it from each trial's own planned grid (`evals_planned`) would
+    overrun the trajectories patience actually produces (dtd: a 375-evaluation
+    window on a 79-evaluation run), turning the objective into the mean of the
+    whole run and costing dtd its best configuration.
+    """
+    from bllarse.tuning import objective as objective_mod
+
+    seen = {}
+
+    def fake_evaluate(arm, config, **kw):
+        seen[config["batch_size"]] = kw["smooth_window"]
+        return 0.5
+
+    budgets = {"oxford_pets": {"batch_size": 512, "steps": 30000, "epochs": 4286}}
+    for batch in (64, 512):
+        study = _toy_study(tmp_path, name=f"w{batch}")
+        objective = worker.make_objective(
+            "adamw_ce", "oxford_pets", budgets=budgets, dump_root=tmp_path,
+            group_id="g", smooth_window=objective_mod.DEFAULT_SMOOTH_WINDOW,
+        )
+        original = objective_mod.evaluate
+        objective_mod.evaluate = fake_evaluate
+        try:
+            study.enqueue_trial({"learning_rate": 1e-3, "weight_decay": 1e-3,
+                                 "batch_size": batch})
+            study.optimize(objective, n_trials=1)
+        finally:
+            objective_mod.evaluate = original
+
+    assert seen[64] == seen[512] == objective_mod.DEFAULT_SMOOTH_WINDOW
+
+def test_the_pruner_is_shown_the_windowed_statistic_when_smoothing_is_on():
+    """Pruner and objective must judge on the same quantity. Guarded as source
+    because the alternative is a live Optuna study plus a fake training loop,
+    and the property is a one-line coupling that is easy to break."""
+    import inspect
+
+    src = inspect.getsource(worker.make_objective)
+    assert "RunningWindow(window)" in src
+    assert "value if running is None else running.push(value)" in src
+    # The raw value must NOT be what gets reported when smoothing is active.
+    assert 'trial.report(float(scalars["val_nll"]), eval_index)' not in src

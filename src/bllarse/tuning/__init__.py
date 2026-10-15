@@ -1,0 +1,10 @@
+"""Optuna TPE tuning for the probing arms.
+
+Separate from the sweep files in bllarse_sweeps by necessity: a sweep's
+contract is `create_configs() -> list[dict]`, enumerated before submission, and
+TPE generates configurations adaptively from the trials already reported.
+"""
+
+from bllarse.tuning.objective import TUNING_SEEDS
+
+__all__ = ["TUNING_SEEDS"]
