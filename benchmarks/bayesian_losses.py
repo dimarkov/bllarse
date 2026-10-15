@@ -26,7 +26,7 @@ def generate_data(key, n_samples, n_features, n_classes):
     key, subkey = jr.split(key)
     y = jr.categorical(subkey, logits=logits, axis=-1)
     
-    return X, y.astype(jnp.float32), probs, (W, b)
+    return X, y, probs, (W, b)
 
 def benchmark_loss_vs_iterations(key):
     n_samples, n_features, n_classes = 1000, 100, 50
@@ -34,7 +34,18 @@ def benchmark_loss_vs_iterations(key):
 
     # Initialize models
     key, subkey = jr.split(key)
-    ib_probit = IBProbit(n_features, n_classes, key=subkey)
+    # IBProbit.__call__ ignores a per-call loss_type -- the branch is fixed at
+    # construction by self.loss_type -- so measuring the IBProbit_1/2/3 columns
+    # needs three independently constructed heads, one per loss_type.
+    # loss_type=0 is rejected by the constructor guard (see the ValueError in
+    # IBProbit.__init__), so the sweep covers only the supported {1, 2, 3}
+    # (CBM, CBC, mixed).
+    ibp_keys = jr.split(subkey, 3)
+    # process-noise prior scale q0 = 1/D (q_init), independent of batch size
+    ib_probits = {
+        lt: IBProbit(n_features, n_classes, key=k, q_init=1.0 / n_features, loss_type=lt)
+        for lt, k in zip((1, 2, 3), ibp_keys)
+    }
     key, subkey = jr.split(key)
     ib_pg = IBPolyaGamma(n_features, n_classes, key=subkey)
     key, subkey = jr.split(key)
@@ -42,17 +53,19 @@ def benchmark_loss_vs_iterations(key):
 
     n_iters_range = jnp.arange(1, 128)[::4]
     losses = {
-        "IBProbit_0": [], "IBProbit_1": [], "IBProbit_2": [], "IBProbit_3": [],
+        "IBProbit_1": [], "IBProbit_2": [], "IBProbit_3": [],
         "IBPG_0": [], "IBPG_1": [], "IBPG_2": [], "IBPG_3": [],
         "MPG_0": [], "MPG_1": []
     }
 
     for n_iters in n_iters_range:
-        for loss_type in range(4):
-            # Update and compute loss for IBModels
-            loss = ib_probit.update(X, y, num_iters=n_iters)(X, y, loss_type=loss_type).mean()
+        for loss_type in (1, 2, 3):
+            # Each loss_type gets its own IBProbit head (see above); __call__
+            # takes no loss_type argument since it would be ignored anyway.
+            loss = ib_probits[loss_type].update(X, y, num_iters=n_iters)(X, y).mean()
             losses[f"IBProbit_{loss_type}"].append(loss)
-            
+
+        for loss_type in range(4):
             loss = ib_pg.update(X, y, num_iters=n_iters)(X, y, loss_type=loss_type).mean()
             losses[f"IBPG_{loss_type}"].append(loss)
 
@@ -82,7 +95,8 @@ def benchmark_runtimes(key):
     n_samples_range = jnp.arange(100, 1100, 100)
     runtimes_data = {"IBProbit": [], "IBPG": [], "MPG": []}
 
-    ib_probit = IBProbit(n_features, n_classes, key=key)
+    # process-noise prior scale q0 = 1/D (q_init), independent of batch size
+    ib_probit = IBProbit(n_features, n_classes, key=key, q_init=1.0 / n_features)
     ib_pg = IBPolyaGamma(n_features, n_classes, key=key)
     mpg = MultinomialPolyaGamma(n_features, n_classes, key=key)
 
@@ -93,7 +107,7 @@ def benchmark_runtimes(key):
         func(X, y)
         start_time = time.time()
         for _ in range(n_runs):
-            jax.block_until_ready(func(X, y).eta)
+            jax.block_until_ready(func(X, y).mu)
         runtimes_data["IBProbit"].append( (time.time() - start_time) / n_runs)
 
         func = eqx.filter_jit(ib_pg.update)
@@ -128,7 +142,8 @@ def benchmark_runtimes(key):
     for n_features in n_features_range:
         X, y, *_ = generate_data(key, n_samples, n_features, n_classes)
         
-        ib_probit = IBProbit(n_features, n_classes, key=key)
+        # process-noise prior scale q0 = 1/D (q_init), independent of batch size
+        ib_probit = IBProbit(n_features, n_classes, key=key, q_init=1.0 / n_features)
         ib_pg = IBPolyaGamma(n_features, n_classes, key=key)
         mpg = MultinomialPolyaGamma(n_features, n_classes, key=key)
 
@@ -136,7 +151,7 @@ def benchmark_runtimes(key):
         func(X, y)
         start_time = time.time()
         for _ in range(n_runs):
-            jax.block_until_ready(func(X, y).eta)
+            jax.block_until_ready(func(X, y).mu)
         runtimes_features["IBProbit"].append((time.time() - start_time) / n_runs)
 
         func = eqx.filter_jit(ib_pg.update)
@@ -171,7 +186,8 @@ def benchmark_runtimes(key):
     for n_classes in n_classes_range:
         X, y, *_ = generate_data(key, n_samples, n_features, n_classes)
         
-        ib_probit = IBProbit(n_features, n_classes, key=key)
+        # process-noise prior scale q0 = 1/D (q_init), independent of batch size
+        ib_probit = IBProbit(n_features, n_classes, key=key, q_init=1.0 / n_features)
         ib_pg = IBPolyaGamma(n_features, n_classes, key=key)
         mpg = MultinomialPolyaGamma(n_features, n_classes, key=key)
 
@@ -179,7 +195,7 @@ def benchmark_runtimes(key):
         func(X, y)
         start_time = time.time()
         for _ in range(n_runs):
-            jax.block_until_ready(func(X, y).eta)
+            jax.block_until_ready(func(X, y).mu)
         runtimes_classes["IBProbit"].append((time.time() - start_time) / n_runs)
 
         func = eqx.filter_jit(ib_pg.update)
@@ -229,10 +245,15 @@ def benchmark_gradient_runtimes(key):
             X, y, *_ = generate_data(key, n_samples, n_features, n_classes)
             
             # IBProbit
-            ib_probit = IBProbit(n_features, n_classes, key=key)
+            # process-noise prior scale q0 = 1/D (q_init), independent of batch size
             for loss_type in loss_types["IBProbit"]:
+                # The loss branch is fixed at construction, so each loss_type
+                # needs its own head.
+                ib_probit = IBProbit(n_features, n_classes, key=key,
+                                     q_init=1.0 / n_features, loss_type=loss_type)
+
                 def loss_fn_probit(x):
-                    return ib_probit(x, y, loss_type=loss_type).mean()
+                    return ib_probit(x, y).mean()
                 
                 grad_fn = eqx.filter_jit(eqx.filter_value_and_grad(loss_fn_probit))
                 grad_fn(X) # JIT compilation
@@ -309,7 +330,8 @@ def benchmark_accuracy(key):
     
     # --- Bayesian Models ---
     key, subkey = jr.split(key)
-    ib_probit = IBProbit(n_features, n_classes, key=subkey)
+    # process-noise prior scale q0 = 1/D (q_init), independent of batch size
+    ib_probit = IBProbit(n_features, n_classes, key=subkey, q_init=1.0 / n_features)
     updated_ib_probit = eqx.filter_jit(ib_probit.update)(X_train, y_train, num_iters=128)
     accs = []
     for loss_type in [0, 1, 2]:
@@ -392,7 +414,7 @@ if __name__ == "__main__":
 
     print("\n--- Benchmarking Runtimes ---")
     benchmark_runtimes(main_key)
-    print("Plot saved to runtimes.png")
+    print("Plot saved to learning_runtimes.png")
 
     print("\n--- Benchmarking Gradient Runtimes ---")
     benchmark_gradient_runtimes(main_key)
