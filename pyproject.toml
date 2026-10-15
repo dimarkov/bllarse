@@ -7,7 +7,8 @@ authors = [
     { name = "Dimitrije Markovic", email = "5038100+dimarkov@users.noreply.github.com" },
     { name = "Conor Heins", email = "conor.heins@gmail.com" }
 ]
-requires-python = ">=3.11"
+# 3.12 is the floor because jax 0.11 requires it.
+requires-python = ">=3.12"
 dependencies = [
     "datasets>=3.5.0",
     "equimo>=0.3.3",
@@ -15,11 +16,25 @@ dependencies = [
     "tqdm>=4.67.1",
     "pillow>=11.1.0",
     "ipykernel>=6.29.5",
-    "jax[cuda]>=0.6.2",
+    # Pinned exactly, not a floor, so that results do not depend on the day
+    # an environment was built.
+    #
+    # 0.10.2 rather than the newest, because 0.11.0 does not run the
+    # fine-tuning step on A100 nodes. It dies in
+    # `jit(ce_micro_grad)/transpose(jvp(vmap(eqx.nn.Conv)))/conv_general_dilated`
+    # with CUDA_ERROR_ILLEGAL_ADDRESS before reaching a single evaluation.
+    # Disabling command buffers (`--xla_gpu_enable_command_buffer=`) does not
+    # help, and a fresh compilation cache fails identically.
+    # scripts/finetune/bench_step.py passes on 0.11.0, so it is not a
+    # reproducer; the full fine-tuning step is. 0.9.2, 0.10.0, 0.10.1 and
+    # 0.10.2 all work.
+    #
+    # Revisit after a driver or jax point release, with one short smoke run
+    # (a small --max-samples) of the fine-tuning script.
+    "jax[cuda]==0.10.2",
     "optax>=0.2.4",
     "tfp-nightly[jax]>=0.25",
     "dotenv<1.0.0",
-    "mlpox @ git+https://github.com/dimarkov/mlpox.git@main",
     "blrax @ git+https://github.com/dimarkov/blrax.git@main"
 ]
 
@@ -36,8 +51,22 @@ dev = [
     "seaborn>=0.13.0",
     "mlflow>=3.9.0",
     "pytest>=8.3.5",
+    # Without it, the module-level `importorskip` in
+    # tests/tuning/test_worker.py silently skips the WHOLE file, including the
+    # tests of `trial_config`, which builds the config for every trial.
+    "optuna>=4.0",
 ]
-alternatives = [
-    "transformers[flax]>=4.35.0",
-    "sentencepiece>=0.2.0",
+vbll = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "vbll>=0.2.0",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
