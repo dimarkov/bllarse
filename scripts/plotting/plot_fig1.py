@@ -31,10 +31,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+import paper_style
+from paper_style import DOWN, UP
+
 LADDER = [("dinov3_small", "S"), ("dinov3_big", "B"),
           ("dinov3_large", "L"), ("dinov3_huge", "H+")]
 
-DATASETS = [("oxford_pets", "Oxford-IIIT Pets"), ("food101", "Food-101"),
+DATASETS = [("oxford_pets", "Oxford Pets"), ("food101", "Food-101"),
             ("flowers102", "Flowers-102"), ("stanford_cars", "Stanford Cars"),
             ("dtd", "DTD")]
 
@@ -42,7 +45,8 @@ DATASETS = [("oxford_pets", "Oxford-IIIT Pets"), ("food101", "Food-101"),
 # NLL and Brier are both strictly proper, so they already price calibration
 # together with sharpness -- a binned ECE beside them adds a third view of the
 # same axis whose value moves with the bin count.
-METRICS = [("acc", "Accuracy ↑"), ("nll", "NLL ↓"), ("brier", "Brier ↓")]
+METRICS = [("acc", f"Accuracy {UP}"), ("nll", f"NLL {DOWN}"),
+           ("brier", f"Brier {DOWN}")]
 
 # (label, arm, metric prefix, colour, marker)
 #
@@ -109,8 +113,10 @@ def _truncated(summary, arm, dataset, metric):
 
 
 def make_figure(summary, out_path):
-    fig, axes = plt.subplots(len(METRICS), len(DATASETS),
-                             figsize=(2.7 * len(DATASETS), 2.3 * len(METRICS)))
+    # Fifteen small panels, so one step below the paper context's default size.
+    paper_style.use(font_scale=0.85)
+    fig, axes = paper_style.figure(len(METRICS), len(DATASETS), height=4.1,
+                                   sharex=True)
     any_truncated = False
 
     for j, (dataset, ds_label) in enumerate(DATASETS):
@@ -122,8 +128,8 @@ def make_figure(summary, out_path):
                     continue
                 ax.errorbar(
                     xs, means, yerr=stds, color=colour, marker=marker,
-                    markersize=5, linewidth=1.4, capsize=2.5, elinewidth=0.9,
-                    markeredgecolor="white", markeredgewidth=0.6,
+                    markersize=3.8, linewidth=1.3, capsize=1.8, elinewidth=0.9,
+                    markeredgecolor="white", markeredgewidth=0.5,
                     label=label if (i == 0 and j == 0) else None,
                 )
                 # Overlaid, not styled into the errorbar call: matplotlib takes
@@ -132,21 +138,18 @@ def make_figure(summary, out_path):
                 tx, ty = _truncated(summary, arm, dataset, f"{prefix}{metric}")
                 if tx:
                     any_truncated = True
-                    ax.scatter(tx, ty, s=95, facecolors="none",
-                               edgecolors="#333333", linewidths=1.0, zorder=5)
+                    ax.scatter(tx, ty, s=46, facecolors="none",
+                               edgecolors="#333333", linewidths=0.8, zorder=5)
             ax.set_xticks(range(len(LADDER)))
-            ax.set_xticklabels([m[1] for m in LADDER] if i == len(METRICS) - 1 else [],
-                               fontsize=8)
-            ax.grid(axis="y", alpha=0.25, linewidth=0.5)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            ax.tick_params(axis="y", labelsize=7)
+            ax.set_xticklabels([m[1] for m in LADDER])
+            ax.set_xlim(-0.45, len(LADDER) - 0.55)
+            paper_style.few_ticks(ax, y=5)
             if i == 0:
-                ax.set_title(ds_label, fontsize=9)
+                ax.set_title(ds_label)
             if j == 0:
-                ax.set_ylabel(metric_label, fontsize=9)
-            if i == len(METRICS) - 1:
-                ax.set_xlabel("DINOv3 scale", fontsize=8)
+                ax.set_ylabel(metric_label)
+    # One x label for the row, under the middle column.
+    axes[-1, len(DATASETS) // 2].set_xlabel("DINOv3 backbone size")
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
     if any_truncated:
@@ -155,21 +158,12 @@ def make_figure(summary, out_path):
         # in the legend only when the top-left panel happened to contain a
         # truncated point. It did not, and the rings went out unexplained.
         handles.append(Line2D([], [], linestyle="none", marker="o",
-                              markersize=9, markerfacecolor="none",
-                              markeredgecolor="#333333", markeredgewidth=1.0))
-        labels.append("budget-truncated (val optimum at end of budget)")
-    fig.legend(handles, labels, loc="upper center", ncol=5, frameon=False,
-               fontsize=9, bbox_to_anchor=(0.5, 1.005))
-    fig.suptitle(
-        "Fig 1 — linear probing on frozen DINOv3, "
-        "10 seeds, bands ±1 sd\n"
-        "each point at its val-optimal step; only H+ was tuned, "
-        "its config applied across the ladder",
-        fontsize=9.5, y=1.06,
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.985])
-    fig.savefig(out_path, bbox_inches="tight", dpi=150)
-    print(f"wrote {out_path}")
+                              markersize=6.5, markerfacecolor="none",
+                              markeredgecolor="#333333", markeredgewidth=0.8))
+        # What a ring means is spelled out in the caption.
+        labels.append("budget-truncated")
+    paper_style.legend_below(fig, handles, labels)
+    paper_style.save(fig, out_path)
 
 
 def make_overfit_figure(summary, out_path):

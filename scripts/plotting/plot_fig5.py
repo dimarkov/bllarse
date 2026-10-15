@@ -39,14 +39,16 @@ from matplotlib.ticker import NullFormatter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+import paper_style  # noqa: E402
 from bllarse.analysis import final_json  # noqa: E402
 
 
 def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
     metrics = final_json.METRICS
-    fig, axes = plt.subplots(len(metrics), 1, figsize=(6.4, 3.0 * len(metrics)),
-                             sharex=True)
-    seen_labels = []
+    paper_style.use(font_scale=0.9)
+    # One row across the text width, a panel per metric.
+    fig, axes = paper_style.figure(1, len(metrics), height=2.15)
+    axes = axes[0]
 
     for ax, (metric, ylabel, _lower_better, log_y) in zip(axes, metrics):
         for (arm, pass_key), label, colour, marker in final_json.ARMS:
@@ -54,50 +56,37 @@ def make_figure(data, out_path, *, x_log=True, tuning_budget=None):
             if not per_seed:
                 continue
             xs, mean, lo, hi, n = final_json.band(per_seed)
-            ax.plot(xs, mean, color=colour, lw=1.8, label=label, zorder=3)
+            ax.plot(xs, mean, color=colour, lw=1.6, label=label, zorder=3)
             # min-max over seeds, not a standard error: at five seeds the
             # spread is the object of interest, and a sigma ribbon would hide
             # which runs are the outliers.
             if max(n) > 1:
-                ax.fill_between(xs, lo, hi, color=colour, alpha=0.16, lw=0,
+                ax.fill_between(xs, lo, hi, color=colour, alpha=0.22, lw=0,
                                 zorder=2)
-            ax.plot(xs[-1], mean[-1], marker=marker, ms=5, color=colour,
-                    mec="white", mew=0.9, zorder=4)
-            if label not in seen_labels:
-                seen_labels.append(label)
+            ax.plot(xs[-1], mean[-1], marker=marker, ms=4.5, color=colour,
+                    mec="white", mew=0.7, zorder=4)
         # Where the search actually looked. Every config here was selected at
-        # this budget and transferred to 4 epochs by the AdamW SDE rule, so
-        # everything to the right is the transfer's extrapolation.
+        # this budget and transferred to the reported duration by the AdamW
+        # SDE rule, so everything to the right is the transfer's
+        # extrapolation. What the rule marks is said in the caption.
         if tuning_budget:
-            ax.axvline(tuning_budget, color="0.35", ls="--", lw=1.0, zorder=1)
+            ax.axvline(tuning_budget, color="0.35", ls="--", lw=0.9, zorder=1)
         if x_log:
             ax.set_xscale("log")
+            # A log axis spanning under two decades labels its MINOR ticks
+            # too, which on a narrow panel overprints into an unreadable smear.
+            ax.xaxis.set_minor_formatter(NullFormatter())
         if log_y:
             ax.set_yscale("log")
+            paper_style.plain_log_ticks(ax, "y")
+        else:
+            paper_style.few_ticks(ax, y=5)
         ax.set_ylabel(ylabel)
-        ax.grid(alpha=0.25, lw=0.6)
-        ax.set_axisbelow(True)
-        # A log axis spanning under two decades labels its MINOR ticks too,
-        # which on a narrow panel overprints into an unreadable smear.
-        ax.xaxis.set_minor_formatter(NullFormatter())
+        ax.set_xlabel("Samples seen")
 
-    axes[-1].set_xlabel("samples seen")
-    axes[0].legend(frameon=False, fontsize=9, loc="lower right")
-    if tuning_budget:
-        # On the LAST panel, not the first: the first carries the legend, and
-        # the two overprint there.
-        axes[-1].annotate(
-            f"tuning budget\n{final_json.format_samples(tuning_budget)} samples",
-                          xy=(tuning_budget, 0.97),
-                          xycoords=("data", "axes fraction"),
-                          xytext=(4, 0), textcoords="offset points",
-                          fontsize=7, color="0.35", ha="left", va="top")
-    fig.suptitle("Fig 5 — sample efficiency (ImageNet val, held-out 80%)\n"
-                 + final_json.provenance(data), fontsize=9, y=0.995)
-    fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    print(f"[fig5] wrote {out_path}")
+    handles, labels = axes[0].get_legend_handles_labels()
+    paper_style.legend_below(fig, handles, labels)
+    paper_style.save(fig, out_path)
 
 
 def main():

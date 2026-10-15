@@ -21,11 +21,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-PAIRS = [("cifar10_vs_svhn", "CIFAR-10 vs SVHN\n(far-OOD)"),
-         ("cifar10_vs_cifar100", "CIFAR-10 vs CIFAR-100\n(near-OOD)"),
-         ("cifar100_vs_svhn", "CIFAR-100 vs SVHN\n(far-OOD)")]
+import paper_style
+from paper_style import DOWN, UP
 
-METRICS = [("auroc", "AUROC ↑"), ("fpr95", "FPR@95TPR ↓"), ("aupr", "AUPR ↑")]
+# Which pair is far-OOD and which near-OOD is said in the caption.
+PAIRS = [("cifar10_vs_svhn", "CIFAR-10 vs SVHN"),
+         ("cifar10_vs_cifar100", "CIFAR-10 vs CIFAR-100"),
+         ("cifar100_vs_svhn", "CIFAR-100 vs SVHN")]
+
+# The two metrics the paper reports. AUPR is measured and in the JSON, and
+# `--with-aupr` adds it as a third row; it ranks the methods the same way.
+METRICS = [("auroc", f"AUROC {UP}"), ("fpr95", f"FPR at 95% TPR {DOWN}")]
+AUPR = ("aupr", f"AUPR {UP}")
 
 # (arm, score, label, colour).
 #
@@ -52,11 +59,16 @@ METRICS = [("auroc", "AUROC ↑"), ("fpr95", "FPR@95TPR ↓"), ("aupr", "AUPR �
 # columns at different operating points. VBLL and IBProbit stay raw: their
 # claim is calibration by construction and their dumps are already-normalized
 # log-predictives (curves.TS_ARMS).
+#
+# The label is the method alone: every entry is scored by MSP, which the
+# caption states. Colours and markers are the ones the other figures use for
+# the same methods.
 SERIES = [
-    ("adamw_ce", "ts_msp", "CE+TS / MSP",   "#4C72B0"),
-    ("vbll",     "msp",    "VBLL / MSP",     "#C44E52"),
-    ("ibprobit", "msp",    "IBProbit / MSP", "#8172B2"),
+    ("adamw_ce", "ts_msp", "CE+TS",    paper_style.COLOURS["ce_ts"]),
+    ("vbll",     "msp",    "VBLL",     paper_style.COLOURS["vbll"]),
+    ("ibprobit", "msp",    "IBProbit", paper_style.COLOURS["ibprobit"]),
 ]
+MARKERS = {"adamw_ce": "s", "vbll": "^", "ibprobit": "D"}
 
 # ID control: the four classification metrics, keyed by ID dataset. Undefined on
 # the OOD side (an SVHN digit has no correct CIFAR label), so they cannot go on
@@ -93,36 +105,30 @@ def _arm_boundaries():
     ]
 
 
-def make_figure(summary, out_path):
-    fig, axes = plt.subplots(len(METRICS), len(PAIRS),
-                             figsize=(3.4 * len(PAIRS), 2.5 * len(METRICS)))
+def make_figure(summary, out_path, metrics=None):
+    metrics = metrics or METRICS
+    paper_style.use(font_scale=0.9)
+    fig, axes = paper_style.figure(len(metrics), len(PAIRS),
+                                   height=1.4 * len(metrics) + 0.2,
+                                   sharex=True)
 
     for j, (pair_key, pair_label) in enumerate(PAIRS):
-        for i, (metric_key, metric_label) in enumerate(METRICS):
+        for i, (metric_key, metric_label) in enumerate(metrics):
             ax = axes[i, j]
-            xs, means, stds, colours, labels = [], [], [], [], []
-            for x, (arm, score, label, colour) in enumerate(SERIES):
+            for x, (arm, score, _label, colour) in enumerate(SERIES):
                 cell = summary.get(f"{arm}|{pair_key}|{score}")
                 if not cell or metric_key not in cell:
                     continue
-                xs.append(x)
-                means.append(cell[metric_key]["mean"])
-                stds.append(cell[metric_key]["std"])
-                colours.append(colour)
-                labels.append(label)
-
-            if xs:
-                ax.errorbar(xs, means, yerr=stds, fmt="none",
-                            ecolor="#999999", elinewidth=1, capsize=3, zorder=2)
-                ax.scatter(xs, means, c=colours, s=52, zorder=3,
-                           edgecolors="white", linewidths=0.8)
+                ax.errorbar([x], [cell[metric_key]["mean"]],
+                            yerr=[cell[metric_key]["std"]], color=colour,
+                            marker=MARKERS.get(arm, "o"), markersize=6.5,
+                            markeredgecolor="white", markeredgewidth=0.7,
+                            elinewidth=1.3, capsize=3.0, capthick=1.3,
+                            linestyle="none", zorder=3)
 
             ax.set_xlim(-0.6, len(SERIES) - 0.4)
             ax.set_xticks(range(len(SERIES)))
-            ax.set_xticklabels(
-                [s[2] for s in SERIES] if i == len(METRICS) - 1 else [],
-                rotation=45, ha="right", fontsize=7,
-            )
+            ax.set_xticklabels([s[2] for s in SERIES])
             # Derived from SERIES, never hardcoded. This was a single axvline
             # at 1.5 -- correct for the two arms the figure had when it was
             # written, and silently wrong the moment IBProbit made it three:
@@ -131,24 +137,13 @@ def make_figure(summary, out_path):
             for boundary in _arm_boundaries():
                 ax.axvline(boundary, color="#cccccc", linewidth=0.8,
                            linestyle="--", zorder=1)
-            ax.grid(axis="y", alpha=0.25, linewidth=0.5)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            ax.tick_params(axis="y", labelsize=7)
+            paper_style.few_ticks(ax, y=5)
             if i == 0:
-                ax.set_title(pair_label, fontsize=9)
+                ax.set_title(pair_label)
             if j == 0:
-                ax.set_ylabel(metric_label, fontsize=9)
+                ax.set_ylabel(metric_label)
 
-    fig.suptitle(
-        "Fig 2 — OOD detection from frozen DINOv3-H+ features\n"
-        "hyperparameters tuned for in-distribution val_nll, not for OOD; "
-        "bands are ±1 sd over seeds",
-        fontsize=9.5, y=1.02,
-    )
-    fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight", dpi=150)
-    print(f"wrote {out_path}")
+    paper_style.save(fig, out_path)
 
 
 def make_id_figure(id_summary, out_path):
@@ -227,6 +222,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--json", default="scripts/results/fig2_detection.json")
     p.add_argument("--out-dir", default="scripts/figures")
+    p.add_argument("--with-aupr", action="store_true",
+                   help="Add AUPR as a third row.")
     args = p.parse_args()
 
     # `mlflow:<name>` fetches the published artifact; anything else is a
@@ -240,9 +237,11 @@ def main():
     summary = payload["summary"]
     id_summary = payload.get("id_summary", {})
 
+    metrics = METRICS + [AUPR] if args.with_aupr else METRICS
     os.makedirs(args.out_dir, exist_ok=True)
     for ext in ("pdf", "png"):
-        make_figure(summary, os.path.join(args.out_dir, f"fig2_draft.{ext}"))
+        make_figure(summary, os.path.join(args.out_dir, f"fig2_draft.{ext}"),
+                    metrics=metrics)
         if id_summary:
             make_id_figure(id_summary, os.path.join(args.out_dir, f"fig2_id_control.{ext}"))
 

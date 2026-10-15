@@ -66,6 +66,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+import paper_style  # noqa: E402
 from bllarse.finetune import imagenet
 from bllarse.analysis import final_json, thresholds  # noqa: E402
 
@@ -274,7 +275,7 @@ def panel_cost(ax, entries, cost, title, ylabel):
     ax.set_axisbelow(True)
 
 
-def panel_relative(ax, entries, timelines, baseline_arm, title):
+def panel_relative(ax, entries, timelines, baseline_arm):
     """Wall clock to the val-NLL target, RELATIVE to the baseline arm.
 
     Absolute seconds are a property of the A100 this ran on; the ratio is the
@@ -307,12 +308,13 @@ def panel_relative(ax, entries, timelines, baseline_arm, title):
     print(f"[fig7] normalising by {baseline_arm}: {unit:.0f} s = 1.0")
 
     order = [arm for (arm, _p), _l, _c, _m in final_json.ARMS if arm in costed]
-    # Headroom set from the data before anything is drawn: the accuracy note
-    # sits ~8 points above the tallest DOT, not the tallest bar, and a mean bar
-    # well below a spread-out seed hid the note behind the panel title.
+    note_size = plt.rcParams["xtick.labelsize"]
+    # Headroom set from the data before anything is drawn: the notes sit above
+    # the tallest DOT, not the tallest bar, and a mean bar well below a
+    # spread-out seed put them outside the axes.
     tallest = max((v / unit for _l, _c, r, c, _a, _n in costed.values()
                    for v in (r + c)), default=1.0)
-    ax.set_ylim(0, tallest * 1.32)
+    ax.set_ylim(0, tallest * 1.34)
 
     for i, arm in enumerate(order):
         label, colour, reached, censored, accs, n_seeds = costed[arm]
@@ -320,38 +322,45 @@ def panel_relative(ax, entries, timelines, baseline_arm, title):
         rel_censored = [v / unit for v in censored]
         if rel:
             ax.bar(i, sum(rel) / len(rel), width=0.6, color=colour, alpha=0.75,
-                   zorder=2)
-            ax.plot([i] * len(rel), rel, "o", ms=5, color="k", mfc="white",
-                    mew=1.0, zorder=4)
+                   lw=0, zorder=2)
+            ax.plot([i] * len(rel), rel, "o", ms=4.5, color="k", mfc="white",
+                    mew=0.9, zorder=4)
+        # A censored run is not a fast run and not a missing one: it is a lower
+        # bound at its own budget. Open hatched bar per seed, one arrow off the
+        # tallest, and a count.
         for v in rel_censored:
             ax.bar(i, v, width=0.6, facecolor="none", edgecolor=colour,
-                   hatch="///", lw=1.2, zorder=3)
-            ax.annotate("", xy=(i, v), xytext=(0, 16),
+                   hatch="///", lw=1.0, zorder=3)
+        if rel_censored:
+            ax.annotate("", xy=(i, max(rel_censored)), xytext=(0, 14),
                         textcoords="offset points",
-                        arrowprops=dict(arrowstyle="<|-", color=colour, lw=1.2))
+                        arrowprops=dict(arrowstyle="<|-", color=colour, lw=1.2,
+                                        shrinkA=0, shrinkB=0))
         # What ACCURACY the run had when its val NLL crossed. The panel gates
         # on one metric, so the other one has to be stated rather than assumed
         # to have come along -- an arm can cross first and still be behind here.
         top = max(rel + rel_censored) if (rel or rel_censored) else 0
         if accs:
             acc = sum(accs) / len(accs)
-            delta = "" if base_acc is None else f"\n({acc - base_acc:+.3f})"
-            ax.annotate(f"acc {acc:.3f}{delta}", xy=(i, top), xytext=(0, 8),
+            # The difference to the normalising arm, which for that arm itself
+            # is zero by construction and is not printed.
+            delta = ("" if base_acc is None or arm == baseline_arm
+                     else f"\n({acc - base_acc:+.3f})")
+            ax.annotate(f"acc {acc:.3f}{delta}", xy=(i, top), xytext=(0, 6),
                         textcoords="offset points", ha="center", va="bottom",
-                        fontsize=7, color="0.25")
+                        fontsize=note_size, color="0.25")
         if censored:
             ax.annotate(f"{len(censored)}/{n_seeds} censored", xy=(i, top),
-                        xytext=(0, 26), textcoords="offset points",
-                        ha="center", va="bottom", fontsize=7, color=colour)
+                        xytext=(0, 16), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=note_size,
+                        color=colour)
 
     ax.axhline(1.0, color="0.4", ls=":", lw=1.0, zorder=1)
     ax.set_xticks(range(len(order)))
-    ax.set_xticklabels([costed[a][0] for a in order], rotation=20, ha="right",
-                       fontsize=8)
-    ax.set_ylabel(f"wall clock / {costed[baseline_arm][0]}")
-    ax.set_title(title, fontsize=10)
-    ax.grid(alpha=0.25, lw=0.6, axis="y")
-    ax.set_axisbelow(True)
+    ax.set_xticklabels([costed[a][0] for a in order])
+    ax.set_xlim(-0.55, len(order) - 0.45)
+    ax.tick_params(axis="x", length=0)
+    ax.set_ylabel(f"Wall-clock time / {costed[baseline_arm][0]}")
 
 
 
@@ -372,7 +381,13 @@ def _elapsed_at(timeline, samples):
 
 def make_figure(data, out_path, *, targets, baseline_name, fraction,
                 reference, normalise_by, wallclock):
-    fig, ax = plt.subplots(1, 1, figsize=(5.2, 4.2))
+    # A single panel, drawn at 0.65 of the text width and included at that.
+    # The target, the baseline it comes from and the normalisation are stated
+    # in the caption; `main` prints them.
+    paper_style.use()
+    fig, axes = paper_style.figure(1, 1, width=0.65 * paper_style.TEXT_WIDTH,
+                                   height=2.5)
+    ax = axes[0][0]
     entries = joint_crossings(data, targets)
 
     # {(arm, seed): [(samples, elapsed_s)]} -- a MEASURED timeline per run, so
@@ -384,19 +399,283 @@ def make_figure(data, out_path, *, targets, baseline_name, fraction,
     if not timelines:
         raise SystemExit("[fig7] --wallclock is required: this panel is a time")
 
-    panel_relative(ax, entries, timelines, normalise_by,
-                   "time to the joint calibration target")
-    fig.suptitle(
-        f"Fig 7 — wall clock to acc ≥ {targets.acc:.4f}, NLL ≤ {targets.nll:.4f}, "
-        f"Brier ≤ {targets.brier:.4f}\n"
-        + (f"({fraction:g}× {baseline_name})" if " at " in baseline_name
-           else f"({fraction:g}× {baseline_name} at its {reference})")
-        + f", relative to {normalise_by}\n"
-        + final_json.provenance(data), fontsize=9, y=1.04)
-    fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    print(f"[fig7] wrote {out_path}")
+    panel_relative(ax, entries, timelines, normalise_by)
+    print(f"[fig7] joint target: acc >= {targets.acc:.4f}, "
+          f"NLL <= {targets.nll:.4f}, Brier <= {targets.brier:.4f} "
+          + (f"({fraction:g}x {baseline_name})" if " at " in baseline_name
+             else f"({fraction:g}x {baseline_name} at its {reference})")
+          + f", relative to {normalise_by}")
+    paper_style.save(fig, out_path)
+
+
+# The arm whose time is measured in the baseline-endpoint mode.
+METHOD = ("ibprobit", "id")
+
+
+def endpoint_targets(data, arm, pass_key):
+    """One arm's seed-mean values at the end of its run, as joint targets.
+
+    "The end" is the largest evaluation present in EVERY seed of the arm, so
+    the mean is over all of them. Returns (targets, samples_seen, uids).
+    """
+    uids = final_json.uids_by_arm(data, pass_key).get(arm)
+    if not uids:
+        return None
+    budget = min(max(r["samples_seen"] for r in final_json.rows(data, uid, pass_key))
+                 for uid in uids.values())
+    targets, row = thresholds.targets_at_samples(
+        _mean_curve(data, uids, pass_key), budget, 1.0)
+    return targets, row["samples_seen"], uids
+
+
+def time_to_baseline_endpoints(data, timelines):
+    """How long METHOD needs to reach what each baseline has at its endpoint.
+
+    The reverse of `--target-arm ibprobit`, and the comparison that can be
+    made when the baselines never reach the method's level: the target comes
+    from the BASELINE, at the end of its own run, and it is the method that is
+    timed against it. Each baseline sets its own target, so one baseline being
+    weaker than the other censors nothing.
+
+    The crossing is joint and per seed of the method, as everywhere else in
+    this file. A seed that never reaches a target is kept as censored, at the
+    time its own run ended.
+
+    Returns [(label, colour, targets, baseline_seconds, samples,
+              {seed: (seconds, samples_seen, censored)})].
+    """
+    method_arm, method_pass = METHOD
+    method_uids = final_json.uids_by_arm(data, method_pass).get(method_arm)
+    if not method_uids:
+        raise SystemExit(f"[fig7] no {method_arm!r} runs in the scores")
+
+    out = []
+    for (arm, pass_key), label, colour, _marker in final_json.ARMS:
+        if (arm, pass_key) == METHOD:
+            continue
+        found = endpoint_targets(data, arm, pass_key)
+        if found is None:
+            continue
+        targets, samples, uids = found
+        totals = [_elapsed_at(timelines[(arm, seed)], samples)
+                  for seed in uids if timelines.get((arm, seed))]
+        if not totals:
+            continue
+        baseline_seconds = sum(totals) / len(totals)
+
+        per_seed = {}
+        for seed, uid in sorted(method_uids.items()):
+            timeline = timelines.get((method_arm, seed))
+            if not timeline:
+                continue
+            crossing = thresholds.first_crossing(
+                final_json.rows(data, uid, method_pass), targets)
+            at = crossing.last_step if crossing.censored else crossing.samples_seen
+            per_seed[seed] = (_elapsed_at(timeline, at), at, crossing.censored)
+        out.append((label, colour, targets, baseline_seconds, samples, per_seed))
+    return out
+
+
+def make_endpoint_figure(data, out_path, *, wallclock):
+    """The method's time to each baseline's endpoint, over that baseline's time.
+
+    One bar per baseline. The bar is the mean over the method's seeds and the
+    circles are the seeds, both as a fraction of the baseline's own training
+    time, so the dotted line at 1 is the baseline. The number above a bar is
+    the speed-up, the inverse of the bar.
+    """
+    timelines = _timelines(wallclock)
+    entries = time_to_baseline_endpoints(data, timelines)
+    if not entries:
+        raise SystemExit("[fig7] no baseline with both scores and a timeline")
+    n_train = imagenet.IMAGENET_N_TRAIN
+
+    paper_style.use()
+    fig, axes = paper_style.figure(1, 1, width=0.5 * paper_style.TEXT_WIDTH,
+                                   height=2.4)
+    ax = axes[0][0]
+    note_size = plt.rcParams["xtick.labelsize"]
+
+    for i, (label, colour, targets, base_s, samples, per_seed) in enumerate(entries):
+        reached = [t for t, _x, censored in per_seed.values() if not censored]
+        bounds = [t for t, _x, censored in per_seed.values() if censored]
+        print(f"[fig7] target from {label} at {samples:,} samples "
+              f"({samples / n_train:.2f} epochs, {base_s / 3600:.2f} h): "
+              f"acc >= {targets.acc:.4f}, NLL <= {targets.nll:.4f}, "
+              f"Brier <= {targets.brier:.4f}")
+        for seed, (t, x, censored) in per_seed.items():
+            print(f"[fig7]   seed {seed}: "
+                  + ("NEVER reached, run ended at " if censored else "reached at ")
+                  + f"{x:,} samples ({x / n_train:.2f} epochs), "
+                  f"{t / 3600:.2f} h, {t / base_s:.3f} of the baseline's time")
+        top = 0.0
+        if reached:
+            mean = sum(reached) / len(reached)
+            epochs = [x / n_train for _t, x, c in per_seed.values() if not c]
+            print(f"[fig7]   mean {mean / 3600:.2f} h and "
+                  f"{sum(epochs) / len(epochs):.2f} epochs, "
+                  f"{mean / base_s:.3f} of the baseline's time, "
+                  f"speed-up {base_s / mean:.2f}x "
+                  f"(per seed {base_s / max(reached):.2f}x to "
+                  f"{base_s / min(reached):.2f}x)")
+            ax.bar(i, mean / base_s, width=0.6, color=colour, alpha=0.75,
+                   lw=0, zorder=2)
+            ax.plot([i] * len(reached), [t / base_s for t in reached], "o",
+                    ms=4.5, color="k", mfc="white", mew=0.9, zorder=4)
+            top = max(reached) / base_s
+            ax.annotate(f"{base_s / mean:.1f}$\\times$", xy=(i, top),
+                        xytext=(0, 5), textcoords="offset points", ha="center",
+                        va="bottom", fontsize=note_size, color="0.25")
+        # A seed that never reaches the target is a LOWER bound on the time,
+        # at the end of its own run: an open marker with an arrow, and a count.
+        if bounds:
+            ax.plot([i] * len(bounds), [t / base_s for t in bounds], "^",
+                    ms=5.0, color=colour, mfc="white", mew=1.0, zorder=4)
+            ax.annotate(f"{len(bounds)}/{len(per_seed)} never",
+                        xy=(i, max(max(bounds) / base_s, top)), xytext=(0, 16),
+                        textcoords="offset points", ha="center", va="bottom",
+                        fontsize=note_size, color=colour)
+
+    ax.axhline(1.0, color="0.4", ls=":", lw=1.0, zorder=1)
+    ax.set_xticks(range(len(entries)))
+    ax.set_xticklabels([e[0] for e in entries])
+    ax.set_xlim(-0.6, len(entries) - 0.4)
+    ax.tick_params(axis="x", length=0)
+    ax.set_ylim(0, max(1.12, ax.get_ylim()[1]))
+    ax.set_xlabel("Baseline that sets the target")
+    ax.set_ylabel("IBProbit time / baseline time")
+    paper_style.save(fig, out_path)
+
+
+def _timelines(wallclock):
+    timelines = {}
+    for run in (wallclock.get("runs") or {}).values():
+        timelines[(run["arm"], int(run["seed"]))] = run["elapsed_s"]
+    if not timelines:
+        raise SystemExit("[fig7] --wallclock is required: this figure is a time")
+    return timelines
+
+
+def cost_to_endpoint(data, timelines, target_arm):
+    """Training each arm needs to reach `target_arm`'s performance at its endpoint.
+
+    ONE target for every arm: the seed-mean accuracy, NLL and Brier of
+    `target_arm` at the end of its own run. The target arm reaches it at that
+    point by construction, so its cost is the length of its run and is not
+    read off a per-seed crossing -- about half of its seeds end below their
+    own mean and would otherwise count as never reaching a level that is
+    defined as where the arm ends.
+
+    Every other arm is timed at its first joint crossing, per seed. A seed that
+    never crosses is censored at the end of its own run: a lower bound.
+
+    Returns (targets, samples, [(arm, label, colour,
+                                 {seed: (hours, epochs, censored)})]).
+    """
+    spec = next(((arm, pass_key) for (arm, pass_key), _l, _c, _m in final_json.ARMS
+                 if arm == target_arm), None)
+    found = spec and endpoint_targets(data, *spec)
+    if not found:
+        raise SystemExit(f"[fig7] no {target_arm!r} runs in the scores")
+    targets, samples, _uids = found
+    n_train = imagenet.IMAGENET_N_TRAIN
+
+    entries = []
+    for (arm, pass_key), label, colour, _marker in final_json.ARMS:
+        uids = final_json.uids_by_arm(data, pass_key).get(arm)
+        if not uids:
+            continue
+        per_seed = {}
+        for seed, uid in sorted(uids.items()):
+            timeline = timelines.get((arm, seed))
+            if not timeline:
+                continue
+            if arm == target_arm:
+                at, censored = samples, False
+            else:
+                crossing = thresholds.first_crossing(
+                    final_json.rows(data, uid, pass_key), targets)
+                censored = crossing.censored
+                at = crossing.last_step if censored else crossing.samples_seen
+            per_seed[seed] = (_elapsed_at(timeline, at) / 3600.0, at / n_train,
+                              censored)
+        entries.append((arm, label, colour, per_seed))
+    return targets, samples, entries
+
+
+def make_cost_to_endpoint_figure(data, out_path, *, wallclock, target_arm):
+    """Two panels, wall-clock hours and epochs, to one baseline's endpoint.
+
+    A filled bar is the mean over the seeds that reach the target, with the
+    seeds as circles. A seed that never reaches it is an open hatched bar at
+    the length of its own run, with one arrow: a lower bound, not a
+    measurement. The number above a bar is the speed-up against the target arm.
+    """
+    timelines = _timelines(wallclock)
+    targets, samples, entries = cost_to_endpoint(data, timelines, target_arm)
+    n_train = imagenet.IMAGENET_N_TRAIN
+    print(f"[fig7] target from {target_arm} at {samples:,} samples "
+          f"({samples / n_train:.2f} epochs): acc >= {targets.acc:.4f}, "
+          f"NLL <= {targets.nll:.4f}, Brier <= {targets.brier:.4f}")
+
+    paper_style.use()
+    fig, axes = paper_style.figure(1, 2, width=0.85 * paper_style.TEXT_WIDTH,
+                                   height=2.35)
+    note_size = plt.rcParams["xtick.labelsize"]
+    panels = [(0, "Wall-clock time (hours)", "h"), (1, "Epochs", "epochs")]
+    base = next(per_seed for arm, _l, _c, per_seed in entries if arm == target_arm)
+
+    for ax, (k, ylabel, unit) in zip(axes[0], panels):
+        base_mean = sum(v[k] for v in base.values()) / len(base)
+        tallest = 0.0
+        for i, (arm, label, colour, per_seed) in enumerate(entries):
+            reached = [v[k] for v in per_seed.values() if not v[2]]
+            bounds = [v[k] for v in per_seed.values() if v[2]]
+            tallest = max([tallest] + reached + bounds)
+            if reached:
+                mean = sum(reached) / len(reached)
+                ax.bar(i, mean, width=0.6, color=colour, alpha=0.75, lw=0,
+                       zorder=2)
+                ax.plot([i] * len(reached), reached, "o", ms=4.5, color="k",
+                        mfc="white", mew=0.9, zorder=4)
+                if arm != target_arm:
+                    ax.annotate(f"{base_mean / mean:.1f}$\\times$",
+                                xy=(i, max(reached)), xytext=(0, 5),
+                                textcoords="offset points", ha="center",
+                                va="bottom", fontsize=note_size, color="0.25")
+            for v in bounds:
+                ax.bar(i, v, width=0.6, facecolor="none", edgecolor=colour,
+                       hatch="///", lw=1.0, zorder=3)
+            if bounds:
+                ax.annotate("", xy=(i, max(bounds)), xytext=(0, 14),
+                            textcoords="offset points",
+                            arrowprops=dict(arrowstyle="<|-", color=colour,
+                                            lw=1.2, shrinkA=0, shrinkB=0))
+                # The count only when it is partial; an arm in which no seed
+                # reaches the target is described in the caption.
+                if reached:
+                    ax.annotate(f"{len(bounds)}/{len(per_seed)} censored",
+                                xy=(i, max(bounds)), xytext=(0, 16),
+                                textcoords="offset points", ha="center",
+                                va="bottom", fontsize=note_size, color=colour)
+            if k == 0:
+                n_c = len(bounds)
+                print(f"[fig7] {label}: "
+                      + (f"{sum(reached) / len(reached):.2f} {unit} "
+                         f"({min(reached):.2f}-{max(reached):.2f})"
+                         if reached else "never reached")
+                      + (f"; {n_c}/{len(per_seed)} censored at "
+                         f"{sum(bounds) / n_c:.2f} {unit}" if n_c else "")
+                      + (f"; epochs {sum(v[1] for v in per_seed.values() if not v[2]) / len(reached):.2f}"
+                         if reached else ""))
+        ax.set_xticks(range(len(entries)))
+        ax.set_xticklabels([e[1].replace("AdamW+", "") for e in entries])
+        ax.set_xlim(-0.6, len(entries) - 0.4)
+        ax.tick_params(axis="x", length=0)
+        ax.set_ylim(0, tallest * 1.2)
+        ax.set_ylabel(ylabel)
+        paper_style.few_ticks(ax, y=5)
+    paper_style.save(fig, out_path)
 
 
 def main():
@@ -427,6 +706,19 @@ def main():
                         "multiple of. This does NOT set the target -- "
                         "results-plan 0.4 fixes that at the strongest baseline "
                         "-- and changing it rescales every bar equally.")
+    p.add_argument("--target-endpoint", default=None, metavar="ARM",
+                   help="ONE target for every arm: what ARM (e.g. ce) has at "
+                        "the end of its own run. Two panels, hours and "
+                        "epochs; an arm that never reaches the target is "
+                        "drawn right-censored at the length of its run. "
+                        "Ignores --fraction, --target-arm and --reference.")
+    p.add_argument("--baseline-endpoints", action="store_true",
+                   help="The reverse comparison: for each baseline, the target "
+                        "is what that baseline has at the end of its own run, "
+                        "and the figure is the time IBProbit needs to reach it "
+                        "as a fraction of the baseline's training time. For "
+                        "when the baselines never reach IBProbit's level. "
+                        "Ignores --fraction, --target-arm and --reference.")
     p.add_argument("--wallclock", default=None,
                    help="scripts/analysis/wallclock_from_dumps.py output: a "
                         "measured (samples, elapsed) timeline per run.")
@@ -434,6 +726,18 @@ def main():
 
     data = final_json.load(args.scores)
     print(f"[fig7] {final_json.provenance(data)}")
+    if args.target_endpoint or args.baseline_endpoints:
+        wallclock = (json.loads(Path(args.wallclock).read_text())
+                     if args.wallclock else {})
+        os.makedirs(args.out_dir, exist_ok=True)
+        for ext in ("pdf", "png"):
+            out_path = os.path.join(args.out_dir, f"{args.name}.{ext}")
+            if args.target_endpoint:
+                make_cost_to_endpoint_figure(data, out_path, wallclock=wallclock,
+                                             target_arm=args.target_endpoint)
+            else:
+                make_endpoint_figure(data, out_path, wallclock=wallclock)
+        return
     if args.target_arm:
         samples = int(round(args.target_epochs * imagenet.IMAGENET_N_TRAIN))
         uids = final_json.uids_by_arm(data, "id").get(args.target_arm)

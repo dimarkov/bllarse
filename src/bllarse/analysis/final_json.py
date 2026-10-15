@@ -63,10 +63,13 @@ def ood_arms(data):
 # any analysis can read it -- and it is off the reported figures because NLL
 # and Brier are proper scoring rules that already carry the calibration claim,
 # while ECE's value depends on a binning choice the figure would not show.
+#
+# The arrows are mathtext, not the Unicode characters: the figures' text font
+# is not guaranteed to have those glyphs.
 METRICS = [
-    ("acc", "accuracy ↑", False, False),
-    ("nll", "NLL ↓", True, True),
-    ("brier", "Brier ↓", True, False),
+    ("acc", r"Accuracy $\uparrow$", False, False),
+    ("nll", r"NLL $\downarrow$", True, True),
+    ("brier", r"Brier $\downarrow$", True, False),
 ]
 
 # Where the hyperparameter search actually looked. Everything to the RIGHT of
@@ -113,14 +116,14 @@ def format_samples(n: float) -> str:
 # so it measures whether the model can tell SHIFTED inputs from clean ones --
 # covariate shift. It is not the semantic OOD task of Fig 2 (CIFAR-10 vs SVHN,
 # disjoint labels), and the two numbers must not be read across.
-OOD_METRICS = METRICS + [("auroc", "MSP AUROC ↑", False, False)]
+OOD_METRICS = METRICS + [("auroc", r"MSP AUROC $\uparrow$", False, False)]
 
 # OOD panel order. Matches finetune.imagenet.OOD_KEYS; R and A cover only 200 of
 # the 1000 classes and are evaluated under the subset mask, which the caption
-# has to say out loud.
+# has to say out loud -- the panel headers name the set and nothing else.
 OOD_SETS = [
-    ("ood_imagenet_r", "ImageNet-R (200c)"),
-    ("ood_imagenet_a", "ImageNet-A (200c)"),
+    ("ood_imagenet_r", "ImageNet-R"),
+    ("ood_imagenet_a", "ImageNet-A"),
     ("ood_imagenet_v2", "ImageNet-V2"),
     ("ood_imagenet_sketch", "ImageNet-Sketch"),
 ]

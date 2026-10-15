@@ -18,7 +18,11 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from dotenv import load_dotenv
+
+import paper_style
+from paper_style import DOWN, UP
 
 load_dotenv()
 load_dotenv(".env.secrets", override=False)
@@ -107,7 +111,8 @@ def fetch_mlflow_runs(experiment_name: str, parent_run_name: str) -> pd.DataFram
 # ---------------------------------------------------------------------------
 
 METRICS = ["test_acc", "test_ece", "test_nll"]
-METRIC_LABELS = {"test_acc": "Accuracy", "test_ece": "ECE", "test_nll": "NLL"}
+METRIC_LABELS = {"test_acc": f"Accuracy {UP}", "test_ece": f"ECE {DOWN}",
+                 "test_nll": f"NLL {DOWN}"}
 FIGURE_DATASETS = [
     "oxford_pets", "food101", "flowers102",
     "stanford_cars", "dtd", "imagenet1k",
@@ -128,44 +133,41 @@ MODEL_DISPLAY = {
 }
 
 
-def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", model: str = "dinov3_huge", dataset_info: dict | None = None):
-    """3-row (metrics) x 6-col (datasets) figure."""
-    plt.rcParams.update({
-        "font.size": 12,
-        "axes.titlesize": 13,
-        "axes.labelsize": 13,
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 11,
-        "legend.fontsize": 12,
-        "figure.titlesize": 16,
-    })
+def _batch_label(batch_size, _pos=None):
+    """512 -> '512', 4096 -> '4k'."""
+    batch_size = int(round(batch_size))
+    return str(batch_size) if batch_size < 1024 else f"{batch_size // 1024}k"
+
+
+def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", model: str = "dinov3_huge"):
+    """One row per dataset, one column per metric.
+
+    Six datasets across the page left each panel under an inch wide at print
+    size, with no room for readable tick labels. Down the page, every panel is
+    a third of the text width and all of them share one batch-size axis.
+    """
+    paper_style.use(font_scale=0.9)
 
     df_model = df[df["model"] == model].copy()
+    datasets = [d for d in FIGURE_DATASETS if (df_model["dataset"] == d).any()]
 
-    n_rows = len(METRICS)
-    n_cols = len(FIGURE_DATASETS)
+    fig, axes = paper_style.figure(len(datasets), len(METRICS),
+                                   height=0.95 * len(datasets) + 0.75,
+                                   sharex=True)
 
-    fig, axes = plt.subplots(
-        n_rows, n_cols,
-        figsize=(1.7 * n_cols, 1.8 * n_rows),
-        squeeze=False,
-        sharex="col",
-    )
-
-    batch_sizes = sorted(df_model["batch_size"].unique())
+    batch_sizes = sorted(df_model[df_model["dataset"].isin(datasets)]["batch_size"].unique())
     update_iters_list = sorted(df_model["num_update_iters"].unique())
 
-    cmap = plt.cm.RdYlBu
-    colors = {
-        it: cmap(i / max(len(update_iters_list) - 1, 1))
-        for i, it in enumerate(update_iters_list)
-    }
+    # The iteration count is ordered, so a sequential palette: light to dark
+    # with more iterations. One extra colour is requested and the first
+    # dropped, because viridis starts at a yellow that does not show on white.
+    colors = dict(zip(update_iters_list,
+                      sns.color_palette("viridis_r", len(update_iters_list) + 1)[1:]))
 
-    for col_idx, dataset in enumerate(FIGURE_DATASETS):
+    for row_idx, dataset in enumerate(datasets):
         df_ds = df_model[df_model["dataset"] == dataset]
-        ds_batch_sizes = sorted(df_ds["batch_size"].unique())
 
-        for row_idx, metric in enumerate(METRICS):
+        for col_idx, metric in enumerate(METRICS):
             ax = axes[row_idx, col_idx]
 
             for ui in update_iters_list:
@@ -175,7 +177,7 @@ def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", mode
 
                 stats = df_ui.groupby("batch_size")[metric].agg(["mean", "std"])
                 stats["std"] = stats["std"].fillna(0)
-                stats = stats.reindex(ds_batch_sizes).dropna(subset=["mean"])
+                stats = stats.dropna(subset=["mean"]).sort_index()
                 if stats.empty:
                     continue
 
@@ -183,64 +185,37 @@ def make_figure(df: pd.DataFrame, output_dir: str, prefix: str = "sweep2a", mode
                 y = stats["mean"].values
                 yerr = stats["std"].values
 
-                ax.plot(x, y, marker="o", ms=3.5, color=colors[ui], label=f"iters={int(ui)}")
+                ax.plot(x, y, marker="o", ms=3.0, lw=1.4, color=colors[ui],
+                        label=f"{int(ui)}")
                 if yerr.any():
-                    ax.fill_between(x, y - yerr, y + yerr, alpha=0.15, color=colors[ui])
+                    ax.fill_between(x, y - yerr, y + yerr, alpha=0.18,
+                                    color=colors[ui], lw=0)
 
             ax.set_xscale("log", base=2)
-            ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-            if ds_batch_sizes:
-                ax.xaxis.set_major_locator(ticker.FixedLocator(ds_batch_sizes))
-            ax.tick_params(axis="x", rotation=45)
+            ax.xaxis.set_major_locator(ticker.FixedLocator(batch_sizes))
+            ax.xaxis.set_major_formatter(ticker.FuncFormatter(_batch_label))
+            ax.xaxis.set_minor_locator(ticker.NullLocator())
+            paper_style.few_ticks(ax, y=4)
 
-            ax.yaxis.set_major_locator(
-                ticker.MaxNLocator(nbins=3, steps=[1, 2, 10], prune="both")
-            )
-            ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
-
-
+            # A metric that does not move at all would otherwise get
+            # matplotlib's default window around a constant, which for an
+            # accuracy of 0.996 runs past 1.
+            lo, hi = ax.dataLim.intervaly
+            if hi - lo < 1e-9:
+                ax.set_ylim(lo - 0.003, lo + 0.003)
 
             if row_idx == 0:
-                ds_label = DATASET_DISPLAY.get(dataset, dataset.replace("_", " ").title())
-                info = (dataset_info or {}).get(dataset, {})
-                n_train = info.get("n_train")
-                n_classes = info.get("n_classes")
-                parts = []
-                if n_train:
-                    parts.append(f"n={n_train:,}")
-                if n_classes:
-                    parts.append(f"C={n_classes}")
-                title = f"{ds_label}\n({', '.join(parts)})" if parts else ds_label
-                ax.set_title(title, fontweight="bold")
-            if row_idx == n_rows - 1:
-                ax.set_xlabel("Batch Size")
+                ax.set_title(METRIC_LABELS[metric])
             if col_idx == 0:
-                ax.set_ylabel(METRIC_LABELS[metric])
+                ax.set_ylabel(DATASET_DISPLAY.get(dataset, dataset))
+    for ax in axes[-1]:
+        ax.set_xlabel("Batch size")
 
-    # Single legend
-    handles, labels = [], []
-    for ax in axes.flat:
-        for h, l in zip(*ax.get_legend_handles_labels()):
-            if l not in labels:
-                handles.append(h)
-                labels.append(l)
-
-    fig.legend(
-        handles, labels,
-        loc="center left",
-        ncol=1,
-        frameon=True,
-        bbox_to_anchor=(1.01, 0.5),
-    )
-
-    model_label = MODEL_DISPLAY.get(model, model)
-    fig.suptitle(f"IBProbit linear probing — {model_label}", y=1.005)
-    fig.tight_layout(pad=0.1, w_pad=0.1, h_pad=0.1)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    paper_style.legend_below(fig, handles, labels, title="CAVI iterations per step")
 
     fname = os.path.join(output_dir, f"{prefix}_dinov3_huge.pdf")
-    fig.savefig(fname, bbox_inches="tight", dpi=150)
-    print(f"Saved {fname}")
-    plt.close(fig)
+    paper_style.save(fig, fname)
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +253,14 @@ def main():
         return
 
     prefix = args.parent_run_name.split("-")[0]
+    # Training-set size and class count go in the caption, not on the figure.
     dataset_info = _load_dataset_info(args.cache_dir)
-    make_figure(df, args.output_dir, prefix=prefix, dataset_info=dataset_info)
+    for dataset in FIGURE_DATASETS:
+        info = dataset_info.get(dataset)
+        if info:
+            print(f"{DATASET_DISPLAY[dataset]}: n={info['n_train']:,}, "
+                  f"C={info.get('n_classes', '?')}")
+    make_figure(df, args.output_dir, prefix=prefix)
 
 
 if __name__ == "__main__":

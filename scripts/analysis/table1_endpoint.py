@@ -17,7 +17,7 @@ ECE is omitted deliberately, matching the figures: NLL and Brier are proper and
 carry the calibration claim, while ECE depends on a binning choice the table
 would not show.
 
-The shift columns average the four sets in `final_json.OOD_SETS` at the last OOD
+The shift rows average the four sets in `final_json.OOD_SETS` at the last OOD
 evaluation at or before the budget -- the OOD grid is a stride of the trajectory
 grid, so it rarely lands on the same step.
 """
@@ -108,50 +108,48 @@ def main() -> None:
     used = {label: min(at) for label, _i, _s, at in rows_out if at}
     shift_ok = bool(used) and (max(used.values()) - min(used.values())) <= 0.1 * budget
     if not shift_ok:
-        print("% shift columns OMITTED: the arms' OOD grids do not line up.")
+        print("% shift rows OMITTED: the arms' OOD grids do not line up.")
         for label, at in sorted(used.items(), key=lambda kv: kv[1]):
             print(f"%   {label:14} would be read at {at:>10,} samples "
                   f"({at / budget:.0%} of the in-distribution budget)")
         print("%   Averaging an early model against late ones under one header "
               "is not a comparison. Fix the sparse arm's OOD coverage.")
 
-    print(r"\begin{tabular}{lccc" + ("|cccc}" if shift_ok else "}"))
-    print(r"\toprule")
+    # Methods as columns, metrics as rows. The other way round is seven
+    # columns of "mean +- sd", which does not fit the text width.
+    labels = [label for label, _i, _s, _a in rows_out]
+    names = {"acc": r"Accuracy $\uparrow$", "nll": r"NLL $\downarrow$",
+             "brier": r"Brier $\downarrow$", "auroc": r"AUROC $\uparrow$"}
+    groups = [("In distribution", "id",
+               [("acc", True), ("nll", False), ("brier", False)])]
     if shift_ok:
-        print(r"& \multicolumn{3}{c|}{In distribution} "
-              r"& \multicolumn{4}{c}{Shift (mean of four sets)} \\")
-    print(r"Method & Acc $\uparrow$ & NLL $\downarrow$ & Brier $\downarrow$"
-          + (r" & Acc $\uparrow$ & NLL $\downarrow$ & Brier $\downarrow$ "
-             r"& AUROC $\uparrow$ \\" if shift_ok else r" \\"))
-    print(r"\midrule")
-    # Bold the winner per column, computed rather than typed: the ordering
-    # changes between campaigns and a hand-bolded cell is how a table ends up
-    # crediting the wrong arm.
-    cols = [("acc", idv_key := "id", True), ("nll", "id", False),
-            ("brier", "id", False)]
-    if shift_ok:
-        cols += [("acc", "sh", True), ("nll", "sh", False),
-                 ("brier", "sh", False), ("auroc", "sh", True)]
-    means = []
-    for metric, where, higher in cols:
-        vals = []
-        for _label, idv, shv, _ in rows_out:
-            src = idv if where == "id" else shv
-            vals.append(statistics.fmean(src[metric]) if src[metric] else None)
-        live = [v for v in vals if v is not None]
-        best = (max(live) if higher else min(live)) if live else None
-        means.append((vals, best))
+        groups.append(("Under shift (mean of four sets)", "sh",
+                       [("acc", True), ("nll", False), ("brier", False),
+                        ("auroc", True)]))
 
-    for i, (label, idv, shv, _) in enumerate(rows_out):
-        cells = []
-        for j, (metric, where, _h) in enumerate(cols):
-            src = idv if where == "id" else shv
-            text = _pm(src[metric])
-            vals, best = means[j]
-            if best is not None and vals[i] is not None and vals[i] == best:
-                text = r"$\bm{" + text.replace(r" $\pm$ ", r" \pm ").replace("$", "") + "}$"
-            cells.append(text)
-        print(f"{label} & " + " & ".join(cells) + r" \\")
+    print(r"\begin{tabular}{l" + "c" * len(labels) + "}")
+    print(r"\toprule")
+    print("Metric & " + " & ".join(labels) + r" \\")
+    for title, where, metrics in groups:
+        print(r"\midrule")
+        print(rf"\multicolumn{{{len(labels) + 1}}}{{l}}{{\textit{{{title}}}}} \\")
+        for metric, higher in metrics:
+            per_arm = [(idv if where == "id" else shv)[metric]
+                       for _label, idv, shv, _at in rows_out]
+            vals = [statistics.fmean(v) if v else None for v in per_arm]
+            live = [v for v in vals if v is not None]
+            # Bold the winner per metric, computed rather than typed: the
+            # ordering changes between campaigns and a hand-bolded cell is how
+            # a table ends up crediting the wrong arm.
+            best = (max(live) if higher else min(live)) if live else None
+            cells = []
+            for seeds, mean in zip(per_arm, vals):
+                text = _pm(seeds)
+                if best is not None and mean is not None and mean == best:
+                    text = (r"$\bm{" + text.replace(r" $\pm$ ", r" \pm ")
+                            .replace("$", "") + "}$")
+                cells.append(text)
+            print(f"{names[metric]} & " + " & ".join(cells) + r" \\")
     print(r"\bottomrule")
     print(r"\end{tabular}")
 
