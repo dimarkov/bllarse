@@ -1,17 +1,17 @@
 # bllarse
 
-Fitting Bayesian last layers or Bayesian "heads" with sparse priors to embeddings of deep neural networks, and pruning their parameters with Bayesian model reduction.
+Bayesian last layers ("heads") on top of pretrained vision backbones. This is
+the code for comparing an IBProbit head with AdamW + cross-entropy (with
+temperature scaling) and with VBLL, in two settings: linear probing on frozen
+DINOv3 features, and full-network fine-tuning on ImageNet-1k. Accuracy,
+calibration and OOD detection are all computed after training, from saved
+logits.
 
 ## Setup
 
-We recommend using `uv` to create a virtual environment and install dependencies
-
 ```bash
-# (Re)create and synchronize your virtual environment:
-uv venv
-uv sync
-
-# Activate it:
+uv sync                 # the JAX library and the AdamW+CE / IBProbit arms
+uv sync --group vbll    # adds PyTorch and `vbll` for the VBLL arm
 source .venv/bin/activate
 ```
 
@@ -26,21 +26,48 @@ source .venv/bin/activate
 | `bllarse_sweeps/` | The linear-probing sweeps, with the tuned hyperparameters behind Figs 1 and 2 |
 | `scripts/analysis/`, `scripts/plotting/` | Scoring dumps into JSON, Table 1, and the paper figures |
 
-## Running a sweep configuration
+## Linear probing
 
-A sweep file defines `create_configs() -> list[dict]` and `run(config)`. Run one
-of its configurations by index:
+Probing runs on cached DINOv3 features. By default they come from the public
+Hugging Face dataset `dimarkov/bllarse-features`. To compute them yourself
+instead, run `scripts/dinov3/precompute_features.py` (and
+`precompute_ood_features.py` for the OOD sets) with `--no-hf-cache`.
+
+A sweep file defines `create_configs() -> list[dict]` and `run(config)`. To run
+one of its configurations, pass its index:
 
 ```bash
 python -m bllarse.tools.run_config bllarse_sweeps/probe_vbll.py 0
 ```
 
-Every training script writes logit dumps; all reported metrics are computed
-from them afterwards. MLflow logging is optional: it is on when a config sets
-`enable_mlflow=True`, and it reports to whatever `MLFLOW_TRACKING_URI` points
-at.
+The hyperparameters in the sweep files come from Optuna TPE studies, run with
+`python -m bllarse.tuning.worker`.
+
+## Full-network fine-tuning
+
+Each script below documents its arguments in its module docstring. In order:
+
+1. `scripts/finetune/build_shards.py` decodes each ImageNet-1k split once into
+   a uint8 shard that every run reads.
+2. `scripts/finetune/prepare_ood_cache.py` downloads the OOD sets.
+3. `python -m bllarse.tuning.finetune_worker` tunes each arm.
+4. `scripts/finetune/final_config.py` prints the command line for the final
+   runs from a finished study.
+5. `scripts/finetune/finetune_jax.py --arm ce|ibprobit` and
+   `scripts/finetune/finetune_vbll.py` train the three arms.
+6. `scripts/finetune/ood_worker.py` scores the OOD sets from checkpoints.
+
+## Results and logging
+
+Every training script writes logit dumps under `--dump-root`, and every
+reported metric is computed from those dumps. MLflow logging is optional. A
+config turns it on with `enable_mlflow=True`, and it logs to
+`MLFLOW_TRACKING_URI` if that is set, or to a local store if not.
 
 ## From dumps to figures
+
+In the commands below, `$DUMPS` is the dump root, and `$GROUP` is the
+`--group-id` that the fine-tuning runs used.
 
 Linear probing (Figs 1 and 2):
 
@@ -66,16 +93,3 @@ python scripts/plotting/plot_fig4.py --scores scores.json
 python scripts/plotting/plot_fig5.py --scores scores.json --wallclock wallclock.json \
     --target-arm ibprobit --target-epochs 1.0 --fraction 1.0
 ```
-
-## 🔄 Updating Git-based dependencies
-
-Some dependencies in `pyproject.toml` are installed directly from GitHub (e.g. `blrax`).  
-By default, `uv sync` will use the commit pinned in your `uv.lock` file, so you won’t automatically get the latest changes from `main`.
-
-To update one of these packages to the newest commit on its branch:
-
-```bash
-uv sync --upgrade-package blrax # replace `blrax` with the name of the dependency you want to upgrade.
-```
-
-This updates the lockfile to the latest commit and reinstalls the package in your virtual environment.
