@@ -261,7 +261,7 @@ def _trunk_labels_of(tree, depth: int):
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--arm", required=True, choices=["ce", "ibprobit"])
-    p.add_argument("--model", default="dinov3_large")
+    p.add_argument("--model", default="dinov3_huge")
     p.add_argument("--dataset", default="imagenet1k")
     p.add_argument("--img-size", type=int, default=FINETUNE_IMG_SIZE)
     p.add_argument(

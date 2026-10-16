@@ -283,7 +283,7 @@ def _write_best(args, best, last_eval_index):
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="dinov3_large", choices=sorted(HF_CHECKPOINTS))
+    p.add_argument("--model", default="dinov3_huge", choices=sorted(HF_CHECKPOINTS))
     p.add_argument("--dataset", default="imagenet1k")
     p.add_argument("--img-size", type=int, default=FINETUNE_IMG_SIZE)
 

@@ -150,6 +150,11 @@ def test_the_shard_is_required():
         fv.check_required_flags(args)
 
 
+def test_default_model_is_the_reported_dinov3_huge():
+    args = fv.build_argparser().parse_args(["--micro-batch-size", "32"])
+    assert args.model == "dinov3_huge"
+
+
 def test_a_shard_path_satisfies_the_flag_check():
     args = fv.build_argparser().parse_args(
         ["--micro-batch-size", "32", "--train-shards", "/scratch/shards"])

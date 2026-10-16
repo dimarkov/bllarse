@@ -33,6 +33,10 @@ def test_default_epochs_is_the_reported_two_epochs():
     assert _args().epochs == 2.0
 
 
+def test_default_model_is_the_reported_dinov3_huge():
+    assert _args().model == "dinov3_huge"
+
+
 def test_default_img_size_is_224():
     assert _args().img_size == 224
 
